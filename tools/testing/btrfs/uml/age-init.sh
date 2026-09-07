@@ -31,11 +31,34 @@ log "devices: $DEVS"
 mkfs.btrfs -f --nodiscard -d $DPROF -m $MPROF $DEVS >/dev/null 2>&1 || { log "MKFS_FAILED"; }
 mount -o rw /dev/ubda $MNT || { log "MOUNT_FAILED"; echo o > /proc/sysrq-trigger; sleep 60; }
 
+# Automatic block-group reclaim: relocates a block group when its usage falls
+# *below* RECLAIM percent, freeing the chunk.  Off by default on non-zoned
+# filesystems (space_info->bg_reclaim_threshold stays 0), which is why it has
+# to be set here to measure what it does to stranded space.
+if [ -n "${RECLAIM:-}" ] && [ "${RECLAIM}" != "0" ]; then
+	for f in /sys/fs/btrfs/*/allocation/data/bg_reclaim_threshold; do
+		[ -f $f ] && { echo $RECLAIM > $f; log "reclaim threshold: $(cat $f)"; }
+	done
+fi
+if [ -n "${PERIODIC:-}" ] && [ "${PERIODIC}" != "0" ]; then
+	for f in /sys/fs/btrfs/*/allocation/data/periodic_reclaim; do
+		[ -f $f ] && { echo 1 > $f; log "periodic reclaim: $(cat $f)"; }
+	done
+fi
+
 python3 $(dirname $0)/age-workload.py $MNT/aged \
 	--seed ${SEED:-1} --rounds ${ROUNDS:-12} --fill ${FILL:-0.75} 2>&1 |
 	while read -r l; do log "$l"; done
 
 sync
+# What the reclaim machinery actually did: how many block groups it relocated
+# and how many bytes that cost.
+for d in /sys/fs/btrfs/*/allocation/data; do
+	[ -d $d ] || continue
+	log "reclaim: threshold=$(cat $d/bg_reclaim_threshold 2>/dev/null) periodic=$(cat $d/periodic_reclaim 2>/dev/null) count=$(cat $d/reclaim_count 2>/dev/null) bytes=$(cat $d/reclaim_bytes 2>/dev/null) errors=$(cat $d/reclaim_errors 2>/dev/null)"
+done
+dmesg | grep -ac "reclaiming chunk" | while read -r n; do log "dmesg reclaiming-chunk lines: $n"; done
+
 # The aging workload is itself a large sample of sub-stripe writes: record
 # what fraction of the writes had to touch committed data.
 for f in /sys/fs/btrfs/*/raid56_write_profile; do

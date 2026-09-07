@@ -25,7 +25,7 @@ ulimit -c 0
 timeout ${TIMEOUT:-7200} $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
 	init=$D/age-init.sh $ubds quiet con=null con0=fd:0,fd:1 \
 	BTRFS_TEST_DIR=$T PROFILE=$PROFILE TAG=$TAG SEED=${SEED:-1} \
-	ROUNDS=${ROUNDS:-12} \
+	ROUNDS=${ROUNDS:-12} RECLAIM=${RECLAIM:-0} PERIODIC=${PERIODIC:-0} \
 	FILL=$FILL > $D/log.age 2>&1
 echo "boot rc=$?" >> $T/umltest/results.$TAG
 
