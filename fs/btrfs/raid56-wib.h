@@ -36,6 +36,13 @@ struct btrfs_fs_info;
 #define BTRFS_WIB_OFFSET		SZ_512K
 #define BTRFS_WIB_SLOT_SIZE		SZ_4K
 #define BTRFS_WIB_NR_SLOTS		2
+/*
+ * How long btrfs_wib_mark() waits for a full log to drain before failing the
+ * write.  Generous: the RMWs that free entries only have to complete their
+ * own device IO, so reaching this means something is genuinely stuck.
+ */
+#define BTRFS_WIB_FULL_TIMEOUT		(60 * HZ)
+
 /* "RI56_WIL" in little endian. */
 #define BTRFS_WIB_MAGIC			0x4c49575f36354952ULL
 

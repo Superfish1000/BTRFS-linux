@@ -828,11 +828,20 @@ static int wib_flush_and_drop_locked(struct btrfs_wib *wib, u64 seq, bool force)
 	for (int i = 0; i < 3 && ret == -ENOSPC; i++) {
 		bool flushed;
 
-		ret = btrfs_wib_build_block(wib, wib->prepared, seq, NULL);
+		/*
+		 * Build into wib->block, never into wib->prepared: that holds
+		 * the snapshot a transaction commit took before its barriers,
+		 * and the commit drops against it on the strength of those
+		 * barriers.  Replacing it here with a snapshot taken after
+		 * them would let that commit drop a stripe no flush covered.
+		 * wib->block is safe scratch, wib_write_block_locked() rebuilds
+		 * it from scratch.
+		 */
+		ret = btrfs_wib_build_block(wib, wib->block, seq, NULL);
 		/* The in-memory set always fits. */
 		ASSERT(ret == 0);
 		flushed = wib_flush_all_devices(wib);
-		ret = wib_drop_locked(wib, seq, wib->prepared, flushed, force);
+		ret = wib_drop_locked(wib, seq, wib->block, flushed, force);
 	}
 	return ret;
 }
@@ -940,13 +949,22 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		spin_unlock(&wib->lock);
 
 		/*
-		 * Log full.  Entries are freed when in-flight RMWs finish,
-		 * and those only wait for their own device IO, so waiting
-		 * here cannot deadlock.
+		 * Log full.  Entries are freed when in-flight RMWs finish.
+		 * Those RMWs can themselves be waiting on commit_mutex and on
+		 * IO to devices this one knows nothing about, so this is not
+		 * a wait that is guaranteed to end: bound it and fail the
+		 * write rather than hang the task forever.
 		 */
 		btrfs_warn_rl(fs_info,
 			      "raid56 write-intent log full, waiting for in-flight writes");
-		wait_event(wib->wait, btrfs_wib_can_mark(wib, logical, len));
+		if (!wait_event_timeout(wib->wait,
+					btrfs_wib_can_mark(wib, logical, len),
+					BTRFS_WIB_FULL_TIMEOUT)) {
+			btrfs_err_rl(fs_info,
+	"raid56 write-intent log still full after %u seconds, failing the write",
+				     jiffies_to_msecs(BTRFS_WIB_FULL_TIMEOUT) / 1000);
+			return -EIO;
+		}
 	}
 	atomic64_inc(&wib->stat_marks);
 
@@ -1666,6 +1684,19 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 			    logical < last_start + last_len)
 				continue;
 
+			/*
+			 * A large log can take a long time to replay.  Stay
+			 * killable: the on-disk log is only rewritten after
+			 * the whole pass, so aborting here leaves a superset
+			 * and the next mount redoes the work.
+			 */
+			if (fatal_signal_pending(current) ||
+			    btrfs_fs_closing(fs_info)) {
+				btrfs_warn(fs_info,
+	"raid56 write-intent log: recovery interrupted, it will be redone at the next mount");
+				return -EINTR;
+			}
+
 			ret = btrfs_raid56_full_stripe_range(fs_info, logical, &start, &len);
 			if (ret == -ENOENT) {
 				st.skipped++;
@@ -1754,6 +1785,13 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 			if (last_len && logical >= last_start &&
 			    logical < last_start + last_len)
 				continue;
+			if (fatal_signal_pending(current) ||
+			    btrfs_fs_closing(fs_info)) {
+				btrfs_warn(fs_info,
+	"raid56 write-intent log: recovery interrupted, it will be redone at the next mount");
+				ret = -EINTR;
+				goto out;
+			}
 
 			ret = wib_recover_one(fs_info, logical, true, false, &start, &len, &st);
 			if (ret < 0)
