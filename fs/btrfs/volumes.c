@@ -5716,7 +5716,7 @@ static void check_raid56_incompat_flag(struct btrfs_fs_info *info, u64 type)
 	 */
 	if (!btrfs_fs_incompat(info, RAID56) &&
 	    !btrfs_fs_compat_ro(info, RAID56_WRITE_INTENT))
-		btrfs_wib_request_enable(info);
+		btrfs_wib_request_enable(info, true);
 	btrfs_set_fs_incompat(info, RAID56);
 }
 

@@ -198,7 +198,7 @@ int btrfs_wib_rw_mount(struct btrfs_fs_info *fs_info, bool log_replay_pending,
 
 int btrfs_wib_enable(struct btrfs_fs_info *fs_info);
 void btrfs_wib_disable(struct btrfs_fs_info *fs_info);
-void btrfs_wib_request_enable(struct btrfs_fs_info *fs_info);
+int btrfs_wib_request_enable(struct btrfs_fs_info *fs_info, bool automatic);
 
 int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed);

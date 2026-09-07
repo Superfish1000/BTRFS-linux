@@ -1254,28 +1254,50 @@ void btrfs_wib_disable(struct btrfs_fs_info *fs_info)
 }
 
 /*
- * The first RAID56 chunk of the filesystem is being created: set the feature
- * flag (so that it goes out with this transaction's superblock) and request
- * the log to be enabled at that commit, before the superblock is written.
- * Called from a context that holds locks incompatible with doing device IO
- * (chunk allocation, chunk_mutex).
+ * Set the feature flag (so that it goes out with this transaction's
+ * superblock) and request the log to be enabled at that commit, before the
+ * superblock is written.  The two become durable together: btrfs_wib_commit()
+ * writes the log out first and a failure there aborts the commit, so the flag
+ * never promises a log that is not there.
+ *
+ * @automatic is set by the filesystem enabling the log by itself (the first
+ * RAID56 chunk), and clear when an administrator asked for it.
+ *
+ * Nothing here does device IO, because none of the callers can afford it.
+ * Chunk allocation holds chunk_mutex.  A sysfs store holds the kernfs node
+ * active for as long as it runs, so an enable that waited on a wedged device
+ * would hold off the removal of that node -- and therefore unmount -- with no
+ * way to interrupt it.  The commit path has neither problem.
  */
-void btrfs_wib_request_enable(struct btrfs_fs_info *fs_info)
+int btrfs_wib_request_enable(struct btrfs_fs_info *fs_info, bool automatic)
 {
 	struct btrfs_wib *wib = fs_info->wib;
 
 	if (!wib)
-		return;
+		return -EOPNOTSUPP;
 	if (btrfs_is_zoned(fs_info))
-		return;
-	if (btrfs_test_opt(fs_info, NORAID56_WRITE_INTENT))
-		return;
+		return -EOPNOTSUPP;
+	/*
+	 * noraid56_write_intent suppresses the log being turned on by the
+	 * filesystem itself; it does not overrule an administrator asking for
+	 * it through sysfs or the ioctl.
+	 */
+	if (automatic && btrfs_test_opt(fs_info, NORAID56_WRITE_INTENT))
+		return -EOPNOTSUPP;
 
 	spin_lock(&wib->lock);
 	if (!wib->enabled)
 		wib->enable_requested = true;
+	/*
+	 * A disable that has not taken effect yet is cancelled: the flag is
+	 * about to be set again, which is what disable_armed waits to see
+	 * gone.
+	 */
+	wib->disable_requested = false;
+	wib->disable_armed = false;
 	spin_unlock(&wib->lock);
 	btrfs_set_fs_compat_ro(fs_info, RAID56_WRITE_INTENT);
+	return 0;
 }
 
 int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
@@ -1667,6 +1689,11 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 	if (!wib || !wib->nr_pending)
 		return 0;
 
+	/* One workqueue for the whole pass, not one per full stripe. */
+	ret = btrfs_scrub_raid56_recovery_begin(fs_info);
+	if (ret < 0)
+		return ret;
+
 	for (unsigned int i = 0; i < wib->nr_pending; i++) {
 		const struct btrfs_wib_entry *e = &wib->pending[i];
 		const u64 bits = e->bitmap | e->sticky;
@@ -1694,7 +1721,8 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 			    btrfs_fs_closing(fs_info)) {
 				btrfs_warn(fs_info,
 	"raid56 write-intent log: recovery interrupted, it will be redone at the next mount");
-				return -EINTR;
+				ret = -EINTR;
+				goto out;
 			}
 
 			ret = btrfs_raid56_full_stripe_range(fs_info, logical, &start, &len);
@@ -1703,7 +1731,7 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 				continue;
 			}
 			if (ret < 0)
-				return ret;
+				goto out;
 			last_start = start;
 			last_len = len;
 
@@ -1717,7 +1745,7 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 			ret = wib_recover_one(fs_info, start, trusted, log_replay_pending,
 					      &start, &len, &st);
 			if (ret < 0)
-				return ret;
+				goto out;
 			if (ret == 1)
 				btrfs_wib_add_sticky(fs_info, start, len);
 		}
@@ -1738,7 +1766,10 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 	 * work.  This is done whether or not the log stays enabled: a stale
 	 * valid block would otherwise be replayed at every mount.
 	 */
-	return wib_commit_after_recovery(wib, BTRFS_WIB_NR_SLOTS);
+	ret = wib_commit_after_recovery(wib, BTRFS_WIB_NR_SLOTS);
+out:
+	btrfs_scrub_raid56_recovery_end(fs_info);
+	return ret;
 }
 
 /*
@@ -1772,6 +1803,10 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 	if (nr == 0)
 		goto out;
 
+	ret = btrfs_scrub_raid56_recovery_begin(fs_info);
+	if (ret < 0)
+		goto out;
+
 	for (unsigned int i = 0; i < nr; i++) {
 		const struct btrfs_wib_entry *e = &snap[i];
 
@@ -1790,12 +1825,12 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 				btrfs_warn(fs_info,
 	"raid56 write-intent log: recovery interrupted, it will be redone at the next mount");
 				ret = -EINTR;
-				goto out;
+				goto out_end;
 			}
 
 			ret = wib_recover_one(fs_info, logical, true, false, &start, &len, &st);
 			if (ret < 0)
-				goto out;
+				goto out_end;
 			if (!len) {
 				/* No RAID56 stripe there anymore. */
 				btrfs_wib_clear_sticky(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
@@ -1812,6 +1847,8 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 	"raid56 write-intent log: recovery after log replay done, %u full stripes scrubbed, %u skipped, %u unrepairable, %u kept recorded",
 		   st.done, st.skipped, st.failed, st.kept);
 	ret = wib_commit_after_recovery(wib, 1);
+out_end:
+	btrfs_scrub_raid56_recovery_end(fs_info);
 out:
 	kvfree(snap);
 	return ret;

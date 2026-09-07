@@ -4288,7 +4288,14 @@ static int btrfs_ioctl_set_features(struct file *file, void __user *arg)
 	 */
 	if (flags[0].compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT) {
 		if (flags[1].compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT) {
-			ret = btrfs_wib_enable(fs_info);
+			/*
+			 * Requested rather than done here so that the log is
+			 * written out by the same commit that carries the
+			 * flag: if that commit never happens, or the log
+			 * write fails and aborts it, the flag does not become
+			 * durable either.
+			 */
+			ret = btrfs_wib_request_enable(fs_info, false);
 			if (ret)
 				goto out_drop_write;
 		} else {

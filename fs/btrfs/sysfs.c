@@ -242,12 +242,16 @@ static ssize_t btrfs_feature_attr_store(struct kobject *kobj,
 	/*
 	 * The write-intent log must be persisted (with everything currently
 	 * in flight) before the flag that promises it is set, and stops
-	 * being maintained when the flag is cleared.
+	 * being maintained when the flag is cleared.  Both are arranged by
+	 * the commit requested below rather than done here: a store callback
+	 * holds the kernfs node active while it runs, so waiting on a device
+	 * from here would block the removal of that node, and unmount with
+	 * it, uninterruptibly.
 	 */
 	if (fa->feature_set == FEAT_COMPAT_RO &&
 	    fa->feature_bit == BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT) {
 		if (val) {
-			ret = btrfs_wib_enable(fs_info);
+			ret = btrfs_wib_request_enable(fs_info, false);
 			if (ret)
 				return ret;
 		} else {

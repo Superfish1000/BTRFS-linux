@@ -3192,6 +3192,24 @@ out:
  * where it may still allow the repair later), -ENOENT if @full_stripe_start
  * is not in a RAID56 block group (anymore), or another negative error.
  */
+/*
+ * Hold the scrub workqueue across a run of btrfs_scrub_raid56_full_stripe()
+ * calls.  Each of those takes its own reference, so without an outer one the
+ * workqueue is created and destroyed again for every full stripe: a long
+ * recovery pays that per stripe, and an allocation shortage part way through
+ * turns into -ENOMEM on a stripe and fails the mount.  With the reference
+ * held the inner get is a refcount increment that cannot fail.
+ */
+int btrfs_scrub_raid56_recovery_begin(struct btrfs_fs_info *fs_info)
+{
+	return scrub_workers_get(fs_info);
+}
+
+void btrfs_scrub_raid56_recovery_end(struct btrfs_fs_info *fs_info)
+{
+	scrub_workers_put(fs_info);
+}
+
 int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 				   u64 full_stripe_start, bool trusted)
 {

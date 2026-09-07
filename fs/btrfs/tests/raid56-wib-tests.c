@@ -654,7 +654,7 @@ static int test_disable_ordering(struct btrfs_fs_info *fs_info)
 	}
 
 	/* Enable again for the remaining tests (and the enable request path). */
-	btrfs_wib_request_enable(fs_info);
+	btrfs_wib_request_enable(fs_info, true);
 	if (!wib->enable_requested ||
 	    !btrfs_fs_compat_ro(fs_info, RAID56_WRITE_INTENT)) {
 		test_err("enable request did not set the feature flag");
