@@ -41,6 +41,28 @@ only "too many faults".
   Cache policies
     keep       a failed RMW leaves its pages in the stripe cache (upstream)
     drop       a failed RMW invalidates them (fixed)
+
+  Results with the fixed accounting (see sweep.sh)
+
+    RAID5 and RAID6, copy-on-write writes, on a healthy array, on a degraded
+    one and while a device replace runs: no silent corruption and no
+    acknowledged loss, at every depth explored.  Reverting any one of the
+    three accounting rules reintroduces a violation.
+
+    Two exposures remain, both from the same root cause: a write failure that
+    stays within the profile's tolerance is acknowledged, and the sector it
+    did not reach stays stale on its device while the correct content lives
+    only in the parity.  Nothing tracks that latent fault afterwards.
+
+      --nodatasum  a read of that sector returns the stale content, because
+                   there is no checksum to notice and send the read to the
+                   parity.  The acknowledged write is silently undone.
+      --in-place   the latent fault plus a later parity write failure is two
+                   faults in one vertical stripe, and the committed content
+                   is gone.  Detected for checksummed data.
+
+    rmw_retry_failed_sectors() removes the transient case; a device that
+    keeps failing still leaves the window open until the next scrub.
 """
 
 import argparse
@@ -136,44 +158,48 @@ class Stripe:
                 return v
 
         # Reconstruct sector i from the parity and the other data sectors.
-        holes = [d for d in range(self.nr_data) if not present(d)]
-        if i not in holes:
-            holes.append(i)             # present but its content is not valid
+        #
+        # btrfs retries a failed read through increasing mirror numbers, and
+        # for RAID6 set_rbio_raid6_extra_error() makes each retry treat one
+        # more stripe as failed.  So a sector that is present but silently
+        # stale can be worked around as long as there are enough parity
+        # equations.  Model that as: try every set of extra suspect sectors
+        # the parity count allows, smallest first, and take the first
+        # reconstruction that verifies.
+        missing_holes = [d for d in range(self.nr_data) if not present(d)]
+        others = [d for d in range(self.nr_data)
+                  if d not in missing_holes and d != i]
+        nr_parity_present = sum(1 for p in range(self.nr_parity)
+                                if present(self.nr_data + p))
+        first_answer = None
 
-        # A parity sector is usable only if what it encodes still matches what
-        # the readable data sectors hold; otherwise it was computed before one
-        # of them changed and says nothing about the holes.
-        usable = []
-        for p in range(self.nr_parity):
-            if not present(self.nr_data + p):
-                continue
-            if all(self.parity[p][d] == self.disk[d]
-                   for d in range(self.nr_data) if d not in holes):
-                usable.append(p)
-        if len(usable) < len(holes):
-            # Not enough equations.  If a parity was there but stale, the
-            # reconstruction it would give is wrong; without checksums that
-            # wrong answer is what a reader gets.
-            stale_present = any(present(self.nr_data + p)
-                                for p in range(self.nr_parity)
-                                if p not in usable)
-            if stale_present and self.nodatasum and \
-               len(holes) <= sum(1 for p in range(self.nr_parity)
-                                 if present(self.nr_data + p)):
-                return GARBAGE
-            return UNREADABLE
-
-        # btrfs rebuilds with one parity equation and verifies the result
-        # against the checksum; recover_vertical() falls back to another
-        # combination (mirror_num) when the verification fails.  Without a
-        # checksum there is nothing to fall back on and the first answer is
-        # returned whatever it is.
-        for p in usable:
-            rebuilt = self.parity[p][i]
-            if self.nodatasum or self.committed[i] is None:
-                return rebuilt
-            if rebuilt == self.committed[i]:
-                return rebuilt
+        for nr_extra in range(len(others) + 1):
+            for extra in itertools.combinations(others, nr_extra):
+                holes = list(missing_holes) + list(extra)
+                if i not in holes:
+                    holes.append(i)
+                if len(holes) > nr_parity_present:
+                    continue
+                usable = []
+                for p in range(self.nr_parity):
+                    if not present(self.nr_data + p):
+                        continue
+                    if all(self.parity[p][d] == self.disk[d]
+                           for d in range(self.nr_data) if d not in holes):
+                        usable.append(p)
+                if len(usable) < len(holes):
+                    continue
+                for p in usable:
+                    rebuilt = self.parity[p][i]
+                    if first_answer is None:
+                        first_answer = rebuilt
+                    if self.nodatasum or self.committed[i] is None:
+                        # Nothing to verify against: the first answer stands.
+                        return first_answer
+                    if rebuilt == self.committed[i]:
+                        return rebuilt
+        if first_answer is not None and self.nodatasum:
+            return first_answer
         return UNREADABLE
 
     def check(self, acked, strict, check_availability):
@@ -212,9 +238,11 @@ class Stripe:
                     got = self.read(i, lost)
                     if got == self.committed[i]:
                         continue
-                    if got == GARBAGE:
-                        # Wrong data returned as good: nothing downstream can
-                        # catch this.  Never acceptable, whatever was reported.
+                    if got != UNREADABLE:
+                        # A value was returned that is not what was committed
+                        # -- reconstructed from a stale parity, or read from a
+                        # sector a failed write left behind.  Nothing
+                        # downstream can catch it.  Never acceptable.
                         return ("silent corruption", i, lost, got,
                                 self.committed[i])
                     if extra == 0:
