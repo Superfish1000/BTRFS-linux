@@ -2055,6 +2055,14 @@ void raid56_parity_write(struct bio *bio, struct btrfs_io_context *bioc)
 	start_async_work(rbio, rmw_rbio_work);
 }
 
+/*
+ * Check a sector against the checksum tree.
+ *
+ * Returns 1 when the sector was compared against a checksum and matched, 0
+ * when there was no checksum to compare it against, and -EIO on a mismatch.
+ * The caller has to tell those apart: a reconstruction that nothing verified
+ * is not a reconstruction that is known good.
+ */
 static int verify_one_sector(struct btrfs_raid_bio *rbio,
 			     int stripe_nr, int sector_nr)
 {
@@ -2068,6 +2076,11 @@ static int verify_one_sector(struct btrfs_raid_bio *rbio,
 
 	/* No way to verify P/Q as they are not covered by data csum. */
 	if (stripe_nr >= rbio->nr_data)
+		return 0;
+
+	/* A data block group can hold nodatasum extents with no checksum. */
+	if (!test_bit(stripe_nr * rbio->stripe_nsectors + sector_nr,
+		      rbio->csum_bitmap))
 		return 0;
 	/*
 	 * If we're rebuilding a read, we have to use pages from the
@@ -2085,7 +2098,70 @@ static int verify_one_sector(struct btrfs_raid_bio *rbio,
 	btrfs_calculate_block_csum_pages(fs_info, paddrs, csum_buf);
 	if (unlikely(memcmp(csum_buf, csum_expected, fs_info->csum_size) != 0))
 		return -EIO;
-	return 0;
+	return 1;
+}
+
+/*
+ * Cross-check a RAID6 single-erasure reconstruction against the second
+ * syndrome.
+ *
+ * A vertical stripe with one failed data sector is rebuilt from P alone, the
+ * same way RAID5 does it, and Q is never consulted.  If P is stale - a lost
+ * or torn parity write, or bit rot on the parity device - the rebuild is
+ * silently wrong.  For a sector with a checksum that is caught, but metadata
+ * on a RAID6 profile and nodatasum data have none, and the RMW path then
+ * folds the wrong sector into both the new P and the new Q, destroying the
+ * correct content that Q still described.
+ *
+ * Recompute the syndrome over the reconstructed data and compare the Q it
+ * produces with the Q on disk.  They match only if the reconstruction agrees
+ * with both parities.  Returns 0 when consistent, -EIO when not.
+ */
+static int recover_verify_q(struct btrfs_raid_bio *rbio, int sector_nr,
+			    void **pointers, void **unmap_array, void *scratch_p,
+			    void *scratch_q)
+{
+	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
+	const u32 step = min(fs_info->sectorsize, PAGE_SIZE);
+	const int qstripe = rbio->real_stripes - 1;
+	int ret = 0;
+
+	for (int step_nr = 0; step_nr < rbio->sector_nsteps; step_nr++) {
+		for (int stripe_nr = 0; stripe_nr <= qstripe; stripe_nr++) {
+			phys_addr_t paddr;
+
+			if (rbio->operation == BTRFS_RBIO_READ_REBUILD)
+				paddr = sector_paddr_in_rbio(rbio, stripe_nr,
+							     sector_nr, step_nr, 0);
+			else
+				paddr = rbio_stripe_paddr(rbio, stripe_nr,
+							  sector_nr, step_nr);
+			pointers[stripe_nr] = kmap_local_paddr(paddr);
+			unmap_array[stripe_nr] = pointers[stripe_nr];
+		}
+
+		/*
+		 * gen_syndrome() writes P and Q into the last two entries, so
+		 * point them at scratch and keep what is on disk intact.
+		 */
+		pointers[rbio->nr_data] = scratch_p;
+		pointers[qstripe] = scratch_q;
+		raid6_gen_syndrome(rbio->real_stripes, step, pointers);
+
+		if (unlikely(memcmp(scratch_q, unmap_array[qstripe], step) != 0))
+			ret = -EIO;
+
+		for (int stripe_nr = qstripe; stripe_nr >= 0; stripe_nr--)
+			kunmap_local(unmap_array[stripe_nr]);
+		if (ret)
+			break;
+	}
+
+	if (ret)
+		btrfs_warn_rl(fs_info,
+	"raid56: rebuild of full stripe %llu sector %d does not match the Q syndrome, the parity is stale or corrupt",
+			      rbio->bioc->full_stripe_logical, sector_nr);
+	return ret;
 }
 
 static void recover_vertical_step(struct btrfs_raid_bio *rbio,
@@ -2202,7 +2278,8 @@ cleanup:
  * need to allocate/free the pointers again and again.
  */
 static int recover_vertical(struct btrfs_raid_bio *rbio, int sector_nr,
-			    void **pointers, void **unmap_array)
+			    void **pointers, void **unmap_array,
+			    void *scratch_p, void *scratch_q)
 {
 	int found_errors;
 	int faila;
@@ -2237,6 +2314,18 @@ static int recover_vertical(struct btrfs_raid_bio *rbio, int sector_nr,
 		if (ret < 0)
 			return ret;
 
+		/*
+		 * A RAID6 stripe with a single failed data sector was rebuilt
+		 * from P alone.  If no checksum vouched for the result, ask
+		 * the second syndrome instead of trusting P blindly.
+		 */
+		if (ret == 0 && scratch_p && failb < 0 && faila < rbio->nr_data) {
+			ret = recover_verify_q(rbio, sector_nr, pointers,
+					       unmap_array, scratch_p, scratch_q);
+			if (ret < 0)
+				return ret;
+		}
+
 		set_bit(rbio_sector_index(rbio, faila, sector_nr),
 			rbio->stripe_uptodate_bitmap);
 	}
@@ -2248,13 +2337,16 @@ static int recover_vertical(struct btrfs_raid_bio *rbio, int sector_nr,
 		set_bit(rbio_sector_index(rbio, failb, sector_nr),
 			rbio->stripe_uptodate_bitmap);
 	}
-	return ret;
+	return 0;
 }
 
 static int recover_sectors(struct btrfs_raid_bio *rbio)
 {
+	const bool has_qstripe = rbio->real_stripes - rbio->nr_data == 2;
 	void **pointers = NULL;
 	void **unmap_array = NULL;
+	void *scratch_p = NULL;
+	void *scratch_q = NULL;
 	int sectornr;
 	int ret = 0;
 
@@ -2270,6 +2362,15 @@ static int recover_sectors(struct btrfs_raid_bio *rbio)
 		ret = -ENOMEM;
 		goto out;
 	}
+	/* Scratch for the RAID6 syndrome cross-check, see recover_verify_q(). */
+	if (has_qstripe) {
+		scratch_p = (void *)__get_free_page(GFP_NOFS);
+		scratch_q = (void *)__get_free_page(GFP_NOFS);
+		if (!scratch_p || !scratch_q) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
 
 	if (rbio->operation == BTRFS_RBIO_READ_REBUILD) {
 		spin_lock(&rbio->bio_list_lock);
@@ -2280,12 +2381,15 @@ static int recover_sectors(struct btrfs_raid_bio *rbio)
 	index_rbio_pages(rbio);
 
 	for (sectornr = 0; sectornr < rbio->stripe_nsectors; sectornr++) {
-		ret = recover_vertical(rbio, sectornr, pointers, unmap_array);
+		ret = recover_vertical(rbio, sectornr, pointers, unmap_array,
+				       scratch_p, scratch_q);
 		if (ret < 0)
 			break;
 	}
 
 out:
+	free_page((unsigned long)scratch_p);
+	free_page((unsigned long)scratch_q);
 	kfree(pointers);
 	kfree(unmap_array);
 	return ret;
@@ -3214,7 +3318,8 @@ static int recover_scrub_rbio(struct btrfs_raid_bio *rbio)
 			goto out;
 		}
 
-		ret = recover_vertical(rbio, sector_nr, pointers, unmap_array);
+		ret = recover_vertical(rbio, sector_nr, pointers, unmap_array,
+				       NULL, NULL);
 		if (ret < 0)
 			goto out;
 	}
