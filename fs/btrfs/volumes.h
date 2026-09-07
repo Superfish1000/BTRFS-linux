@@ -216,6 +216,12 @@ struct btrfs_device {
 	u64 scrub_speed_max;
 
 	/*
+	 * Slot of the RAID56 write-intent log the next log block goes to on
+	 * this device (raid56-wib.c); advanced only after a successful write.
+	 */
+	unsigned int wib_next_slot;
+
+	/*
 	 * A temporary number of allocated space during per-profile
 	 * available space calculation.
 	 */

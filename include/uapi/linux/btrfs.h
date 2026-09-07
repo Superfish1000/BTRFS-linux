@@ -314,6 +314,17 @@ struct btrfs_ioctl_fs_info_args {
  */
 #define BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE	(1ULL << 3)
 
+/*
+ * RAID56 write-intent log.
+ *
+ * Every device carries a small log of the full stripes that have a sub-stripe
+ * (read-modify-write) update in flight.  After an unclean shutdown the parity
+ * of the logged full stripes is regenerated before the filesystem is written
+ * to again, which closes the RAID5/6 write hole.  A kernel that does not
+ * maintain the log must not mount the filesystem read-write, hence compat_ro.
+ */
+#define BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT	(1ULL << 4)
+
 #define BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF	(1ULL << 0)
 #define BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL	(1ULL << 1)
 #define BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS	(1ULL << 2)

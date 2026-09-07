@@ -198,6 +198,11 @@ struct scrub_ctx {
 	u64			throttle_sent;
 
 	bool			is_dev_replace;
+	/*
+	 * Write-intent log recovery at mount: not cancellable, and a failed
+	 * parity write must fail the stripe (see btrfs_scrub_raid56_full_stripe()).
+	 */
+	bool			internal;
 	u64			write_pointer;
 
 	struct mutex            wr_lock;
@@ -2046,6 +2051,10 @@ static int should_cancel_scrub(const struct scrub_ctx *sctx)
 {
 	struct btrfs_fs_info *fs_info = sctx->fs_info;
 
+	/* A recovery at mount has nothing to yield to. */
+	if (sctx->internal)
+		return 0;
+
 	if (atomic_read(&fs_info->scrub_cancel_req) ||
 	    atomic_read(&sctx->cancel_req))
 		return -ECANCELED;
@@ -2108,6 +2117,8 @@ static int scrub_raid56_cached_parity(struct scrub_ctx *sctx,
 		ret = -ENOMEM;
 		goto out;
 	}
+	if (sctx->internal)
+		raid56_parity_scrub_rbio_strict(rbio);
 	/* Use the recovered stripes as cache to avoid read them from disk again. */
 	for (int i = 0; i < data_stripes; i++) {
 		struct scrub_stripe *stripe = &sctx->raid56_data_stripes[i];
@@ -2124,11 +2135,18 @@ out:
 	return ret;
 }
 
+/*
+ * @regen_parity: after the data stripes have been verified and repaired,
+ * check and rewrite the parity on @scrub_dev.  The write-intent log
+ * recovery skips that while extents may still be hidden in the tree log:
+ * the parity is recomputed from every sector of a vertical stripe that
+ * holds an extent, including sectors this scrub could not verify.
+ */
 static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 				      struct btrfs_device *scrub_dev,
 				      struct btrfs_block_group *bg,
 				      struct btrfs_chunk_map *map,
-				      u64 full_stripe_start)
+				      u64 full_stripe_start, bool regen_parity)
 {
 	struct btrfs_fs_info *fs_info = sctx->fs_info;
 	BTRFS_PATH_AUTO_RELEASE(extent_path);
@@ -2253,6 +2271,9 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 		bitmap_or(&extent_bitmap, &extent_bitmap, &has_extent,
 			  stripe->nr_sectors);
 	}
+
+	if (!regen_parity)
+		return 0;
 
 	/* Now we can check and regenerate the P/Q stripe. */
 	return scrub_raid56_cached_parity(sctx, scrub_dev, map, full_stripe_start,
@@ -2503,7 +2524,7 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
 			/* it is parity strip */
 			stripe_logical += chunk_logical;
 			ret = scrub_raid56_parity_stripe(sctx, scrub_dev, bg,
-							 map, stripe_logical);
+							 map, stripe_logical, true);
 			spin_lock(&sctx->stat_lock);
 			sctx->stat.last_physical = min(physical + BTRFS_STRIPE_LEN,
 						       physical_end);
@@ -3041,6 +3062,265 @@ static noinline_for_stack int scrub_workers_get(struct btrfs_fs_info *fs_info)
 	ret = 0;
 
 	destroy_workqueue(scrub_workers);
+	return ret;
+}
+
+/*
+ * Recompute the parity held by @scrub_dev for every vertical stripe of the
+ * full stripe at @full_stripe_start from the data as it is on disk, and
+ * write back the sectors that differ.  Unlike scrub_raid56_cached_parity()
+ * nothing is taken from the scrub stripes: every sector is read.
+ *
+ * Only correct if every data sector holds what was last written to it,
+ * which recovery of the write-intent log establishes before calling this.
+ */
+static int scrub_raid56_full_parity(struct scrub_ctx *sctx,
+				    struct btrfs_device *scrub_dev,
+				    struct btrfs_chunk_map *map,
+				    u64 full_stripe_start)
+{
+	DECLARE_COMPLETION_ONSTACK(io_done);
+	struct btrfs_fs_info *fs_info = sctx->fs_info;
+	struct btrfs_io_context *bioc = NULL;
+	struct btrfs_raid_bio *rbio;
+	struct bio bio;
+	const int data_stripes = nr_data_stripes(map);
+	const unsigned int nsectors = BTRFS_STRIPE_LEN >> fs_info->sectorsize_bits;
+	unsigned long full_bitmap = 0;
+	u64 length = btrfs_stripe_nr_to_offset(data_stripes);
+	int ret;
+
+	ASSERT(nsectors <= BITS_PER_LONG);
+	bitmap_set(&full_bitmap, 0, nsectors);
+
+	bio_init(&bio, NULL, NULL, 0, REQ_OP_READ);
+	bio.bi_iter.bi_sector = full_stripe_start >> SECTOR_SHIFT;
+	bio.bi_private = &io_done;
+	bio.bi_end_io = raid56_scrub_wait_endio;
+
+	btrfs_bio_counter_inc_blocked(fs_info);
+	ret = btrfs_map_block(fs_info, BTRFS_MAP_WRITE, full_stripe_start,
+			      &length, &bioc, NULL, NULL);
+	if (ret < 0)
+		goto out;
+	ASSERT(bioc);
+	rbio = raid56_parity_alloc_scrub_rbio(&bio, bioc, scrub_dev, &full_bitmap,
+					      nsectors);
+	btrfs_put_bioc(bioc);
+	if (!rbio) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	raid56_parity_scrub_rbio_strict(rbio);
+	raid56_parity_submit_scrub_rbio(rbio);
+	wait_for_completion_io(&io_done);
+	ret = blk_status_to_errno(bio.bi_status);
+out:
+	btrfs_bio_counter_dec(fs_info);
+	bio_uninit(&bio);
+	return ret;
+}
+
+/*
+ * Return the geometry of the RAID56 full stripe containing @logical, or
+ * -ENOENT if @logical is not inside a RAID56 block group.
+ */
+int btrfs_raid56_full_stripe_range(struct btrfs_fs_info *fs_info, u64 logical,
+				   u64 *full_stripe_start, u64 *full_stripe_len)
+{
+	struct btrfs_block_group *bg;
+	struct btrfs_chunk_map *map;
+	u64 fstripe_len;
+	int ret = 0;
+
+	bg = btrfs_lookup_block_group(fs_info, logical);
+	if (!bg)
+		return -ENOENT;
+	if (!(bg->flags & BTRFS_BLOCK_GROUP_RAID56_MASK)) {
+		ret = -ENOENT;
+		goto out;
+	}
+	map = btrfs_find_chunk_map(fs_info, bg->start, bg->length);
+	if (!map) {
+		ret = -ENOENT;
+		goto out;
+	}
+	fstripe_len = btrfs_stripe_nr_to_offset(nr_data_stripes(map));
+	*full_stripe_start = bg->start +
+			     div_u64(logical - bg->start, fstripe_len) * fstripe_len;
+	*full_stripe_len = fstripe_len;
+	btrfs_free_chunk_map(map);
+out:
+	btrfs_put_block_group(bg);
+	return ret;
+}
+
+/*
+ * Scrub one RAID56 full stripe for the write-intent log recovery: verify
+ * every sector that holds an extent (data checksums, tree block headers),
+ * repair the bad ones from the parity and write them back, and recompute
+ * the parity of the vertical stripes that hold extents from the verified
+ * data.
+ *
+ * @trusted: the sectors that hold no extent are known to be what was last
+ * written to them (see btrfs_wib_recover()): the parity of the vertical
+ * stripes holding extents is recomputed by the scrub, and if the
+ * verification passed and no device is missing, the parity of every
+ * vertical stripe is additionally recomputed from the data on disk, which
+ * covers extents the extent tree does not know yet (tree log).  Otherwise
+ * only the data stripes are verified and repaired; no parity is written,
+ * since the scrub would recompute it from sectors it cannot verify.
+ *
+ * Return 0 if every extent found was verified or repaired (and, if
+ * @trusted, the full stripe is consistent), 1 if a device of the chunk is
+ * missing (its sectors were not repaired), 2 if every extent was verified
+ * but the parity of a vertical stripe with an unreadable sector holding no
+ * extent could not be recomputed, -EIO if a sector holding an extent could
+ * not be repaired or a parity write failed (the parity is then left alone
+ * where it may still allow the repair later), -ENOENT if @full_stripe_start
+ * is not in a RAID56 block group (anymore), or another negative error.
+ */
+int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
+				   u64 full_stripe_start, bool trusted)
+{
+	struct btrfs_block_group *bg;
+	struct btrfs_chunk_map *map = NULL;
+	struct scrub_ctx *sctx = NULL;
+	u64 fstripe_len;
+	bool missing = false;
+	int data_stripes;
+	u32 rem;
+	int rot;
+	int ret;
+
+	bg = btrfs_lookup_block_group(fs_info, full_stripe_start);
+	if (!bg)
+		return -ENOENT;
+	if (!(bg->flags & BTRFS_BLOCK_GROUP_RAID56_MASK)) {
+		ret = -ENOENT;
+		goto out_bg;
+	}
+	map = btrfs_find_chunk_map(fs_info, bg->start, bg->length);
+	if (!map) {
+		ret = -ENOENT;
+		goto out_bg;
+	}
+	data_stripes = nr_data_stripes(map);
+	fstripe_len = btrfs_stripe_nr_to_offset(data_stripes);
+	/* The full stripe length is not a power of two, no IS_ALIGNED() here. */
+	rot = div_u64_rem(full_stripe_start - bg->start, fstripe_len, &rem);
+	ASSERT(rem == 0);
+	for (int i = 0; i < map->num_stripes; i++) {
+		if (!map->stripes[i].dev->bdev)
+			missing = true;
+	}
+
+	sctx = scrub_setup_ctx(fs_info, false);
+	if (IS_ERR(sctx)) {
+		ret = PTR_ERR(sctx);
+		sctx = NULL;
+		goto out_map;
+	}
+	sctx->readonly = false;
+	sctx->internal = true;
+	sctx->raid56_data_stripes = kzalloc_objs(struct scrub_stripe, data_stripes);
+	if (!sctx->raid56_data_stripes) {
+		ret = -ENOMEM;
+		goto out_ctx;
+	}
+	for (int i = 0; i < data_stripes; i++) {
+		ret = init_scrub_stripe(fs_info, &sctx->raid56_data_stripes[i]);
+		if (ret < 0)
+			goto out_stripes;
+		sctx->raid56_data_stripes[i].bg = bg;
+		sctx->raid56_data_stripes[i].sctx = sctx;
+	}
+	ret = scrub_workers_get(fs_info);
+	if (ret < 0)
+		goto out_stripes;
+
+	mutex_lock(&fs_info->scrub_lock);
+	atomic_inc(&fs_info->scrubs_running);
+	mutex_unlock(&fs_info->scrub_lock);
+
+	/*
+	 * Every parity stripe of the full stripe is regenerated by a separate
+	 * pass; each pass verifies and repairs the data stripes, which is
+	 * cheap compared to the corruption it prevents.
+	 */
+	for (int p = data_stripes; p < map->num_stripes; p++) {
+		struct btrfs_device *pdev = map->stripes[(p + rot) % map->num_stripes].dev;
+
+		/* A missing parity device gets its parity rebuilt when replaced. */
+		if (!pdev->bdev)
+			continue;
+		ret = scrub_raid56_parity_stripe(sctx, pdev, bg, map, full_stripe_start,
+						 trusted);
+		if (ret < 0)
+			break;
+		ret = 0;
+	}
+	/*
+	 * scrub_raid56_parity_stripe() does not report unrepaired sectors
+	 * through its return value (and the stripes carry NO_REPORT), look
+	 * at the stripes of the last pass directly.
+	 */
+	if (ret == -EREMOTEIO) {
+		/* A parity write failed (strict scrub rbio): still stale. */
+		ret = -EIO;
+	}
+	if (ret == 0) {
+		for (int i = 0; i < data_stripes; i++) {
+			struct scrub_stripe *stripe = &sctx->raid56_data_stripes[i];
+			unsigned long error = scrub_bitmap_read_error(stripe);
+			unsigned long has_extent = scrub_bitmap_read_has_extent(stripe);
+
+			/* Repair writes completed before REPAIR_DONE was set. */
+			bitmap_or(&error, &error, &stripe->write_error_bitmap,
+				  stripe->nr_sectors);
+			bitmap_and(&error, &error, &has_extent, stripe->nr_sectors);
+			if (!bitmap_empty(&error, stripe->nr_sectors)) {
+				ret = -EIO;
+				break;
+			}
+		}
+	}
+	if (ret == 0 && missing)
+		ret = 1;
+	if (ret == 0 && trusted) {
+		for (int p = data_stripes; p < map->num_stripes; p++) {
+			struct btrfs_device *pdev =
+				map->stripes[(p + rot) % map->num_stripes].dev;
+
+			ret = scrub_raid56_full_parity(sctx, pdev, map, full_stripe_start);
+			if (ret < 0)
+				break;
+		}
+		if (ret == -EREMOTEIO) {
+			ret = -EIO;
+		} else if (ret < 0) {
+			/*
+			 * Every extent was verified above; what could not be
+			 * read holds none.
+			 */
+			ret = 2;
+		}
+	}
+
+	atomic_dec(&fs_info->scrubs_running);
+	wake_up(&fs_info->scrub_pause_wait);
+	scrub_workers_put(fs_info);
+out_stripes:
+	for (int i = 0; i < data_stripes; i++)
+		release_scrub_stripe(&sctx->raid56_data_stripes[i]);
+	kfree(sctx->raid56_data_stripes);
+	sctx->raid56_data_stripes = NULL;
+out_ctx:
+	scrub_put_ctx(sctx);
+out_map:
+	btrfs_free_chunk_map(map);
+out_bg:
+	btrfs_put_block_group(bg);
 	return ret;
 }
 

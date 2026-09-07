@@ -31,6 +31,7 @@
 #include "free-space-tree.h"
 #include "dev-replace.h"
 #include "raid56.h"
+#include "raid56-wib.h"
 #include "sysfs.h"
 #include "qgroup.h"
 #include "compression.h"
@@ -1237,6 +1238,7 @@ void btrfs_free_fs_info(struct btrfs_fs_info *fs_info)
 	percpu_counter_destroy(em_counter);
 	percpu_counter_destroy(&fs_info->dev_replace.bio_counter);
 	btrfs_free_stripe_hash_table(fs_info);
+	btrfs_wib_free(fs_info);
 	btrfs_free_ref_cache(fs_info);
 	kfree(fs_info->balance_ctl);
 	free_global_roots(fs_info);
@@ -2962,6 +2964,10 @@ static int init_mount_fs_info(struct btrfs_fs_info *fs_info, struct super_block 
 	if (btrfs_test_opt(fs_info, IGNOREMETACSUMS))
 		set_bit(BTRFS_FS_STATE_SKIP_META_CSUMS, &fs_info->fs_state);
 
+	ret = btrfs_wib_alloc(fs_info);
+	if (ret)
+		return ret;
+
 	return btrfs_alloc_stripe_hash_table(fs_info);
 }
 
@@ -3374,6 +3380,7 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 	struct btrfs_root *tree_root;
 	struct btrfs_root *chunk_root;
 	struct btrfs_root *remap_root;
+	bool log_replay;
 	int ret;
 	int level;
 
@@ -3712,6 +3719,32 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 		goto fail_sysfs;
 	}
 
+	/*
+	 * Read the RAID56 write-intent log and, if anything is going to be
+	 * written (a writable mount, or a tree log replay which writes even
+	 * on a read-only mount), recover the full stripes that had a write
+	 * in flight at the last unclean shutdown and start the log.  This
+	 * must happen before anything else writes to the filesystem (log
+	 * replay, orphan cleanup, relocation recovery, ...).
+	 */
+	ret = btrfs_wib_load(fs_info);
+	if (ret) {
+		btrfs_err(fs_info, "failed to read raid56 write-intent log: %pe",
+			  ERR_PTR(ret));
+		goto fail_sysfs;
+	}
+	log_replay = btrfs_super_log_root(disk_super) != 0 &&
+		     !btrfs_test_opt(fs_info, NOLOGREPLAY);
+	if (!sb_rdonly(sb) || log_replay) {
+		ret = btrfs_wib_rw_mount(fs_info, log_replay, sb_rdonly(sb));
+		if (ret) {
+			btrfs_err(fs_info,
+				  "failed to replay raid56 write-intent log: %pe",
+				  ERR_PTR(ret));
+			goto fail_sysfs;
+		}
+	}
+
 	fs_info->cleaner_kthread = kthread_run(cleaner_kthread, fs_info,
 					       "btrfs-cleaner");
 	if (IS_ERR(fs_info->cleaner_kthread)) {
@@ -3741,12 +3774,23 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 		btrfs_err(fs_info, "couldn't build ref tree");
 
 	/* do not make disk changes in broken FS or nologreplay is given */
-	if (btrfs_super_log_root(disk_super) != 0 &&
-	    !btrfs_test_opt(fs_info, NOLOGREPLAY)) {
+	if (log_replay) {
 		btrfs_info(fs_info, "start tree-log replay");
 		ret = btrfs_replay_log(fs_info, fs_devices);
 		if (ret)
 			goto fail_qgroup;
+		/*
+		 * The extents the log referenced are visible now, finish the
+		 * write-intent log recovery of the stripes that had to wait
+		 * for them.
+		 */
+		ret = btrfs_wib_recover_after_replay(fs_info);
+		if (ret) {
+			btrfs_err(fs_info,
+				  "failed to replay raid56 write-intent log: %pe",
+				  ERR_PTR(ret));
+			goto fail_qgroup;
+		}
 	}
 
 	fs_info->fs_root = btrfs_get_fs_root(fs_info, BTRFS_FS_TREE_OBJECTID, true);
@@ -4054,7 +4098,7 @@ static bool wait_dev_flush(struct btrfs_device *device)
  * send an empty flush down to each device in parallel,
  * then wait for them
  */
-static int barrier_all_devices(struct btrfs_fs_info *info)
+static int barrier_all_devices(struct btrfs_fs_info *info, int *nr_errors)
 {
 	struct list_head *head;
 	struct btrfs_device *dev;
@@ -4091,6 +4135,7 @@ static int barrier_all_devices(struct btrfs_fs_info *info)
 			errors_wait++;
 	}
 
+	*nr_errors = errors_wait;
 	/*
 	 * Checks flush failure of disks in order to determine the device
 	 * state.
@@ -4142,6 +4187,7 @@ int write_all_supers(struct btrfs_trans_handle *trans)
 	int do_barriers;
 	int max_errors;
 	int total_errors = 0;
+	int flush_errors = 0;
 
 	do_barriers = !btrfs_test_opt(fs_info, NOBARRIER);
 
@@ -4159,12 +4205,15 @@ int write_all_supers(struct btrfs_trans_handle *trans)
 	sb = fs_info->super_for_commit;
 	dev_item = &sb->dev_item;
 
+	/* Snapshot the RAID56 write-intent set before the barriers. */
+	btrfs_wib_commit_prepare(fs_info);
+
 	mutex_lock(&fs_info->fs_devices->device_list_mutex);
 	head = &fs_info->fs_devices->devices;
 	max_errors = btrfs_super_num_devices(fs_info->super_copy) - 1;
 
 	if (do_barriers) {
-		ret = barrier_all_devices(fs_info);
+		ret = barrier_all_devices(fs_info, &flush_errors);
 		if (unlikely(ret)) {
 			mutex_unlock(
 				&fs_info->fs_devices->device_list_mutex);
@@ -4172,6 +4221,22 @@ int write_all_supers(struct btrfs_trans_handle *trans)
 			btrfs_err(fs_info, "error while submitting device barriers");
 			return ret;
 		}
+	}
+
+	/*
+	 * Persist the RAID56 write-intent log: drops the full stripes whose
+	 * writes completed since the last commit, now that the barriers
+	 * above made those writes stable (a device that failed its barrier
+	 * keeps them recorded), and enables the log if a RAID56 chunk was
+	 * created in this transaction.  The log writer does not use
+	 * device_list_mutex itself (see wib_collect_targets()).
+	 */
+	ret = btrfs_wib_commit(fs_info, flush_errors == 0);
+	if (unlikely(ret)) {
+		mutex_unlock(&fs_info->fs_devices->device_list_mutex);
+		btrfs_abort_transaction(trans, ret);
+		btrfs_err(fs_info, "error while writing raid56 write-intent log");
+		return ret;
 	}
 
 	btrfs_set_super_flags(sb, btrfs_super_flags(sb) | BTRFS_HEADER_FLAG_WRITTEN);

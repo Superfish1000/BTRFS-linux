@@ -25,6 +25,7 @@
 #include "misc.h"
 #include "fs.h"
 #include "accessors.h"
+#include "raid56-wib.h"
 
 /*
  * Structure name                       Path
@@ -238,6 +239,22 @@ static ssize_t btrfs_feature_attr_store(struct kobject *kobj,
 	btrfs_info(fs_info, "%s %s feature flag",
 		   val ? "Setting" : "Clearing", fa->kobj_attr.attr.name);
 
+	/*
+	 * The write-intent log must be persisted (with everything currently
+	 * in flight) before the flag that promises it is set, and stops
+	 * being maintained when the flag is cleared.
+	 */
+	if (fa->feature_set == FEAT_COMPAT_RO &&
+	    fa->feature_bit == BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT) {
+		if (val) {
+			ret = btrfs_wib_enable(fs_info);
+			if (ret)
+				return ret;
+		} else {
+			btrfs_wib_disable(fs_info);
+		}
+	}
+
 	spin_lock(&fs_info->super_lock);
 	features = get_features(fs_info, fa->feature_set);
 	if (val)
@@ -289,6 +306,7 @@ BTRFS_FEAT_ATTR_INCOMPAT(no_holes, NO_HOLES);
 BTRFS_FEAT_ATTR_INCOMPAT(metadata_uuid, METADATA_UUID);
 BTRFS_FEAT_ATTR_COMPAT_RO(free_space_tree, FREE_SPACE_TREE);
 BTRFS_FEAT_ATTR_COMPAT_RO(block_group_tree, BLOCK_GROUP_TREE);
+BTRFS_FEAT_ATTR_COMPAT_RO(raid56_write_intent, RAID56_WRITE_INTENT);
 BTRFS_FEAT_ATTR_INCOMPAT(raid1c34, RAID1C34);
 BTRFS_FEAT_ATTR_INCOMPAT(simple_quota, SIMPLE_QUOTA);
 #ifdef CONFIG_BLK_DEV_ZONED
@@ -326,6 +344,7 @@ static struct attribute *btrfs_supported_feature_attrs[] = {
 	BTRFS_FEAT_ATTR_PTR(free_space_tree),
 	BTRFS_FEAT_ATTR_PTR(raid1c34),
 	BTRFS_FEAT_ATTR_PTR(block_group_tree),
+	BTRFS_FEAT_ATTR_PTR(raid56_write_intent),
 	BTRFS_FEAT_ATTR_PTR(simple_quota),
 #ifdef CONFIG_BLK_DEV_ZONED
 	BTRFS_FEAT_ATTR_PTR(zoned),
@@ -1319,6 +1338,40 @@ static ssize_t btrfs_temp_fsid_show(struct kobject *kobj,
 }
 BTRFS_ATTR(, temp_fsid, btrfs_temp_fsid_show);
 
+static ssize_t btrfs_raid56_write_intent_show(struct kobject *kobj,
+					      struct kobj_attribute *a, char *buf)
+{
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj);
+	struct btrfs_wib *wib = fs_info->wib;
+	bool enabled;
+	unsigned int nr_inflight = 0;
+	unsigned int nr_sticky = 0;
+
+	if (!wib)
+		return sysfs_emit(buf, "unsupported\n");
+
+	spin_lock(&wib->lock);
+	enabled = wib->enabled;
+	for (int i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+		nr_inflight += hweight64(wib->entries[i].bitmap);
+		nr_sticky += hweight64(wib->entries[i].sticky);
+	}
+	spin_unlock(&wib->lock);
+
+	return sysfs_emit(buf,
+		"enabled %d\ninflight_blocks %u\nsticky_blocks %u\npending_recovery_regions %u\nmarks %llu\ncommits %llu\ncommit_flushes %llu\ncommit_errors %llu\nrecovered_stripes %llu\nrecovery_errors %llu\nsticky_total %llu\nsticky_evicted %llu\n",
+		enabled, nr_inflight, nr_sticky, wib->nr_pending,
+		(unsigned long long)atomic64_read(&wib->stat_marks),
+		(unsigned long long)atomic64_read(&wib->stat_commits),
+		(unsigned long long)atomic64_read(&wib->stat_commit_flushes),
+		(unsigned long long)atomic64_read(&wib->stat_commit_errors),
+		(unsigned long long)atomic64_read(&wib->stat_recovered_stripes),
+		(unsigned long long)atomic64_read(&wib->stat_recovery_errors),
+		(unsigned long long)atomic64_read(&wib->stat_sticky),
+		(unsigned long long)atomic64_read(&wib->stat_sticky_evicted));
+}
+BTRFS_ATTR(, raid56_write_intent, btrfs_raid56_write_intent_show);
+
 static const char *btrfs_read_policy_name[] = {
 	"pid",
 #ifdef CONFIG_BTRFS_EXPERIMENTAL
@@ -1560,6 +1613,7 @@ static const struct attribute *btrfs_attrs[] = {
 	BTRFS_ATTR_PTR(, bg_reclaim_threshold),
 	BTRFS_ATTR_PTR(, commit_stats),
 	BTRFS_ATTR_PTR(, temp_fsid),
+	BTRFS_ATTR_PTR(, raid56_write_intent),
 	NULL,
 };
 

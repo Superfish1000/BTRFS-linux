@@ -52,6 +52,7 @@
 #include "discard.h"
 #include "qgroup.h"
 #include "raid56.h"
+#include "raid56-wib.h"
 #include "fs.h"
 #include "accessors.h"
 #include "defrag.h"
@@ -114,6 +115,7 @@ enum {
 	Opt_discard_mode,
 	Opt_ratio,
 	Opt_rescan_uuid_tree,
+	Opt_raid56_write_intent,
 	Opt_skip_balance,
 	Opt_space_cache,
 	Opt_space_cache_version,
@@ -234,6 +236,7 @@ static const struct fs_parameter_spec btrfs_fs_parameters[] = {
 	fsparam_string("max_inline", Opt_max_inline),
 	fsparam_u32("metadata_ratio", Opt_ratio),
 	fsparam_flag("rescan_uuid_tree", Opt_rescan_uuid_tree),
+	fsparam_flag_no("raid56_write_intent", Opt_raid56_write_intent),
 	fsparam_flag("skip_balance", Opt_skip_balance),
 	fsparam_flag_no("space_cache", Opt_space_cache),
 	fsparam_enum("space_cache", Opt_space_cache_version, btrfs_parameter_space_cache),
@@ -539,6 +542,12 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_rescan_uuid_tree:
 		btrfs_set_opt(ctx->mount_opt, RESCAN_UUID_TREE);
+		break;
+	case Opt_raid56_write_intent:
+		if (result.negated)
+			btrfs_set_opt(ctx->mount_opt, NORAID56_WRITE_INTENT);
+		else
+			btrfs_clear_opt(ctx->mount_opt, NORAID56_WRITE_INTENT);
 		break;
 	case Opt_clear_cache:
 		btrfs_set_opt(ctx->mount_opt, CLEAR_CACHE);
@@ -1141,6 +1150,8 @@ static int btrfs_show_options(struct seq_file *seq, struct dentry *dentry)
 		seq_puts(seq, ",ref_verify");
 	if (btrfs_test_opt(info, REF_TRACKER))
 		seq_puts(seq, ",ref_tracker");
+	if (btrfs_test_opt(info, NORAID56_WRITE_INTENT))
+		seq_puts(seq, ",noraid56_write_intent");
 	seq_printf(seq, ",subvolid=%llu", btrfs_root_id(BTRFS_I(d_inode(dentry))->root));
 	subvol_name = btrfs_get_subvol_name_from_objectid(info,
 			btrfs_root_id(BTRFS_I(d_inode(dentry))->root));
@@ -1318,6 +1329,15 @@ static int btrfs_remount_rw(struct btrfs_fs_info *fs_info)
 	 * anywhere above this point, as we are not sure to be safe to write
 	 * until we pass the above checks.
 	 */
+
+	/* RAID56 parity regeneration must precede every other write. */
+	ret = btrfs_wib_rw_mount(fs_info, false, false);
+	if (ret) {
+		btrfs_err(fs_info, "failed to replay raid56 write-intent log: %pe",
+			  ERR_PTR(ret));
+		return ret;
+	}
+
 	ret = btrfs_start_pre_rw_mount(fs_info);
 	if (ret)
 		return ret;

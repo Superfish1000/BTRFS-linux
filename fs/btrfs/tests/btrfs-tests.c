@@ -17,6 +17,7 @@
 #include "../qgroup.h"
 #include "../block-group.h"
 #include "../fs.h"
+#include "../raid56-wib.h"
 
 static struct vfsmount *test_mnt = NULL;
 
@@ -166,6 +167,7 @@ void btrfs_free_dummy_fs_info(struct btrfs_fs_info *fs_info)
 		return;
 
 	test_mnt->mnt_sb->s_fs_info = NULL;
+	btrfs_wib_free(fs_info);
 
 	xa_lock_irq(&fs_info->buffer_tree);
 	xa_for_each(&fs_info->buffer_tree, index, eb) {
@@ -299,6 +301,9 @@ int btrfs_run_sanity_tests(void)
 			if (ret)
 				goto out;
 			ret = btrfs_test_chunk_allocation(sectorsize, nodesize);
+			if (ret)
+				goto out;
+			ret = btrfs_test_raid56_wib(sectorsize, nodesize);
 			if (ret)
 				goto out;
 		}

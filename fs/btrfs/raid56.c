@@ -21,6 +21,8 @@
 #include "async-thread.h"
 #include "file-item.h"
 #include "btrfs_inode.h"
+#include "raid56-wib.h"
+#include "ordered-data.h"
 
 /* set when additional merges to this rbio are not allowed */
 #define RBIO_RMW_LOCKED_BIT	1
@@ -35,6 +37,44 @@
  * set when it is safe to trust the stripe_pages for caching
  */
 #define RBIO_CACHE_READY_BIT	3
+
+/*
+ * Set if any bio of the rbio overwrites referenced sectors in place
+ * (nodatacow or preallocated extents).  Such a write must be recorded in
+ * the write-intent log even when it covers the full stripe: a crash in the
+ * middle of it leaves committed data without valid parity.
+ */
+#define RBIO_INPLACE_BIT	4
+
+/*
+ * Set on a parity scrub rbio used by the write-intent log recovery: a
+ * failed parity write fails the rbio even when it is within the RAID's
+ * tolerance, because the recovery must know that the parity on disk is
+ * still stale.
+ */
+#define RBIO_STRICT_WRITE_BIT	5
+
+#ifdef CONFIG_BTRFS_DEBUG
+/*
+ * Crash injection for testing the write-intent log, module parameter
+ * btrfs.raid56_crash_point:
+ *
+ *  1: the next sub-stripe RMW drops its P/Q writes, waits for its data
+ *     writes to complete and then panics.
+ *  2: the next sub-stripe RMW drops its data writes, waits for its P/Q
+ *     writes to complete and then panics.
+ *  3: like 1 but without the panic, leaving a silently stale parity behind.
+ *  4: the next parity scrub (as used by the write-intent log replay) panics
+ *     before writing the regenerated parity (can be given on the kernel
+ *     command line to crash the replay).
+ *
+ * Only the first matching rbio after the parameter is set is affected.
+ */
+static int btrfs_raid56_crash_point;
+module_param_named(raid56_crash_point, btrfs_raid56_crash_point, int, 0644);
+MODULE_PARM_DESC(raid56_crash_point,
+		 "Inject a crash into the next RAID56 sub-stripe write (testing only)");
+#endif
 
 #define RBIO_CACHE_SIZE 1024
 
@@ -455,6 +495,8 @@ static void merge_rbio(struct btrfs_raid_bio *dest,
 	/* Also inherit the bitmaps from @victim. */
 	bitmap_or(&dest->dbitmap, &victim->dbitmap, &dest->dbitmap,
 		  dest->stripe_nsectors);
+	if (test_bit(RBIO_INPLACE_BIT, &victim->flags))
+		set_bit(RBIO_INPLACE_BIT, &dest->flags);
 }
 
 /*
@@ -1437,7 +1479,7 @@ static void generate_pq_vertical(struct btrfs_raid_bio *rbio, int sectornr)
 }
 
 static int rmw_assemble_write_bios(struct btrfs_raid_bio *rbio,
-				   struct bio_list *bio_list)
+				   struct bio_list *bio_list, int crash_point)
 {
 	/* The total sector number inside the full stripe. */
 	int total_sector_nr;
@@ -1475,8 +1517,14 @@ static int rmw_assemble_write_bios(struct btrfs_raid_bio *rbio,
 			paddrs = sector_paddrs_in_rbio(rbio, stripe, sectornr, 1);
 			if (paddrs == NULL)
 				continue;
+			/* Testing: pretend the data writes never reached the disk. */
+			if (unlikely(crash_point == 2))
+				continue;
 		} else {
 			paddrs = rbio_stripe_paddrs(rbio, stripe, sectornr);
+			/* Testing: pretend the P/Q writes never reached the disk. */
+			if (unlikely(crash_point == 1 || crash_point == 3))
+				continue;
 		}
 
 		ret = rbio_add_io_paddrs(rbio, bio_list, paddrs, stripe,
@@ -1839,6 +1887,23 @@ static void rbio_add_bio(struct btrfs_raid_bio *rbio, struct bio *orig_bio)
 /*
  * our main entry point for writes from the rest of the FS.
  */
+/*
+ * Does this data write overwrite sectors that are already referenced?
+ * Only nodatacow and preallocated extents are written in place; everything
+ * else (COW data, metadata, tree log blocks) goes to unreferenced space.
+ */
+static bool bio_writes_in_place(struct bio *bio)
+{
+	struct btrfs_bio *bbio = btrfs_bio(bio);
+
+	if (!bbio->inode || !is_data_inode(bbio->inode))
+		return false;
+	if (!bbio->ordered)
+		return false;
+	return test_bit(BTRFS_ORDERED_NOCOW, &bbio->ordered->flags) ||
+	       test_bit(BTRFS_ORDERED_PREALLOC, &bbio->ordered->flags);
+}
+
 void raid56_parity_write(struct bio *bio, struct btrfs_io_context *bioc)
 {
 	struct btrfs_fs_info *fs_info = bioc->fs_info;
@@ -1853,6 +1918,8 @@ void raid56_parity_write(struct bio *bio, struct btrfs_io_context *bioc)
 		return;
 	}
 	rbio->operation = BTRFS_RBIO_WRITE;
+	if (bio_writes_in_place(bio))
+		set_bit(RBIO_INPLACE_BIT, &rbio->flags);
 	rbio_add_bio(rbio, bio);
 
 	/*
@@ -2437,7 +2504,12 @@ static bool need_read_stripe_sectors(struct btrfs_raid_bio *rbio)
 
 static void rmw_rbio(struct btrfs_raid_bio *rbio)
 {
+	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
+	const u64 full_stripe_start = rbio->bioc->full_stripe_logical;
+	const u64 full_stripe_len = (u64)rbio->nr_data << BTRFS_STRIPE_LEN_SHIFT;
 	struct bio_list bio_list;
+	bool logged = false;
+	int crash_point = 0;
 	int sectornr;
 	int ret = 0;
 
@@ -2478,6 +2550,37 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	set_bit(RBIO_RMW_LOCKED_BIT, &rbio->flags);
 	spin_unlock(&rbio->bio_list_lock);
 
+	/*
+	 * A sub-stripe write leaves the full stripe inconsistent if we crash
+	 * in the middle of its writes, and other, committed data in the same
+	 * vertical stripes would then lose its redundancy.  Record the full
+	 * stripe in the write-intent log before submitting anything, so that
+	 * the parity can be regenerated at the next mount.
+	 *
+	 * Full stripe COW writes only touch freshly allocated space and need
+	 * no record: every sector of the stripe is unreferenced until the
+	 * transaction referencing it commits, which happens only after all
+	 * these writes have completed and been flushed.  In-place writes
+	 * (nodatacow, prealloc) overwrite referenced sectors and are recorded
+	 * even when they cover the full stripe.
+	 */
+	if (!rbio_is_full(rbio) || test_bit(RBIO_INPLACE_BIT, &rbio->flags)) {
+		ret = btrfs_wib_mark(fs_info, full_stripe_start, full_stripe_len);
+		if (ret < 0)
+			goto out;
+		logged = true;
+#ifdef CONFIG_BTRFS_DEBUG
+		if (unlikely(READ_ONCE(btrfs_raid56_crash_point) >= 1 &&
+			     READ_ONCE(btrfs_raid56_crash_point) <= 3)) {
+			crash_point = xchg(&btrfs_raid56_crash_point, 0);
+			if (crash_point)
+				btrfs_crit(fs_info,
+			"raid56 crash injection %d armed for full stripe %llu",
+					   crash_point, full_stripe_start);
+		}
+#endif
+	}
+
 	bitmap_clear(rbio->error_bitmap, 0, rbio->nr_sectors);
 
 	index_rbio_pages(rbio);
@@ -2497,7 +2600,7 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 		generate_pq_vertical(rbio, sectornr);
 
 	bio_list_init(&bio_list);
-	ret = rmw_assemble_write_bios(rbio, &bio_list);
+	ret = rmw_assemble_write_bios(rbio, &bio_list, crash_point);
 	if (ret < 0)
 		goto out;
 
@@ -2505,6 +2608,12 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	ASSERT(bio_list_size(&bio_list));
 	submit_write_bios(rbio, &bio_list);
 	wait_event(rbio->io_wait, atomic_read(&rbio->stripes_pending) == 0);
+
+#ifdef CONFIG_BTRFS_DEBUG
+	if (unlikely(crash_point == 1 || crash_point == 2))
+		panic("btrfs: raid56 crash injection %d at full stripe %llu",
+		      crash_point, full_stripe_start);
+#endif
 
 	/* We may have more errors than our tolerance during the read. */
 	for (sectornr = 0; sectornr < rbio->stripe_nsectors; sectornr++) {
@@ -2517,6 +2626,26 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 		}
 	}
 out:
+	/*
+	 * All writes of this RMW have completed (or none were submitted),
+	 * the stripe can leave the in-flight set.  The on-disk log is
+	 * updated lazily with a flush, see raid56-wib.c.
+	 *
+	 * If any write failed (device error or missing device) the stripe is
+	 * inconsistent on that device even without a crash; it stays logged
+	 * so that the parity is regenerated at the next mount.
+	 */
+	if (logged)
+		btrfs_wib_done(fs_info, full_stripe_start, full_stripe_len,
+			       ret < 0 || !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors));
+	else if (ret >= 0 && !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors))
+		/*
+		 * A full stripe write that a device did not take (within the
+		 * tolerance): that device holds a stale sector of what is
+		 * about to be committed, record the stripe for the next
+		 * mount's scrub like a failed RMW.
+		 */
+		btrfs_wib_add_sticky(fs_info, full_stripe_start, full_stripe_len);
 	rbio_orig_end_io(rbio, errno_to_blk_status(ret));
 }
 
@@ -2963,6 +3092,12 @@ static void scrub_rbio(struct btrfs_raid_bio *rbio)
 	 * We have every sector properly prepared. Can finish the scrub
 	 * and writeback the good content.
 	 */
+#ifdef CONFIG_BTRFS_DEBUG
+	if (unlikely(READ_ONCE(btrfs_raid56_crash_point) == 4) &&
+	    xchg(&btrfs_raid56_crash_point, 0) == 4)
+		panic("btrfs: raid56 crash injection 4 before parity write of full stripe %llu",
+		      rbio->bioc->full_stripe_logical);
+#endif
 	ret = finish_parity_scrub(rbio);
 	wait_event(rbio->io_wait, atomic_read(&rbio->stripes_pending) == 0);
 	for (sector_nr = 0; sector_nr < rbio->stripe_nsectors; sector_nr++) {
@@ -2974,8 +3109,21 @@ static void scrub_rbio(struct btrfs_raid_bio *rbio)
 			break;
 		}
 	}
+	/*
+	 * finish_parity_scrub() cleared the error bitmap before the writes,
+	 * so anything set now is a failed parity write.
+	 */
+	if (ret == 0 && test_bit(RBIO_STRICT_WRITE_BIT, &rbio->flags) &&
+	    !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors))
+		ret = -EREMOTEIO;
 out:
 	rbio_orig_end_io(rbio, errno_to_blk_status(ret));
+}
+
+/* See RBIO_STRICT_WRITE_BIT. */
+void raid56_parity_scrub_rbio_strict(struct btrfs_raid_bio *rbio)
+{
+	set_bit(RBIO_STRICT_WRITE_BIT, &rbio->flags);
 }
 
 static void scrub_rbio_work_locked(struct work_struct *work)

@@ -19,6 +19,7 @@
 #include "transaction.h"
 #include "volumes.h"
 #include "raid56.h"
+#include "raid56-wib.h"
 #include "dev-replace.h"
 #include "sysfs.h"
 #include "tree-checker.h"
@@ -2543,9 +2544,14 @@ void btrfs_rm_dev_replace_free_srcdev(struct btrfs_device *srcdev)
 
 	mutex_lock(&uuid_mutex);
 
+	/*
+	 * RCU readers of the device list (the RAID56 write-intent log takes
+	 * a reference on bdev_file under RCU) must be done before the
+	 * device is closed.
+	 */
+	synchronize_rcu();
 	/* The source was made unfreezable for the replace; undo it. */
 	btrfs_close_bdev(srcdev, true);
-	synchronize_rcu();
 	btrfs_free_device(srcdev);
 
 	/* if this is no devs we rather delete the fs_devices */
@@ -2587,8 +2593,9 @@ void btrfs_destroy_dev_replace_tgtdev(struct btrfs_device *tgtdev,
 
 	btrfs_scratch_superblocks(tgtdev->fs_info, tgtdev);
 
-	btrfs_close_bdev(tgtdev, allow_freeze);
+	/* RCU readers may still hold a reference on the file, see above. */
 	synchronize_rcu();
+	btrfs_close_bdev(tgtdev, allow_freeze);
 	btrfs_free_device(tgtdev);
 }
 
@@ -3137,6 +3144,13 @@ error_sysfs:
 	btrfs_update_per_profile_avail(fs_info);
 	mutex_unlock(&fs_info->chunk_mutex);
 	mutex_unlock(&fs_info->fs_devices->device_list_mutex);
+	/*
+	 * The device was visible to RCU readers of the device list (which
+	 * may take a reference on its bdev_file, see the RAID56 write-intent
+	 * log); let them finish before the device is freed and its block
+	 * device released.
+	 */
+	synchronize_rcu();
 error_trans:
 	if (trans)
 		btrfs_end_transaction(trans);
@@ -5692,6 +5706,17 @@ static void check_raid56_incompat_flag(struct btrfs_fs_info *info, u64 type)
 	if (!(type & BTRFS_BLOCK_GROUP_RAID56_MASK))
 		return;
 
+	/*
+	 * The first RAID56 chunk of the filesystem: start the write-intent
+	 * log at this transaction's commit (we hold chunk_mutex here, no IO
+	 * allowed).  Any sub-stripe write into this chunk before that commit
+	 * can only touch data that is not yet referenced by any committed
+	 * transaction.  Later chunks don't re-enable a log the user turned
+	 * off through sysfs.
+	 */
+	if (!btrfs_fs_incompat(info, RAID56) &&
+	    !btrfs_fs_compat_ro(info, RAID56_WRITE_INTENT))
+		btrfs_wib_request_enable(info);
 	btrfs_set_fs_incompat(info, RAID56);
 }
 

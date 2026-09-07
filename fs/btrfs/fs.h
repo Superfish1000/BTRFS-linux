@@ -48,6 +48,7 @@ struct btrfs_transaction;
 struct btrfs_balance_control;
 struct btrfs_subpage_info;
 struct btrfs_stripe_hash_table;
+struct btrfs_wib;
 struct btrfs_space_info;
 
 /* Minimum data and metadata block size. */
@@ -281,6 +282,7 @@ enum {
 	BTRFS_MOUNT_IGNOREMETACSUMS		= (1ULL << 31),
 	BTRFS_MOUNT_IGNORESUPERFLAGS		= (1ULL << 32),
 	BTRFS_MOUNT_REF_TRACKER			= (1ULL << 33),
+	BTRFS_MOUNT_NORAID56_WRITE_INTENT	= (1ULL << 34),
 };
 
 /* These mount options require a full read-only fs, no new transaction is allowed. */
@@ -304,10 +306,14 @@ enum {
 	(BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE |	\
 	 BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID | \
 	 BTRFS_FEATURE_COMPAT_RO_VERITY |		\
-	 BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE)
+	 BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE |	\
+	 BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT)
 
-#define BTRFS_FEATURE_COMPAT_RO_SAFE_SET	0ULL
-#define BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR	0ULL
+/* The write-intent log can be turned on and off on a mounted filesystem. */
+#define BTRFS_FEATURE_COMPAT_RO_SAFE_SET	\
+	(BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT)
+#define BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR	\
+	(BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT)
 
 #define BTRFS_FEATURE_INCOMPAT_SUPP_STABLE		\
 	(BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF |		\
@@ -636,6 +642,8 @@ struct btrfs_fs_info {
 	 * trying to mod the same stripe at the same time.
 	 */
 	struct btrfs_stripe_hash_table *stripe_hash_table;
+	/* RAID56 write-intent log, see raid56-wib.c. */
+	struct btrfs_wib *wib;
 
 	/*
 	 * This protects the ordered operations list only while we are

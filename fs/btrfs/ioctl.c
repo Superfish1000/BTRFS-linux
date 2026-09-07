@@ -58,6 +58,7 @@
 #include "file.h"
 #include "file-item.h"
 #include "scrub.h"
+#include "raid56-wib.h"
 #include "super.h"
 
 #ifdef CONFIG_64BIT
@@ -4279,6 +4280,21 @@ static int btrfs_ioctl_set_features(struct file *file, void __user *arg)
 	ret = mnt_want_write_file(file);
 	if (ret)
 		return ret;
+
+	/*
+	 * The RAID56 write-intent log must be persisted before the flag that
+	 * promises it is set, and stops being maintained (once the superblock
+	 * without the flag is durable) when it is cleared, like in sysfs.
+	 */
+	if (flags[0].compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT) {
+		if (flags[1].compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT) {
+			ret = btrfs_wib_enable(fs_info);
+			if (ret)
+				goto out_drop_write;
+		} else {
+			btrfs_wib_disable(fs_info);
+		}
+	}
 
 	trans = btrfs_start_transaction(root, 0);
 	if (IS_ERR(trans)) {
