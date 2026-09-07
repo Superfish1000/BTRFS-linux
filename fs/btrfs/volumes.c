@@ -6522,6 +6522,31 @@ int btrfs_num_copies(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	return ret;
 }
 
+/*
+ * Is @logical inside a RAID5 or RAID6 block group?
+ *
+ * Callers that need to know whether a mirror above 1 is an independent copy
+ * or a reconstruction must ask this rather than compare the full stripe
+ * length against the sector size: a RAID5 chunk with a single data stripe has
+ * a full stripe of exactly BTRFS_STRIPE_LEN, which a filesystem with 64KiB
+ * sectors cannot tell apart from a non-RAID56 chunk.
+ */
+bool btrfs_logical_is_raid56(struct btrfs_fs_info *fs_info, u64 logical)
+{
+	struct btrfs_chunk_map *map;
+	bool ret = false;
+
+	if (!btrfs_fs_incompat(fs_info, RAID56))
+		return false;
+
+	map = btrfs_get_chunk_map(fs_info, logical, fs_info->sectorsize);
+	if (!WARN_ON(IS_ERR(map))) {
+		ret = map->type & BTRFS_BLOCK_GROUP_RAID56_MASK;
+		btrfs_free_chunk_map(map);
+	}
+	return ret;
+}
+
 unsigned long btrfs_full_stripe_len(struct btrfs_fs_info *fs_info,
 				    u64 logical)
 {

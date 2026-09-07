@@ -188,11 +188,7 @@ static bool repair_read_is_reconstruction(struct btrfs_fs_info *fs_info,
 {
 	if (mirror_num <= 1)
 		return false;
-	/*
-	 * Returns fs_info->sectorsize for every non-RAID56 chunk, and the full
-	 * stripe length for RAID5/RAID6.
-	 */
-	return btrfs_full_stripe_len(fs_info, logical) != fs_info->sectorsize;
+	return btrfs_logical_is_raid56(fs_info, logical);
 }
 
 static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
