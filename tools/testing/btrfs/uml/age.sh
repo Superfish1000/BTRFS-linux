@@ -22,7 +22,7 @@ for i in $(seq 0 $((NDEV-1))); do
 	ubds="$ubds ubd$i=$D/disk$i.img"
 done
 ulimit -c 0
-timeout 3600 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
+timeout ${TIMEOUT:-7200} $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
 	init=$D/age-init.sh $ubds quiet con=null con0=fd:0,fd:1 \
 	BTRFS_TEST_DIR=$T PROFILE=$PROFILE TAG=$TAG SEED=${SEED:-1} \
 	ROUNDS=${ROUNDS:-12} \

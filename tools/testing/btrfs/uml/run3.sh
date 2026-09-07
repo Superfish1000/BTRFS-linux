@@ -6,6 +6,9 @@
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
 KERNEL=${1:?usage: see README.md}; TAG=$2; PROFILE=$3; OPTS=$4; CRASH=$5; NDEV=${6:-4}
+HERE=$(cd "$(dirname "$0")" && pwd)
+mkdir -p $T/umltest
+cp $HERE/init-final3.sh $T/umltest/init-final3.sh
 D=$T/umltest/$TAG
 rm -rf $D; mkdir -p $D
 rm -f $T/umltest/results.$TAG $T/umltest/manifest.$TAG $T/umltest/nocow.md5.$TAG $T/umltest/old.md5.$TAG
@@ -23,7 +26,7 @@ boot() {
 	omit=${omit// /-}
 	local extra="${4:-}" suffix="${5:-}"
 	timeout 1800 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
-		init=$T/umltest/init-final2.sh $ubds quiet con=null con0=fd:0,fd:1 \
+		init=$T/umltest/init-final3.sh $ubds quiet con=null con0=fd:0,fd:1 BTRFS_TEST_DIR=$T \
 		MODE=$mode OPTS=$OPTS PROFILE=$PROFILE CRASH=$CRASH TAG=$TAG \
 		MNTDEV=$mntdev NDEV=$NDEV CONVERT=${CONVERT:-} $extra > $D/log.$mode.omit$omit$suffix 2>&1
 	echo "boot $mode omit=$omit$suffix rc=$?" >> $T/umltest/results.$TAG

@@ -6,6 +6,9 @@
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
 KERNEL=$1; TAG=$2; PROFILE=$3; OPTS=$4; NDEV=${5:-4}; ITER=${6:-3}
+HERE=$(cd "$(dirname "$0")" && pwd)
+mkdir -p $T/umltest
+cp $HERE/init-final3.sh $T/umltest/init-final3.sh
 D=$T/umltest/$TAG
 rm -rf $D; mkdir -p $D
 rm -f $T/umltest/results.$TAG
@@ -18,7 +21,7 @@ ubds_for() {
 	done
 	echo $ubds
 }
-common="mem=1G rootfstype=hostfs rootflags=/ rw init=$T/umltest/init-final2.sh quiet con=null con0=fd:0,fd:1 OPTS=$OPTS PROFILE=$PROFILE TAG=$TAG NDEV=$NDEV CRASH=0"
+common="mem=1G rootfstype=hostfs rootflags=/ rw init=$T/umltest/init-final3.sh quiet con=null con0=fd:0,fd:1 BTRFS_TEST_DIR=$T OPTS=$OPTS PROFILE=$PROFILE TAG=$TAG NDEV=$NDEV CRASH=0"
 for it in $(seq 1 $ITER); do
 	for i in $(seq 0 $((NDEV-1))); do rm -f $D/disk$i.img; truncate -s 2G $D/disk$i.img; done
 	$KERNEL $common $(ubds_for none) MODE=stress MNTDEV=/dev/ubda > $D/log.stress.$it 2>&1 &
