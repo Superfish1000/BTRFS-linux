@@ -513,6 +513,24 @@ void btrfs_calculate_block_csum_pages(struct btrfs_fs_info *fs_info,
 				      const phys_addr_t paddrs[], u8 *dest);
 int btrfs_check_block_csum(struct btrfs_fs_info *fs_info, phys_addr_t paddr, u8 *csum,
 			   const u8 * const csum_expected);
+/*
+ * Outcome of the data checksum verification of a single block.
+ *
+ * BTRFS_CSUM_NONE is not a success: nothing was compared, because the block has
+ * no checksum (a NODATASUM/NODATACOW inode, or a NODATASUM range of the data
+ * reloc inode).  A caller that only serves the content to the reader can treat
+ * it like BTRFS_CSUM_OK; a caller that persists the content must not.
+ */
+enum btrfs_csum_result {
+	BTRFS_CSUM_OK,
+	BTRFS_CSUM_NONE,
+	BTRFS_CSUM_MISMATCH,
+};
+
+enum btrfs_csum_result btrfs_data_csum_check(struct btrfs_bio *bbio,
+					     struct btrfs_device *dev,
+					     u32 bio_offset,
+					     const phys_addr_t paddrs[]);
 bool btrfs_data_csum_ok(struct btrfs_bio *bbio, struct btrfs_device *dev,
 			u32 bio_offset, const phys_addr_t paddrs[]);
 noinline int can_nocow_extent(struct btrfs_inode *inode, u64 offset, u64 *len,

@@ -3545,8 +3545,10 @@ int btrfs_check_block_csum(struct btrfs_fs_info *fs_info, phys_addr_t paddr, u8 
  *
  * Return %true if the sector is ok or had no checksum to start with, else %false.
  */
-bool btrfs_data_csum_ok(struct btrfs_bio *bbio, struct btrfs_device *dev,
-			u32 bio_offset, const phys_addr_t paddrs[])
+enum btrfs_csum_result btrfs_data_csum_check(struct btrfs_bio *bbio,
+					     struct btrfs_device *dev,
+					     u32 bio_offset,
+					     const phys_addr_t paddrs[])
 {
 	struct btrfs_inode *inode = bbio->inode;
 	struct btrfs_fs_info *fs_info = inode->root->fs_info;
@@ -3559,7 +3561,7 @@ bool btrfs_data_csum_ok(struct btrfs_bio *bbio, struct btrfs_device *dev,
 	u8 csum[BTRFS_CSUM_SIZE];
 
 	if (!bbio->csum)
-		return true;
+		return BTRFS_CSUM_NONE;
 
 	if (btrfs_is_data_reloc_root(inode->root) &&
 	    btrfs_test_range_bit(&inode->io_tree, file_offset, end, EXTENT_NODATASUM,
@@ -3567,7 +3569,7 @@ bool btrfs_data_csum_ok(struct btrfs_bio *bbio, struct btrfs_device *dev,
 		/* Skip the range without csum for data reloc inode */
 		btrfs_clear_extent_bit(&inode->io_tree, file_offset, end,
 				       EXTENT_NODATASUM, NULL);
-		return true;
+		return BTRFS_CSUM_NONE;
 	}
 
 	csum_expected = bbio->csum + (bio_offset >> fs_info->sectorsize_bits) *
@@ -3575,7 +3577,7 @@ bool btrfs_data_csum_ok(struct btrfs_bio *bbio, struct btrfs_device *dev,
 	btrfs_calculate_block_csum_pages(fs_info, paddrs, csum);
 	if (unlikely(memcmp(csum, csum_expected, fs_info->csum_size) != 0))
 		goto zeroit;
-	return true;
+	return BTRFS_CSUM_OK;
 
 zeroit:
 	btrfs_print_data_csum_error(inode, file_offset, csum, csum_expected,
@@ -3584,7 +3586,14 @@ zeroit:
 		btrfs_dev_stat_inc_and_print(dev, BTRFS_DEV_STAT_CORRUPTION_ERRS);
 	for (int i = 0; i < nr_steps; i++)
 		memzero_page(phys_to_page(paddrs[i]), offset_in_page(paddrs[i]), step);
-	return false;
+	return BTRFS_CSUM_MISMATCH;
+}
+
+bool btrfs_data_csum_ok(struct btrfs_bio *bbio, struct btrfs_device *dev,
+			u32 bio_offset, const phys_addr_t paddrs[])
+{
+	return btrfs_data_csum_check(bbio, dev, bio_offset, paddrs) !=
+	       BTRFS_CSUM_MISMATCH;
 }
 
 /*

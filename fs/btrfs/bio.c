@@ -174,6 +174,27 @@ static void btrfs_repair_done(struct btrfs_failed_bio *fbio)
 	}
 }
 
+/*
+ * Did a repair read of @logical at @mirror_num produce a reconstruction rather
+ * than an independent copy of the block?
+ *
+ * For RAID1/RAID1C3/RAID1C4/RAID10/DUP every mirror is a full copy of the
+ * block, written independently.  For RAID56 only mirror 1 is; every higher
+ * mirror is raid56_parity_recover() computing the block from the parity and
+ * from every other data stripe of the same vertical stripe.
+ */
+static bool repair_read_is_reconstruction(struct btrfs_fs_info *fs_info,
+					  u64 logical, int mirror_num)
+{
+	if (mirror_num <= 1)
+		return false;
+	/*
+	 * Returns fs_info->sectorsize for every non-RAID56 chunk, and the full
+	 * stripe length for RAID5/RAID6.
+	 */
+	return btrfs_full_stripe_len(fs_info, logical) != fs_info->sectorsize;
+}
+
 static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
 				 struct btrfs_device *dev)
 {
@@ -192,6 +213,7 @@ static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
 	phys_addr_t paddrs[BTRFS_MAX_BLOCKSIZE / PAGE_SIZE];
 	phys_addr_t paddr;
 	unsigned int slot = 0;
+	enum btrfs_csum_result csum_result;
 
 	/* Repair bbio should be eaxctly one block sized. */
 	ASSERT(repair_bbio->saved_iter.bi_size == fs_info->sectorsize);
@@ -202,8 +224,18 @@ static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
 		slot++;
 	}
 
-	if (repair_bbio->bio.bi_status ||
-	    !btrfs_data_csum_ok(repair_bbio, dev, 0, paddrs)) {
+	/*
+	 * Keep the short circuit the || used to give: on an I/O error there is
+	 * no content to check, and running the check anyway would report a
+	 * checksum mismatch and bump the device's corruption counter for what
+	 * is a plain read error.
+	 */
+	if (repair_bbio->bio.bi_status)
+		csum_result = BTRFS_CSUM_MISMATCH;
+	else
+		csum_result = btrfs_data_csum_check(repair_bbio, dev, 0, paddrs);
+
+	if (csum_result == BTRFS_CSUM_MISMATCH) {
 		bio_reset(&repair_bbio->bio, NULL, REQ_OP_READ);
 		repair_bbio->bio.bi_iter = repair_bbio->saved_iter;
 
@@ -216,6 +248,39 @@ static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
 
 		btrfs_submit_bbio(repair_bbio, mirror);
 		return;
+	}
+
+	/*
+	 * Hand the content to the reader, but write it back over the copy that
+	 * failed only if we may trust it.
+	 *
+	 * A block with no checksum passes the check above without anything
+	 * being compared.  For a real mirror that is still worth persisting:
+	 * the content is an independent copy that a device returned without
+	 * error, and the failed copy gets its redundancy back.
+	 *
+	 * For RAID56 it is not.  A mirror > 1 is not a copy of the block:
+	 * raid56_parity_recover() reconstructs it as P ^ (every other data
+	 * stripe of the vertical stripe), and none of those inputs is verified
+	 * - parity carries no checksum at all, and recover_rbio() never calls
+	 * fill_data_csums(), so rbio->csum_bitmap stays NULL and
+	 * verify_one_sector() is a no-op for BTRFS_RBIO_READ_REBUILD.  If the
+	 * parity is stale, or any other data stripe of the vertical stripe is
+	 * silently corrupt, the reconstruction is garbage.
+	 *
+	 * Persisting that garbage is strictly worse than not repairing.  One
+	 * bio status fails every block of the bio, so most of the blocks
+	 * overwritten were readable and correct; and the value written is by
+	 * construction the one the parity implies, so the full stripe ends up
+	 * self-consistent and a later scrub cannot detect it either.  A
+	 * detected read error would become permanent, silent corruption.
+	 */
+	if (csum_result == BTRFS_CSUM_NONE &&
+	    repair_read_is_reconstruction(fs_info, logical, mirror)) {
+		btrfs_warn_rl(fs_info,
+"read error at logical %llu rebuilt from parity but not written back: block has no checksum, the rebuild cannot be verified",
+			      logical);
+		goto done;
 	}
 
 	do {
