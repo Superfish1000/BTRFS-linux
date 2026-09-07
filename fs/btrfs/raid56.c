@@ -1524,6 +1524,9 @@ static int rmw_assemble_write_bios(struct btrfs_raid_bio *rbio,
 {
 	/* The total sector number inside the full stripe. */
 	int total_sector_nr;
+	struct btrfs_raid56_write_stats *stats;
+	u64 resident = 0;
+	u64 supplied = 0;
 	int sectornr;
 	int stripe;
 	int ret;
@@ -1532,6 +1535,9 @@ static int rmw_assemble_write_bios(struct btrfs_raid_bio *rbio,
 
 	/* We should have at least one data sector. */
 	ASSERT(bitmap_weight(&rbio->dbitmap, rbio->stripe_nsectors));
+
+	/* Accounting only, see struct btrfs_raid56_write_stats. */
+	stats = &rbio->bioc->fs_info->raid56_write_stats;
 
 	/*
 	 * Reset errors, as we may have errors inherited from from degraded
@@ -1556,8 +1562,18 @@ static int rmw_assemble_write_bios(struct btrfs_raid_bio *rbio,
 
 		if (stripe < rbio->nr_data) {
 			paddrs = sector_paddrs_in_rbio(rbio, stripe, sectornr, 1);
-			if (paddrs == NULL)
+			/*
+			 * A data sector of a touched vertical stripe that this
+			 * write does not supply: it was read off the disks (or
+			 * reconstructed) to recompute the parity, and its
+			 * redundancy is what a crash in the middle of these
+			 * writes puts at risk.
+			 */
+			if (paddrs == NULL) {
+				resident++;
 				continue;
+			}
+			supplied++;
 			/* Testing: pretend the data writes never reached the disk. */
 			if (unlikely(crash_point == 2))
 				continue;
@@ -1572,6 +1588,18 @@ static int rmw_assemble_write_bios(struct btrfs_raid_bio *rbio,
 					 sectornr, REQ_OP_WRITE);
 		if (ret)
 			goto error;
+	}
+
+	if (!rbio_is_full(rbio)) {
+		atomic64_inc(&stats->partial);
+		atomic64_add(bitmap_weight(&rbio->dbitmap, rbio->stripe_nsectors),
+			     &stats->partial_vstripes);
+		atomic64_add(supplied, &stats->partial_sectors);
+		atomic64_add(resident, &stats->partial_resident);
+	} else if (test_bit(RBIO_INPLACE_BIT, &rbio->flags)) {
+		atomic64_inc(&stats->inplace);
+	} else {
+		atomic64_inc(&stats->full);
 	}
 
 	if (likely(!rbio->bioc->replace_nr_stripes))

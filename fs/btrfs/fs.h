@@ -506,6 +506,33 @@ struct btrfs_delayed_root {
 struct btrfs_free_space_ctl;
 struct btrfs_free_space;
 
+/*
+ * Counters for how RAID5/6 writes divide between the case that is safe by
+ * construction and the case the write hole comes from.  Read through
+ * /sys/fs/btrfs/<uuid>/raid56_write_profile.
+ *
+ * A full-stripe copy-on-write touches only sectors that no committed
+ * transaction references yet, so a crash in the middle of it can lose
+ * nothing.  A sub-stripe write recomputes parity over vertical stripes that
+ * already hold committed data, and it is the sectors it does *not* write --
+ * @partial_resident -- whose redundancy is at stake while it runs.  That
+ * number is the size of the exposure, and nothing in btrfs reports it today.
+ */
+struct btrfs_raid56_write_stats {
+	/* Full-stripe writes into freshly allocated space. */
+	atomic64_t full;
+	/* Full-stripe writes over referenced sectors (nodatacow, prealloc). */
+	atomic64_t inplace;
+	/* Sub-stripe writes: read-modify-write of an existing full stripe. */
+	atomic64_t partial;
+	/* Vertical stripes those sub-stripe writes recomputed parity over. */
+	atomic64_t partial_vstripes;
+	/* Data sectors they supplied themselves. */
+	atomic64_t partial_sectors;
+	/* Data sectors in the same vertical stripes that they did not. */
+	atomic64_t partial_resident;
+};
+
 struct btrfs_fs_info {
 	u8 chunk_tree_uuid[BTRFS_UUID_SIZE];
 	unsigned long flags;
@@ -644,6 +671,8 @@ struct btrfs_fs_info {
 	struct btrfs_stripe_hash_table *stripe_hash_table;
 	/* RAID56 write-intent log, see raid56-wib.c. */
 	struct btrfs_wib *wib;
+	/* How RAID56 writes divide, see rmw_assemble_write_bios(). */
+	struct btrfs_raid56_write_stats raid56_write_stats;
 
 	/*
 	 * This protects the ordered operations list only while we are

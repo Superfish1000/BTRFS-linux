@@ -1376,6 +1376,29 @@ static ssize_t btrfs_raid56_write_intent_show(struct kobject *kobj,
 }
 BTRFS_ATTR(, raid56_write_intent, btrfs_raid56_write_intent_show);
 
+/*
+ * How the RAID5/6 writes of this filesystem divided between the two cases
+ * that matter for the write hole.  See struct btrfs_raid56_write_stats:
+ * resident_sectors is the one to look at, the committed data whose
+ * redundancy sub-stripe writes put at stake.
+ */
+static ssize_t btrfs_raid56_write_profile_show(struct kobject *kobj,
+					       struct kobj_attribute *a, char *buf)
+{
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj);
+	const struct btrfs_raid56_write_stats *st = &fs_info->raid56_write_stats;
+
+	return sysfs_emit(buf,
+		"full_stripe_writes %llu\ninplace_full_stripe_writes %llu\nsub_stripe_writes %llu\nsub_stripe_vertical_stripes %llu\nsub_stripe_written_sectors %llu\nsub_stripe_resident_sectors %llu\n",
+		(unsigned long long)atomic64_read(&st->full),
+		(unsigned long long)atomic64_read(&st->inplace),
+		(unsigned long long)atomic64_read(&st->partial),
+		(unsigned long long)atomic64_read(&st->partial_vstripes),
+		(unsigned long long)atomic64_read(&st->partial_sectors),
+		(unsigned long long)atomic64_read(&st->partial_resident));
+}
+BTRFS_ATTR(, raid56_write_profile, btrfs_raid56_write_profile_show);
+
 static const char *btrfs_read_policy_name[] = {
 	"pid",
 #ifdef CONFIG_BTRFS_EXPERIMENTAL
@@ -1618,6 +1641,7 @@ static const struct attribute *btrfs_attrs[] = {
 	BTRFS_ATTR_PTR(, commit_stats),
 	BTRFS_ATTR_PTR(, temp_fsid),
 	BTRFS_ATTR_PTR(, raid56_write_intent),
+	BTRFS_ATTR_PTR(, raid56_write_profile),
 	NULL,
 };
 

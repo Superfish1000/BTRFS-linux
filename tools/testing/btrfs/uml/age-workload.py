@@ -120,12 +120,21 @@ def main():
     def free_to(target):
         """Delete whole files until the filesystem is @target full."""
         rng.shuffle(files)
+        n = 0
         while files and data_used_frac(args.root) > target:
             p = files.pop()
             try:
                 os.unlink(p)
             except OSError:
                 pass
+            # btrfs frees the extents through delayed refs, so statvfs lags
+            # behind the unlinks.  Without this the loop reads a filesystem
+            # that still looks full and deletes far more than it was asked
+            # to, which defeats the point: a filesystem emptied in bulk gets
+            # whole block groups back and stops looking aged at all.
+            n += 1
+            if n % 16 == 0:
+                os.sync()
         os.sync()
 
     # Phase 1: fill up.  A filesystem with plenty of virgin space strands
