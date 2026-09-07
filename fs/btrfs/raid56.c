@@ -2749,6 +2749,12 @@ static bool rmw_retry_failed_sectors(struct btrfs_raid_bio *rbio)
 
 	bio_list_init(&bio_list);
 
+	/*
+	 * First pass: build the bios without touching error_bitmap.  If this
+	 * has to be abandoned part way, every failed sector must still be
+	 * recorded as failed, or the tolerance check below would count fewer
+	 * faults than the stripe really has and accept the write.
+	 */
 	for (int stripe = 0; stripe < rbio->real_stripes; stripe++) {
 		if (!rbio->bioc->stripes[stripe].dev->bdev)
 			continue;
@@ -2773,12 +2779,31 @@ static bool rmw_retry_failed_sectors(struct btrfs_raid_bio *rbio)
 				return false;
 			}
 			nr_retried++;
-			clear_bit(index, rbio->error_bitmap);
 		}
 	}
 
 	if (!nr_retried)
 		return false;
+
+	/*
+	 * Second pass, walking the same sectors: the retry is going ahead, so
+	 * hand ownership of these bits to raid_wait_write_end_io(), which sets
+	 * them again for whatever fails a second time.
+	 */
+	for (int stripe = 0; stripe < rbio->real_stripes; stripe++) {
+		if (!rbio->bioc->stripes[stripe].dev->bdev)
+			continue;
+		for (int sectornr = 0; sectornr < rbio->stripe_nsectors; sectornr++) {
+			const int index = stripe * rbio->stripe_nsectors + sectornr;
+
+			if (!test_bit(index, rbio->error_bitmap))
+				continue;
+			if (stripe < rbio->nr_data &&
+			    !sector_paddrs_in_rbio(rbio, stripe, sectornr, 1))
+				continue;
+			clear_bit(index, rbio->error_bitmap);
+		}
+	}
 
 	btrfs_warn_rl(rbio->bioc->fs_info,
 		      "raid56: retrying %u failed sectors of full stripe %llu",
