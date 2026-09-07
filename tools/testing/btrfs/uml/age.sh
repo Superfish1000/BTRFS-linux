@@ -12,7 +12,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 D=$T/umltest/$TAG
 rm -rf $D; mkdir -p $D $T/umltest
 rm -f $T/umltest/results.$TAG
-cp $HERE/age-init.sh $HERE/age-workload.py $T/umltest/
+# Into the per-tag directory, not the shared one: two runs at once would
+# otherwise overwrite the scripts under each other, and bash reads an init
+# script as it executes it -- the other guest loses its init and panics.
+cp $HERE/age-init.sh $HERE/age-workload.py $D/
 ubds=""
 for i in $(seq 0 $((NDEV-1))); do
 	truncate -s $DEVSIZE $D/disk$i.img
@@ -20,7 +23,7 @@ for i in $(seq 0 $((NDEV-1))); do
 done
 ulimit -c 0
 timeout 3600 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
-	init=$T/umltest/age-init.sh $ubds quiet con=null con0=fd:0,fd:1 \
+	init=$D/age-init.sh $ubds quiet con=null con0=fd:0,fd:1 \
 	BTRFS_TEST_DIR=$T PROFILE=$PROFILE TAG=$TAG SEED=${SEED:-1} \
 	ROUNDS=${ROUNDS:-12} \
 	FILL=$FILL > $D/log.age 2>&1

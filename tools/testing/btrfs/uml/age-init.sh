@@ -31,7 +31,7 @@ log "devices: $DEVS"
 mkfs.btrfs -f --nodiscard -d $DPROF -m $MPROF $DEVS >/dev/null 2>&1 || { log "MKFS_FAILED"; }
 mount -o rw /dev/ubda $MNT || { log "MOUNT_FAILED"; echo o > /proc/sysrq-trigger; sleep 60; }
 
-python3 $T/umltest/age-workload.py $MNT/aged \
+python3 $(dirname $0)/age-workload.py $MNT/aged \
 	--seed ${SEED:-1} --rounds ${ROUNDS:-12} --fill ${FILL:-0.75} 2>&1 |
 	while read -r l; do log "$l"; done
 
