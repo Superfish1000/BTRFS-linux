@@ -1194,6 +1194,47 @@ static int alloc_rbio_parity_pages(struct btrfs_raid_bio *rbio)
  * @faila and @failb will also be updated to the first and second stripe
  * number of the errors.
  */
+/*
+ * How many faults a vertical stripe of this rbio can survive.
+ *
+ * Deliberately not bioc->max_errors: while a device replace is running,
+ * btrfs_map_block() appends the replace target as an extra stripe and raises
+ * bioc->max_errors to cover a failure of that copy (see
+ * handle_ops_on_dev_replace()).  The RAID56 code does not track the target in
+ * error_bitmap (it only has bits for the real stripes, see alloc_rbio()), so
+ * counting real failures against the raised threshold would tolerate one more
+ * real device failure than the profile does, and a stripe that lost its
+ * redundancy would be reported as written successfully.
+ */
+static inline int rbio_max_errors(const struct btrfs_raid_bio *rbio)
+{
+	return rbio->real_stripes - rbio->nr_data;
+}
+
+/*
+ * Faults of a vertical stripe after a write: the sectors whose I/O failed,
+ * plus the sectors of a device that is missing altogether.
+ *
+ * get_rbio_vertical_errors() only sees sectors this rbio issued I/O for.  A
+ * missing device is a fault of the whole vertical stripe: the sectors of it
+ * that this write did not cover hold committed data which is now only
+ * reconstructable from the parity this write just rewrote.  Ignoring that
+ * would let a write complete successfully after leaving a vertical stripe
+ * with more faults than the profile can survive.
+ */
+static int get_rbio_vertical_faults(struct btrfs_raid_bio *rbio, int sector_nr)
+{
+	int faults = 0;
+
+	for (int stripe_nr = 0; stripe_nr < rbio->real_stripes; stripe_nr++) {
+		if (!rbio->bioc->stripes[stripe_nr].dev->bdev ||
+		    test_bit(stripe_nr * rbio->stripe_nsectors + sector_nr,
+			     rbio->error_bitmap))
+			faults++;
+	}
+	return faults;
+}
+
 static int get_rbio_vertical_errors(struct btrfs_raid_bio *rbio, int sector_nr,
 				    int *faila, int *failb)
 {
@@ -1292,7 +1333,7 @@ static int rbio_add_io_paddrs(struct btrfs_raid_bio *rbio, struct bio_list *bio_
 		/* Check if we have reached tolerance early. */
 		found_errors = get_rbio_vertical_errors(rbio, sector_nr,
 							NULL, NULL);
-		if (unlikely(found_errors > rbio->bioc->max_errors))
+		if (unlikely(found_errors > rbio_max_errors(rbio)))
 			return -EIO;
 		return 0;
 	}
@@ -1740,11 +1781,79 @@ static void verify_bio_data_sectors(struct btrfs_raid_bio *rbio,
 	}
 }
 
+/*
+ * The device a stripe bio was submitted to, or NULL if it cannot be told.
+ *
+ * Stripe bios are submitted with submit_bio() and never carry a btrfs_bio, so
+ * the block device is the only link back.  Every stripe of a bioc is on a
+ * different device, so this is unambiguous.
+ */
+static struct btrfs_device *rbio_bio_device(struct btrfs_raid_bio *rbio,
+					    const struct bio *bio)
+{
+	const struct btrfs_io_context *bioc = rbio->bioc;
+
+	if (!bio->bi_bdev)
+		return NULL;
+	for (int i = 0; i < bioc->num_stripes; i++) {
+		if (bio->bi_bdev == bioc->stripes[i].dev->bdev)
+			return bioc->stripes[i].dev;
+	}
+	return NULL;
+}
+
+/*
+ * Is this the copy of a stripe that goes to the device replace target?
+ *
+ * Such a bio carries the pages of the stripe it duplicates, so its failure
+ * must not be recorded in error_bitmap: that would count against the source
+ * device's fault budget although the source took the write.  The target is
+ * not part of the RAID redundancy yet, its failure only fails the replace.
+ */
+static bool rbio_bio_is_replace_target(struct btrfs_raid_bio *rbio,
+				       const struct bio *bio)
+{
+	const struct btrfs_io_context *bioc = rbio->bioc;
+
+	if (!bioc->replace_nr_stripes || !bio->bi_bdev)
+		return false;
+	for (int i = rbio->real_stripes; i < bioc->num_stripes; i++) {
+		if (bio->bi_bdev == bioc->stripes[i].dev->bdev)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Account a failed stripe I/O to the device, so that it shows up in
+ * "btrfs device stats" and in the log.  The RAID56 paths submit their bios
+ * directly and therefore bypass the accounting btrfs_submit_bio() does for
+ * every other I/O.
+ */
+static void rbio_account_io_error(struct btrfs_raid_bio *rbio, struct bio *bio)
+{
+	struct btrfs_device *dev = rbio_bio_device(rbio, bio);
+
+	if (!dev)
+		return;
+	if (bio_op(bio) == REQ_OP_WRITE)
+		btrfs_dev_stat_inc_and_print(dev, BTRFS_DEV_STAT_WRITE_ERRS);
+	else if (!(bio->bi_opf & REQ_RAHEAD))
+		btrfs_dev_stat_inc_and_print(dev, BTRFS_DEV_STAT_READ_ERRS);
+	btrfs_warn_rl(rbio->bioc->fs_info,
+	"raid56: %s error on %s, full stripe %llu sector %llu, status %d",
+		      bio_op(bio) == REQ_OP_WRITE ? "write" : "read",
+		      btrfs_dev_name(dev), rbio->bioc->full_stripe_logical,
+		      (u64)bio->bi_iter.bi_sector << SECTOR_SHIFT,
+		      blk_status_to_errno(bio->bi_status));
+}
+
 static void raid_wait_read_end_io(struct bio *bio)
 {
 	struct btrfs_raid_bio *rbio = bio->bi_private;
 
 	if (bio->bi_status) {
+		rbio_account_io_error(rbio, bio);
 		rbio_update_error_bitmap(rbio, bio);
 	} else {
 		set_bio_pages_uptodate(rbio, bio);
@@ -2117,7 +2226,7 @@ static int recover_vertical(struct btrfs_raid_bio *rbio, int sector_nr,
 	if (!found_errors)
 		return 0;
 
-	if (unlikely(found_errors > rbio->bioc->max_errors))
+	if (unlikely(found_errors > rbio_max_errors(rbio)))
 		return -EIO;
 
 	for (int i = 0; i < rbio->sector_nsteps; i++)
@@ -2453,8 +2562,15 @@ static void raid_wait_write_end_io(struct bio *bio)
 {
 	struct btrfs_raid_bio *rbio = bio->bi_private;
 
-	if (bio->bi_status)
-		rbio_update_error_bitmap(rbio, bio);
+	if (bio->bi_status) {
+		rbio_account_io_error(rbio, bio);
+		/*
+		 * A failed copy to the replace target says nothing about the
+		 * redundancy of the stripe; the replace itself will fail.
+		 */
+		if (!rbio_bio_is_replace_target(rbio, bio))
+			rbio_update_error_bitmap(rbio, bio);
+	}
 	bio_put(bio);
 	if (atomic_dec_and_test(&rbio->stripes_pending))
 		wake_up(&rbio->io_wait);
@@ -2500,6 +2616,72 @@ static bool need_read_stripe_sectors(struct btrfs_raid_bio *rbio)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * Retry the sectors whose write failed on a device that is still there.
+ *
+ * A write failure that stays within the profile's tolerance is accepted
+ * today, and that costs the whole vertical stripe its redundancy:
+ *
+ *  - a failed parity write leaves the parity not matching the data, so every
+ *    other sector of the stripe can no longer be reconstructed;
+ *  - a failed data write leaves that sector stale on its device, so its
+ *    committed content exists only inside the parity.
+ *
+ * Either way a single further fault anywhere in the stripe loses committed
+ * data, until the next scrub repairs it.  One retry costs almost nothing and
+ * turns the common transient failure (a bus reset, a command abort, a
+ * momentarily overloaded device) back into a fully redundant stripe.
+ *
+ * Returns true if anything was retried, in which case error_bitmap has been
+ * updated with the outcome of the retry.
+ */
+static bool rmw_retry_failed_sectors(struct btrfs_raid_bio *rbio)
+{
+	struct bio_list bio_list;
+	unsigned int nr_retried = 0;
+	int ret;
+
+	bio_list_init(&bio_list);
+
+	for (int stripe = 0; stripe < rbio->real_stripes; stripe++) {
+		if (!rbio->bioc->stripes[stripe].dev->bdev)
+			continue;
+		for (int sectornr = 0; sectornr < rbio->stripe_nsectors; sectornr++) {
+			const int index = stripe * rbio->stripe_nsectors + sectornr;
+			phys_addr_t *paddrs;
+
+			if (!test_bit(index, rbio->error_bitmap))
+				continue;
+			if (stripe < rbio->nr_data) {
+				/* Only the data sectors this rbio wrote. */
+				paddrs = sector_paddrs_in_rbio(rbio, stripe, sectornr, 1);
+				if (!paddrs)
+					continue;
+			} else {
+				paddrs = rbio_stripe_paddrs(rbio, stripe, sectornr);
+			}
+			ret = rbio_add_io_paddrs(rbio, &bio_list, paddrs, stripe,
+						 sectornr, REQ_OP_WRITE);
+			if (ret < 0) {
+				bio_list_put(&bio_list);
+				return false;
+			}
+			nr_retried++;
+			clear_bit(index, rbio->error_bitmap);
+		}
+	}
+
+	if (!nr_retried)
+		return false;
+
+	btrfs_warn_rl(rbio->bioc->fs_info,
+		      "raid56: retrying %u failed sectors of full stripe %llu",
+		      nr_retried, rbio->bioc->full_stripe_logical);
+	submit_write_bios(rbio, &bio_list);
+	wait_event(rbio->io_wait, atomic_read(&rbio->stripes_pending) == 0);
+	return true;
 }
 
 static void rmw_rbio(struct btrfs_raid_bio *rbio)
@@ -2615,12 +2797,16 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 		      crash_point, full_stripe_start);
 #endif
 
+	/*
+	 * A write failure within the tolerance still costs the vertical stripe
+	 * its redundancy, so it is worth one retry before accepting it.
+	 */
+	rmw_retry_failed_sectors(rbio);
+
 	/* We may have more errors than our tolerance during the read. */
 	for (sectornr = 0; sectornr < rbio->stripe_nsectors; sectornr++) {
-		int found_errors;
-
-		found_errors = get_rbio_vertical_errors(rbio, sectornr, NULL, NULL);
-		if (unlikely(found_errors > rbio->bioc->max_errors)) {
+		if (unlikely(get_rbio_vertical_faults(rbio, sectornr) >
+			     rbio_max_errors(rbio))) {
 			ret = -EIO;
 			break;
 		}
@@ -2635,6 +2821,22 @@ out:
 	 * inconsistent on that device even without a crash; it stays logged
 	 * so that the parity is regenerated at the next mount.
 	 */
+	/*
+	 * The caller is told this write failed.  The stripe pages hold data
+	 * that is not on disk, so they must not seed a later RMW through the
+	 * stripe cache (cache_rbio()) or the plug list hand-off
+	 * (steal_rbio()): that would compute the parity of the full stripe
+	 * from content the filesystem does not have, and a reconstruction of
+	 * a neighbouring committed sector would then return it.
+	 *
+	 * Only for a failed write.  Within the tolerance (ret == 0) the
+	 * cached content is what the filesystem was told is on disk and the
+	 * parity matches it; dropping it would make the next RMW trust the
+	 * stale sector of the device that did not take the write.
+	 */
+	if (ret < 0)
+		clear_bit(RBIO_CACHE_READY_BIT, &rbio->flags);
+
 	if (logged)
 		btrfs_wib_done(fs_info, full_stripe_start, full_stripe_len,
 			       ret < 0 || !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors));
@@ -2966,7 +3168,7 @@ static int recover_scrub_rbio(struct btrfs_raid_bio *rbio)
 
 		found_errors = get_rbio_vertical_errors(rbio, sector_nr,
 							 &faila, &failb);
-		if (unlikely(found_errors > rbio->bioc->max_errors)) {
+		if (unlikely(found_errors > rbio_max_errors(rbio))) {
 			ret = -EIO;
 			goto out;
 		}
@@ -2990,7 +3192,7 @@ static int recover_scrub_rbio(struct btrfs_raid_bio *rbio)
 		 * data, so the capability of the repair is declined.  (In the
 		 * case of RAID5, we can not repair anything.)
 		 */
-		if (unlikely(dfail > rbio->bioc->max_errors - 1)) {
+		if (unlikely(dfail > rbio_max_errors(rbio) - 1)) {
 			ret = -EIO;
 			goto out;
 		}
@@ -3104,7 +3306,7 @@ static void scrub_rbio(struct btrfs_raid_bio *rbio)
 		int found_errors;
 
 		found_errors = get_rbio_vertical_errors(rbio, sector_nr, NULL, NULL);
-		if (unlikely(found_errors > rbio->bioc->max_errors)) {
+		if (unlikely(found_errors > rbio_max_errors(rbio))) {
 			ret = -EIO;
 			break;
 		}
