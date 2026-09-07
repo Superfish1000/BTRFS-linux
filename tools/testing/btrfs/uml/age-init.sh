@@ -22,7 +22,13 @@ MPROF=${PROFILE##*:}
 DEVS=$(ls /dev/ubd[a-z] 2>/dev/null | tr '\n' ' ')
 log "devices: $DEVS"
 
-mkfs.btrfs -f -d $DPROF -m $MPROF $DEVS >/dev/null 2>&1 || { log "MKFS_FAILED"; }
+# Dump blocked tasks if a step wedges, so a hang is diagnosable from the log
+# instead of looking like a slow run.
+( sleep ${WATCHDOG:-900}; echo 8 > /proc/sys/kernel/printk
+  echo "WATCHDOG: dumping blocked tasks"; echo w > /proc/sysrq-trigger ) &
+
+# --nodiscard: these are image files, and discarding them buys nothing.
+mkfs.btrfs -f --nodiscard -d $DPROF -m $MPROF $DEVS >/dev/null 2>&1 || { log "MKFS_FAILED"; }
 mount -o rw /dev/ubda $MNT || { log "MOUNT_FAILED"; echo o > /proc/sysrq-trigger; sleep 60; }
 
 python3 $T/umltest/age-workload.py $MNT/aged \
@@ -30,6 +36,11 @@ python3 $T/umltest/age-workload.py $MNT/aged \
 	while read -r l; do log "$l"; done
 
 sync
+# The aging workload is itself a large sample of sub-stripe writes: record
+# what fraction of the writes had to touch committed data.
+for f in /sys/fs/btrfs/*/raid56_write_profile; do
+	[ -f $f ] && log "profile: $(tr '\n' ' ' < $f)"
+done
 btrfs filesystem df $MNT 2>&1 | while read -r l; do log "df: $l"; done
 btrfs filesystem usage $MNT 2>&1 | grep -aE "Device size|Free|Data,|Used:" |
 	while read -r l; do log "usage: $l"; done
