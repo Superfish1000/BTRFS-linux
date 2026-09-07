@@ -39,7 +39,14 @@ MPROF=${PROFILE##*:}
 btrfs device scan >/dev/null 2>&1
 DEVS=$(ls /dev/ubd[a-z] 2>/dev/null | tr '\n' ' ')
 log "devices present: $DEVS"
-stats() { for f in /sys/fs/btrfs/*/raid56_write_intent; do [ -f $f ] && log "${1:-sysfs}: $(tr '\n' ' ' < $f)"; done; }
+stats() {
+	for f in /sys/fs/btrfs/*/raid56_write_intent; do
+		[ -f $f ] && log "${1:-sysfs}: $(tr '\n' ' ' < $f)"
+	done
+	for f in /sys/fs/btrfs/*/raid56_write_profile; do
+		[ -f $f ] && log "${1:-sysfs}: $(tr '\n' ' ' < $f)"
+	done
+}
 do_mount() {
 	mount -o "$1" $2 $MNT && return
 	if dmesg | grep -q "log replay failed"; then

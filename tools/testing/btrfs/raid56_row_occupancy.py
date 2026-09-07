@@ -208,7 +208,7 @@ def main():
     rows = []
     print(f"{'block group':>16} {'profile':>7} {'nr_data':>7} "
           f"{'used':>10} {'free':>10} {'used%':>6} "
-          f"{'stranded':>10} {'stranded%':>9}")
+          f"{'stranded':>10} {'stranded%':>9} {'if random':>9}")
     for c in chunks:
         live, free, stranded = occupancy(c, extents)
         ss = c.sectorsize
@@ -219,18 +219,26 @@ def main():
         # How full this block group is.  Stranding is mostly a function of
         # this, so the rows of one filesystem are already a curve.
         usedpct = (100.0 * live / (live + free)) if (live + free) else 0.0
+        # What the same fullness would strand if the live sectors were
+        # scattered at random: a vertical stripe of nr_data sectors then
+        # holds live data with probability 1 - (1-u)^nr_data, and every free
+        # sector in it is stranded.  The gap between this and the measured
+        # column is what the allocator's clustering is worth.
+        u = usedpct / 100.0
+        randpct = 100.0 * (1.0 - (1.0 - u) ** c.nr_data)
         rows.append((c.start, c.profile, c.nr_data, live * ss, free * ss,
-                     usedpct, stranded * ss, pct))
+                     usedpct, stranded * ss, pct, randpct))
         print(f"{c.start:>16} {c.profile:>7} {c.nr_data:>7} "
               f"{human(live * ss):>10} "
               f"{human(free * ss):>10} {usedpct:>5.1f}% "
-              f"{human(stranded * ss):>10} {pct:>8.1f}%")
+              f"{human(stranded * ss):>10} {pct:>8.1f}% {randpct:>8.1f}%")
 
     if args.csv:
         with open(args.csv, "w") as f:
-            f.write("block_group,profile,nr_data,used,free,used_pct,stranded,stranded_pct\n")
+            f.write("block_group,profile,nr_data,used,free,used_pct,"
+                    "stranded,stranded_pct,random_pct\n")
             for r in sorted(rows, key=lambda r: r[5]):
-                f.write("%d,%s,%d,%d,%d,%.3f,%d,%.3f\n" % r)
+                f.write("%d,%s,%d,%d,%d,%.3f,%d,%.3f,%.3f\n" % r)
         print(f"\nper-block-group rows written to {args.csv}", file=sys.stderr)
 
     free = totals["free"]
@@ -249,7 +257,10 @@ def main():
     print("family of designs runs out of space and only variable-width rows")
     print("remain.  Read the per-block-group rows before the total: stranding")
     print("rises steeply with how full a block group is, so one filesystem's")
-    print("rows already show the shape of the curve.")
+    print("rows already show the shape of the curve.  The last column is what")
+    print("the same fullness would strand with the live sectors scattered at")
+    print("random; the distance below it is what btrfs's clustered allocator")
+    print("is already worth to this design.")
     return 0
 
 
