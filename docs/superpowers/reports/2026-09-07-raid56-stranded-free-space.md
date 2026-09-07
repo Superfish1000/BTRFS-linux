@@ -49,9 +49,15 @@ is what copy-on-write perforates stripes with.
 
 | profile | devices | nr_data | aged at | free | stranded | per-block-group range | random-placement bound |
 |---|---|---|---|---|---|---|---|
-| RAID5 | 4 | 3 | 80.7% full | 1.3 GiB | **227 MiB (17.2%)** | 0.3% – 60.4% | 64% – 99.8% |
 | RAID6 | 4 | 2 | 80.9% full | 908 MiB | **66 MiB (7.3%)** | 0.8% – 20.1% | 53% – 97.0% |
+| RAID5 | 4 | 3 | 80.7% full | 1.3 GiB | **227 MiB (17.2%)** | 0.3% – 60.4% | 64% – 99.8% |
 | RAID5 | 4 | 3 | 92.5% full | 617 MiB | **294 MiB (47.6%)** | 30.5% – 67.6% | 99.1% – 99.9% |
+| RAID5 | 8 | 7 | 80.7% full | 1.4 GiB | **681 MiB (46.1%)** | 26.2% – 100.0% | 99.7% – 100.0% |
+
+Two variables move the answer, and they move it about equally far: how full the
+filesystem is kept, and how many data stripes the profile has. A four-disk
+RAID5 at 92.5% full and an eight-disk RAID5 at 80.7% full land in the same
+place.
 
 The RAID5 rows at 80.7% full, in full:
 
@@ -66,51 +72,87 @@ The RAID5 rows at 80.7% full, in full:
       5472780288   RAID5       3  119.8 MiB  295.0 MiB  28.9%    1.0 MiB      0.3%     64.0%
 ```
 
-The 92.5% filesystem also grew two `nr_data 1` block groups, because the devices
-filled unevenly and btrfs made two-device RAID5 chunks out of what was left.
-Those strand nothing by construction -- a vertical stripe of one sector cannot
-have a live neighbour -- and they are excluded from the range above.
+The eight-disk rows, where it goes wrong:
+
+```
+     block group profile nr_data       used       free  used%   stranded stranded% if random
+       298844160   RAID5       7  403.3 MiB  313.3 MiB  56.3%  198.5 MiB     63.4%     99.7%
+      1050279936   RAID5       7  798.2 MiB   97.8 MiB  89.1%   97.8 MiB    100.0%    100.0%
+      1989804032   RAID5       7  749.5 MiB  146.5 MiB  83.7%  110.7 MiB     75.6%    100.0%
+      2929328128   RAID5       7  751.0 MiB  145.0 MiB  83.8%  100.0 MiB     69.0%    100.0%
+      3868852224   RAID5       7  759.2 MiB  136.8 MiB  84.7%   92.9 MiB     67.9%    100.0%
+      4808376320   RAID5       7  690.8 MiB  205.2 MiB  77.1%   53.7 MiB     26.2%    100.0%
+      5747900416   RAID5       7   99.2 MiB   17.2 MiB  85.2%    5.7 MiB     33.2%    100.0%
+      5869928448   RAID5       5  641.9 MiB  238.1 MiB  72.9%   18.8 MiB      7.9%     99.9%
+      6792675328   RAID5       5  161.0 MiB  179.0 MiB  47.3%    3.0 MiB      1.7%     96.0%
+```
+
+The block group at 89.1% full strands **100.0%** of its free space: every free
+sector in it shares a vertical stripe with a live one. It has reached the
+random-placement bound, meaning the allocator's clustering has stopped buying
+anything at all.
+
+Both wide filesystems also grew narrower block groups than the profile asks for
+-- `nr_data 5` here, `nr_data 1` on the 92.5% filesystem -- because the devices
+filled unevenly and btrfs made chunks out of whatever devices still had room.
+Narrower chunks strand less by construction, so they flatter the totals
+slightly.
 
 ## What it means
 
-### At a normal operating point the rule is affordable
+### On a narrow array at ordinary fullness, the rule is affordable
 
-At ~81% full the rule costs 17% of the remaining free space on RAID5 and 7% on
-RAID6 -- 227 MiB of 1.3 GiB, 66 MiB of 908 MiB. Paying it is equivalent to
-running the filesystem one to three percentage points fuller than it really is.
+At ~81% full the rule costs 17% of the remaining free space on four-disk RAID5
+and 7% on four-disk RAID6 -- 227 MiB of 1.3 GiB, 66 MiB of 908 MiB. Paying it is
+equivalent to running the filesystem one to three percentage points fuller than
+it really is. That is comfortable.
 
-That is not survival by a narrow margin. The result that would have killed the
-family -- most of the free space unreachable -- is not what happens.
+### On a wide array, or a full one, it is not
 
-### But the price is steeply non-linear in fullness
+The price is steeply non-linear in both variables.
 
-At 92.5% full the same profile strands 47.6%. The two RAID5 measurements differ
-only in how full the filesystem was kept, and the tax nearly triples. The
-per-block-group rows show the same curve inside a single filesystem: 0.3% in a
-block group 29% full, 60.4% in one 88% full.
+Hold the profile fixed and fill the filesystem from 80.7% to 92.5%, and the tax
+goes from 17.2% to 47.6%. Hold the fullness at ~81% and widen the profile from
+three data stripes to seven, and it goes from 17.2% to 46.1%. One block group on
+the wide array strands *all* of its free space.
 
-So an immutable-stripe allocator is affordable only if block groups are kept off
-the top of that curve. It would not in practice pay 17%: it would skip the block
-groups where the rule bites and allocate in the ones where it does not, which is
-exactly what block-group reclaim exists to make possible. btrfs already has that
-machinery (`/sys/fs/btrfs/<uuid>/allocation/data/bg_reclaim_threshold`) and it is
-off by default on non-zoned filesystems. **The feasibility of copy-on-write
-parity turns on a knob that already exists**, not on a new on-disk format. That
-is the most useful thing this measurement has to say.
+This is the opposite of convenient. Wide arrays are exactly where RAID5/6 is
+most attractive -- parity overhead falls as the array grows -- so the design is
+weakest where it is most wanted. And the mechanism is not subtle: a vertical
+stripe of seven sectors is more than twice as likely to contain a live sector as
+one of three, at any given occupancy. The random-placement column shows the
+ceiling being approached: on every `nr_data 7` block group it is already
+99.7-100%.
+
+So an immutable-stripe allocator is not simply viable or not. It is viable on
+narrow arrays kept at moderate fullness, and it needs help everywhere else. The
+help it needs is to stop allocating in block groups that have climbed the curve,
+which is exactly what block-group reclaim exists to make possible: btrfs has
+that machinery already
+(`/sys/fs/btrfs/<uuid>/allocation/data/bg_reclaim_threshold`) and it is off by
+default on non-zoned filesystems. **The feasibility of copy-on-write parity
+turns on a knob that already exists**, not on a new on-disk format -- but on a
+wide array the threshold would have to be aggressive enough that relocation
+traffic becomes its own cost, and nothing here measures that.
 
 ### It is affordable because of the allocator, not the geometry
 
 The last column is what the same fullness would strand if live sectors were
 scattered at random: a vertical stripe of `nr_data` sectors holds live data with
 probability `1 - (1-u)^nr_data`, and every free sector in such a stripe is lost.
-That bound runs from 53% to 99.9% across these filesystems. The measurements run
-from 0.3% to 67.6%.
+That bound runs from 53% to 100% across these filesystems. The measurements run
+from 0.3% to 100%.
 
 Almost all of the free space an immutable-stripe allocator would keep is free
 only because `find_free_extent()` already packs live data into clusters instead
 of spreading it. The design is not standing on the geometry of RAID5/6; it is
 standing on btrfs's allocation policy. Worth writing down, because an allocator
 change made for unrelated reasons could move this number a long way.
+
+The wide array shows the other end of that: on a seven-data-stripe block group
+at 89% full, the measurement *equals* the random bound. Clustering had stopped
+helping entirely. Whatever margin this design has, it comes from the allocator,
+and on wide arrays the allocator runs out of margin to give.
 
 ### Stranding is not purely a function of fullness
 
@@ -126,9 +168,9 @@ file sizes, deletions and small in-place rewrites. They are not a database, a VM
 image store, or a five-year-old array. The workload was chosen to resemble
 ordinary use rather than to flatter or punish the design; one built out of small
 random overwrites of large files would perforate stripes far harder, and nothing
-here measures that. Nor is there a data point above `nr_data = 3`: the bound
-above says stranding should grow with the number of data stripes, and a wide
-array is the case to measure next.
+here measures that. Nor is there a data point above `nr_data = 7`,
+or on an array wide enough (twelve, sixteen disks) to be interesting for the
+profiles where the write hole is most often argued about.
 
 ### The other half of the picture
 
@@ -136,9 +178,24 @@ This measurement is static: how much room the rule costs. The dynamic half is
 how often the allocator actually hands out space inside an occupied stripe.
 `/sys/fs/btrfs/<uuid>/raid56_write_profile`, added alongside this, counts it --
 `sub_stripe_resident_sectors` is committed data that read-modify-writes put at
-stake, a number btrfs has never reported. The free-space measurement says what
-the rule costs; the write profile says what it buys. Neither is worth much
-alone.
+stake, a number btrfs has never reported.
+
+The eight-disk aging run, which wrote 12 GiB, reported:
+
+```
+full_stripe_writes 19435          inplace_full_stripe_writes 0
+sub_stripe_writes 39170           sub_stripe_vertical_stripes 400808
+sub_stripe_written_sectors 1064830
+sub_stripe_resident_sectors 1680992
+```
+
+Two thirds of the RAID5 writes this workload issued were sub-stripe writes, and
+they put 1.68 million committed sectors -- 6.4 GiB -- at stake to write 1.06
+million of their own. **1.58 sectors of existing data exposed per sector
+written.** On the four-disk toggle test the ratio was 2.0.
+
+The free-space measurement says what the immutable-stripe rule costs; the write
+profile says what it buys. Neither is worth much alone.
 
 ## Reproducing
 
@@ -147,6 +204,7 @@ alone.
     ./age.sh $BTRFS_TEST_DIR/uml-fast/linux r5-80 raid5:raid1 4 2G 0.80
     ./age.sh $BTRFS_TEST_DIR/uml-fast/linux r5-92 raid5:raid1 4 2G 0.92
     ./age.sh $BTRFS_TEST_DIR/uml-fast/linux r6-80 raid6:raid1 4 2G 0.80
+    ./age.sh $BTRFS_TEST_DIR/uml-fast/linux w8-80 raid5:raid1 8 1G 0.80
 
 Or against an existing array, with no kernel and no privileges:
 
