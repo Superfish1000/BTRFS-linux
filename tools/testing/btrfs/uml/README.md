@@ -66,6 +66,26 @@ the next recorded write:
 | `staleq.sh` | leaves a sector stale behind an accepted write, then reads it back |
 | `misc3.sh` | single-boot scenarios: replace, convert, toggle, scrub, writers |
 | `selftest.sh` | boots and reports the in-kernel btrfs self-tests |
+| `age.sh` | ages a RAID5/6 filesystem and measures its stranded free space |
 
 `init-final3.sh` runs as init inside the guest and holds every scenario; the
 host scripts only choose one and pass parameters on the kernel command line.
+
+## Measuring stranded free space
+
+`age.sh` answers a design question rather than testing a fix: how much free
+space in a real RAID5/6 filesystem sits inside vertical stripes that still
+hold live data.  That free space is what an allocator forbidden from writing
+into an occupied stripe -- the rule copy-on-write parity needs -- would have
+to give up, and it is also the free space today's allocator can only use by
+doing a read-modify-write into a stripe holding committed data.
+
+    ./age.sh $BTRFS_TEST_DIR/uml-fast/linux age-r5 raid5:raid1 4 2G 0.80
+
+Arguments are kernel, tag, `data:metadata` profiles, device count, device
+size and the fullness to age at.  It boots once, fills the filesystem to that
+fullness and then churns there (`age-workload.py`: delete whole files, refill,
+overwrite survivors in place), dumps the chunk and extent trees from inside
+the guest, and runs `../raid56_row_occupancy.py` over them.  An almost-empty
+filesystem strands nothing, so the fill fraction is the parameter that
+matters.
