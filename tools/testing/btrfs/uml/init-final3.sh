@@ -1,0 +1,586 @@
+#!/bin/bash
+# Runs as init inside UML (host filesystem as root).  Parameters arrive as
+# environment variables from the kernel command line:
+#   MODE     scenario, see the case statement
+#   OPTS     extra mount options (comma separated, may be empty -> "rw")
+#   PROFILE  data:metadata profiles, e.g. raid5:raid1
+#   CRASH    crash injection point for MODE=prepare (1 or 2)
+#   CONVERT  data:metadata profiles to convert to before the crash (prepare)
+#   FAIL     device index to fail with device-mapper (detach/flakey modes)
+#   TAG      result file suffix
+#   MNTDEV   device to mount (default /dev/ubda)
+#   NDEV     number of devices in the array
+#   OMITTED  device omitted by the host (verify mode)
+T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
+export PATH=$T/progs-install/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+RES=$T/umltest/results.$TAG
+MNT=/mnt/umltest
+mkdir -p $MNT
+log() { echo "TEST[$MODE]: $*"; echo "[$MODE] $*" >> $RES; }
+kmsg() { dmesg | grep -E "$1" | tail -n ${2:-4} | while read -r l; do log "dmesg: $l"; done; }
+finish() {
+	sync
+	dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)|possible circular|lockdep" && log "KERNEL_SPLAT"
+	echo o > /proc/sysrq-trigger
+	sleep 60
+}
+# Dump blocked tasks to the console if the scenario takes too long.
+watchdog() {
+	( sleep ${1:-120}; echo 8 > /proc/sys/kernel/printk; echo "WATCHDOG: dumping blocked tasks";
+	  echo w > /proc/sysrq-trigger; sleep 2; echo "WATCHDOG: done" ) &
+}
+OPTS=${OPTS:-rw}
+MNTDEV=${MNTDEV:-/dev/ubda}
+DPROF=${PROFILE%%:*}
+MPROF=${PROFILE##*:}
+btrfs device scan >/dev/null 2>&1
+DEVS=$(ls /dev/ubd[a-z] 2>/dev/null | tr '\n' ' ')
+log "devices present: $DEVS"
+stats() { for f in /sys/fs/btrfs/*/raid56_write_intent; do [ -f $f ] && log "${1:-sysfs}: $(tr '\n' ' ' < $f)"; done; }
+do_mount() {
+	mount -o "$1" $2 $MNT && return
+	if dmesg | grep -q "log replay failed"; then
+		# A log tree block hit two faults in one vertical stripe (a failed
+		# write on the flaky device and the torn parity of the crashed
+		# RMW): beyond RAID5 tolerance, detected.  Discard the log like an
+		# administrator would and continue with the committed data.
+		log "REPLAY_FAILED_DETECTED (two faults in one vertical stripe)"
+		kmsg "log replay failed|bad tree block" 3
+		btrfs rescue zero-log $2 >/dev/null 2>&1 && log "LOG_ZEROED"
+		rm -f $T/umltest/manifest.$TAG; log "MANIFEST_SKIPPED_LOG_DISCARDED"
+		mount -o "$1" $2 $MNT && return
+	fi
+	log "MOUNT_FAIL($1 $2)"; kmsg "BTRFS" 6; finish
+}
+verify_manifest() {
+	# Every file whose fsync returned before the crash, name + md5.
+	[ -f $T/umltest/manifest.$TAG ] || return 0
+	local total=0 bad=0 f m got
+	while read -r f m; do
+		total=$((total+1))
+		got=$(md5sum $f 2>/dev/null | awk '{print $1}')
+		if [ "$got" != "$m" ]; then bad=$((bad+1)); log "$1_BAD $f expected $m got $got"; fi
+	done < $T/umltest/manifest.$TAG
+	log "$1_MANIFEST total=$total bad=$bad"
+	[ "$bad" = 0 ] || kmsg "csum|error|corrupt" 5
+}
+verify_nocow() {
+	# nodatacow has no checksum: compare with the content read after the
+	# recovery mount, a stale parity would give different content.
+	[ -f $T/umltest/nocow.md5.$TAG ] || return 0
+	local M=$(md5sum $MNT/nocow 2>&1 | awk '{print $1}')
+	if [ "$M" = "$(cat $T/umltest/nocow.md5.$TAG)" ]; then log "$1_NOCOW_OK"; else
+		log "$1_NOCOW_FAIL md5=$M"; kmsg "csum|error|corrupt" 5; fi
+}
+verify_old() {
+	echo 3 > /proc/sys/vm/drop_caches
+	if [ -f $T/umltest/old.md5.$TAG ]; then
+		local M=$(md5sum $MNT/old 2>&1 | awk '{print $1}')
+		if [ "$M" = "$(cat $T/umltest/old.md5.$TAG)" ]; then log "$1_READ_OK"; else
+			log "$1_READ_FAIL md5=$M"; kmsg "csum|error|corrupt" 5; fi
+	fi
+	verify_manifest $1
+	verify_nocow $1
+}
+writers_start() {
+	for w in 1 2 3; do
+		(
+		i=0
+		while [ ! -f $T/umltest/stop.$TAG ]; do
+			f=$MNT/bg$w-$i
+			sz=$(( (RANDOM % 15 + 1) ))
+			if [ "$WRITER" = "syncfs" ]; then
+				head -c $((sz * 4096)) /dev/urandom > $f
+				sync -f $f
+			else
+				dd if=/dev/urandom of=$f bs=4096 count=$sz conv=fsync status=none \
+					&& echo "$f $(md5sum $f | awk '{print $1}')" >> $T/umltest/manifest.$TAG
+			fi
+			i=$((i+1))
+		done
+		) &
+	done
+}
+writers_stop() { touch $T/umltest/stop.$TAG; wait; rm -f $T/umltest/stop.$TAG; }
+rm -f $T/umltest/manifest.$TAG.new
+# device-mapper helpers: dm_setup creates d0..dN-1 over the ubd devices
+dm_setup() {
+	local i=0
+	DMDEVS=""
+	for d in $DEVS; do
+		local sz=$(blockdev --getsz $d)
+		dmsetup create d$i --table "0 $sz linear $d 0" || log "DM_CREATE_FAIL $d"
+		DMDEVS="$DMDEVS /dev/mapper/d$i"
+		i=$((i+1))
+	done
+	# No udev in the guest: create the /dev/mapper nodes ourselves.
+	dmsetup mknodes
+	ls /dev/mapper/d0 >/dev/null || log "DM_NODE_MISSING"
+}
+# Register only the dm paths with btrfs so that the mount uses them.
+dm_scan() { btrfs device scan --forget >/dev/null 2>&1; btrfs device scan $DMDEVS >/dev/null 2>&1; }
+dm_reload() {	# name table...
+	local n=$1; shift
+	dmsetup suspend --nolockfs --noflush $n && dmsetup reload $n --table "$*" && dmsetup resume $n || log "DM_RELOAD_FAIL $n"
+}
+dm_detach() {	# index: every IO fails, like a pulled drive
+	local d=$(echo $DEVS | awk -v i=$(( $1 + 1 )) '{print $i}')
+	dm_reload d$1 "0 $(blockdev --getsz $d) error"
+}
+dm_error_writes() {	# index: reads work, every write fails
+	local d=$(echo $DEVS | awk -v i=$(( $1 + 1 )) '{print $i}')
+	dm_reload d$1 "0 $(blockdev --getsz $d) flakey $d 0 0 1000 1 error_writes"
+}
+dm_heal() {
+	local d=$(echo $DEVS | awk -v i=$(( $1 + 1 )) '{print $i}')
+	dm_reload d$1 "0 $(blockdev --getsz $d) linear $d 0"
+}
+
+case "$MODE" in
+prepare)
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	do_mount $OPTS $MNTDEV
+	log "mount options: $(grep umltest /proc/mounts | head -1)"
+	stats
+	# Committed data: 128K written and committed before the injected write.
+	dd if=/dev/urandom of=$MNT/old bs=128K count=1 status=none
+	sync
+	md5sum $MNT/old | awk '{print $1}' > $T/umltest/old.md5.$TAG
+	log "old md5 $(cat $T/umltest/old.md5.$TAG)"
+	log "old layout: $(filefrag -v $MNT/old | sed -n 4p | tr -s ' ')"
+	if [ -n "$CONVERT" ]; then
+		writers_start
+		btrfs balance start -f -dconvert=${CONVERT%%:*} -mconvert=${CONVERT##*:} $MNT >/dev/null 2>&1 \
+			&& log "CONVERT_OK $CONVERT" || log "CONVERT_FAIL $CONVERT"
+		writers_stop
+		sync
+		log "old layout after convert: $(filefrag -v $MNT/old | sed -n 4p | tr -s ' ')"
+		stats
+	fi
+	# Arm the injection: the next sub-stripe RMW drops P/Q (1) or data (2)
+	# writes, waits for the rest to land and panics.
+	echo $CRASH > /sys/module/btrfs/parameters/raid56_crash_point
+	dd if=/dev/urandom of=$MNT/new bs=4K count=1 status=none
+	sync
+	# Not reached when the injection fired.
+	log "NO_CRASH: raid56_crash_point=$(cat /sys/module/btrfs/parameters/raid56_crash_point)"
+	umount $MNT
+	finish
+	;;
+recover)
+	do_mount $OPTS $MNTDEV
+	kmsg "write-intent|regenerat|crash injection|tree-log" 8
+	stats
+	[ -f $MNT/nocow ] && md5sum $MNT/nocow | awk '{print $1}' > $T/umltest/nocow.md5.$TAG
+	verify_old FULL
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+ro_replay)
+	# Read-only mount with a dirty tree log: the replay writes, so the
+	# recovery and the log must run before it, even read-only.
+	do_mount $OPTS,ro $MNTDEV
+	kmsg "write-intent|tree-log|crash injection" 8
+	stats "ro sysfs"
+	[ -f $MNT/nocow ] && md5sum $MNT/nocow | awk '{print $1}' > $T/umltest/nocow.md5.$TAG
+	verify_old RO
+	umount $MNT || log "UMOUNT_FAIL"
+	do_mount $OPTS $MNTDEV
+	kmsg "write-intent" 4
+	stats "rw sysfs"
+	verify_old FULL
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+prepare_fsync)
+	# Nothing committed in the crashed full stripe: everything in it is
+	# only referenced from the tree log (fsync without a transaction
+	# commit), the log tree blocks and the fsync'ed data.  f shares its
+	# vertical stripe with the crashed write of 'new'.
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	do_mount $OPTS $MNTDEV
+	stats
+	MAN=$T/umltest/manifest.$TAG
+	: > $MAN
+	dd if=/dev/urandom of=$MNT/f bs=4K count=1 conv=fsync status=none
+	echo "$MNT/f $(md5sum $MNT/f | awk '{print $1}')" >> $MAN
+	dd if=/dev/urandom of=$MNT/g bs=4K count=15 conv=fsync status=none
+	echo "$MNT/g $(md5sum $MNT/g | awk '{print $1}')" >> $MAN
+	log "f layout: $(filefrag -v $MNT/f | sed -n 4p | tr -s ' ')"
+	log "g layout: $(filefrag -v $MNT/g | sed -n 4p | tr -s ' ')"
+	echo $CRASH > /sys/module/btrfs/parameters/raid56_crash_point
+	dd if=/dev/urandom of=$MNT/new bs=4K count=1 conv=fsync status=none
+	log "NO_CRASH: raid56_crash_point=$(cat /sys/module/btrfs/parameters/raid56_crash_point)"
+	umount $MNT
+	finish
+	;;
+inplace)
+	# A nodatacow file overwritten in place with full stripe writes: the
+	# overwritten sectors are referenced, the crash leaves them with a
+	# stale parity unless the write was recorded.
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	do_mount $OPTS $MNTDEV
+	stats
+	touch $MNT/nocow; chattr +C $MNT/nocow
+	dd if=/dev/urandom of=$MNT/nocow bs=64K count=12 conv=fsync status=none
+	sync
+	log "nocow layout: $(filefrag -v $MNT/nocow | sed -n 4p | tr -s ' ')"
+	echo $CRASH > /sys/module/btrfs/parameters/raid56_crash_point
+	dd if=/dev/urandom of=$MNT/nocow bs=64K count=12 conv=fsync,notrunc status=none
+	log "NO_CRASH: raid56_crash_point=$(cat /sys/module/btrfs/parameters/raid56_crash_point)"
+	umount $MNT
+	finish
+	;;
+remount)
+	# Read-only mount must not touch the disks; the remount to read-write
+	# must run the recovery before anything else is written.
+	do_mount $OPTS,ro $MNTDEV
+	stats "ro sysfs"
+	kmsg "write-intent" 3
+	mount -o remount,rw $MNT || { log "REMOUNT_RW_FAIL"; finish; }
+	kmsg "write-intent|regenerat" 4
+	stats "rw sysfs"
+	verify_old FULL
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+degraded)
+	do_mount $OPTS,degraded $MNTDEV
+	kmsg "write-intent log:" 3
+	verify_old DEGRADED
+	ls $MNT/new >/dev/null 2>&1 && log "new exists (unexpected, was not committed)"
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+compat)
+	# Kernel without write-intent support: RW mount must be refused, RO ok.
+	if mount -o $OPTS $MNTDEV $MNT 2>/dev/null; then log "OLDKERNEL_RW_MOUNT_ALLOWED"; umount $MNT; else
+		log "OLDKERNEL_RW_MOUNT_REFUSED"; kmsg "compat|unsupported|read-only" 3; fi
+	if mount -o $OPTS,ro $MNTDEV $MNT 2>/dev/null; then log "OLDKERNEL_RO_MOUNT_OK"; verify_old OLDKERNEL_RO; umount $MNT; else
+		log "OLDKERNEL_RO_MOUNT_FAIL"; fi
+	finish
+	;;
+check)
+	btrfs check $MNTDEV > $T/umltest/check.$TAG 2>&1 && log "CHECK_OK" || log "CHECK_FAIL rc=$?"
+	grep -E "error|ERROR|found|compat" $T/umltest/check.$TAG | head -n 5 | while read -r l; do log "check: $l"; done
+	btrfs inspect-internal dump-super $MNTDEV | grep -E "compat_ro_flags|incompat_flags" | while read -r l; do log "super: $l"; done
+	python3 /home/user/BTRFS-linux/tools/testing/btrfs/raid56_wib_dump.py $DEVS | head -n 12 | while read -r l; do log "wib: $l"; done
+	finish
+	;;
+stress)
+	# Concurrent small-file writers with fsync; the host kills the UML
+	# process at a random moment.  Every file whose fsync returned is
+	# recorded (name + md5) in a host-side manifest before the next write.
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	do_mount $OPTS $MNTDEV
+	MAN=$T/umltest/manifest.$TAG
+	: > $MAN
+	# A nodatacow file overwritten in place by one writer: its sectors are
+	# updated in place (torn content after a crash is expected for it).
+	touch $MNT/nocow; chattr +C $MNT/nocow; dd if=/dev/zero of=$MNT/nocow bs=4096 count=64 conv=fsync status=none
+	for w in 1 2 3 4; do
+		(
+		i=0
+		while true; do
+			f=$MNT/w$w-$i
+			sz=$(( (RANDOM % 15 + 1) ))
+			dd if=/dev/urandom of=$f bs=4096 count=$sz conv=fsync status=none
+			m=$(md5sum $f | awk '{print $1}')
+			echo "$f $m" >> $MAN
+			i=$((i+1))
+			dd if=/dev/urandom of=$MNT/nocow bs=4096 count=1 seek=$((RANDOM % 64)) conv=notrunc,fsync status=none
+		done
+		) &
+	done
+	echo "STRESS_START"
+	sleep 600
+	;;
+verify)
+	do_mount "$OPTS${OMITTED:+,degraded}" $MNTDEV
+	echo 3 > /proc/sys/vm/drop_caches
+	MAN=$T/umltest/manifest.$TAG
+	total=0; bad=0
+	while read -r f m; do
+		total=$((total+1))
+		got=$(md5sum $f 2>/dev/null | awk '{print $1}')
+		if [ "$got" != "$m" ]; then bad=$((bad+1)); log "BAD $f expected $m got $got"; fi
+	done < $MAN
+	cat $MNT/nocow > /dev/null 2>&1 && log "nocow readable" || log "NOCOW_READ_FAIL"
+	log "VERIFY total=$total bad=$bad omitted=${OMITTED:-none}"
+	kmsg "write-intent log:" 3
+	stats
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+replace)
+	# Device replace, remove and add while sub-stripe writes are in
+	# flight: exercises the dev-replace finishing path that waits for
+	# in-flight bios under device_list_mutex, and the RCU device list
+	# traversal of the log writer (lockdep is enabled in this kernel).
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF /dev/ubda /dev/ubdb /dev/ubdc /dev/ubdd || { log "MKFS_FAIL"; finish; }
+	do_mount $OPTS /dev/ubda
+	watchdog 150
+	writers_start
+	sleep 3
+	btrfs replace start -B -f 1 /dev/ubde $MNT && log "REPLACE_OK" || log "REPLACE_FAIL"
+	sleep 2
+	btrfs device add -f /dev/ubda $MNT && log "ADD_OK" || log "ADD_FAIL"
+	sleep 2
+	btrfs device remove /dev/ubdb $MNT && log "REMOVE_OK" || log "REMOVE_FAIL"
+	sleep 2
+	writers_stop
+	sync
+	stats
+	umount $MNT || log "UMOUNT_FAIL"
+	btrfs check /dev/ubda 2>&1 | grep -E "error|found|ERROR" | head -n 3 | while read -r l; do log "check: $l"; done
+	finish
+	;;
+convert)
+	# No RAID56 at mkfs time: the log must be enabled when the first
+	# RAID5 chunk is created by the balance, at the next commit.
+	mkfs.btrfs -q -f -d raid1 -m raid1 $DEVS || { log "MKFS_FAIL"; finish; }
+	do_mount $OPTS $MNTDEV
+	stats before
+	writers_start
+	sleep 2
+	btrfs balance start -f -dconvert=raid5 -mconvert=raid5 $MNT >/dev/null 2>&1 && log "CONVERT_OK" || log "CONVERT_FAIL"
+	sleep 2
+	writers_stop
+	sync
+	stats after
+	umount $MNT || log "UMOUNT_FAIL"
+	btrfs inspect-internal dump-super $MNTDEV | grep -E "compat_ro_flags" | while read -r l; do log "super: $l"; done
+	finish
+	;;
+convert_away)
+	# RAID5 -> RAID1 with writers: the log stays enabled (flag set), the
+	# remaining RAID5 chunks are still protected until they are gone.
+	mkfs.btrfs -q -f -d raid5 -m raid5 $DEVS || { log "MKFS_FAIL"; finish; }
+	do_mount $OPTS $MNTDEV
+	dd if=/dev/urandom of=$MNT/old bs=128K count=1 status=none; sync
+	md5sum $MNT/old | awk '{print $1}' > $T/umltest/old.md5.$TAG
+	writers_start
+	sleep 2
+	btrfs balance start -f -dconvert=raid1 -mconvert=raid1 $MNT >/dev/null 2>&1 && log "CONVERT_AWAY_OK" || log "CONVERT_AWAY_FAIL"
+	writers_stop
+	sync
+	stats after
+	verify_old FULL
+	umount $MNT || log "UMOUNT_FAIL"
+	btrfs inspect-internal dump-super $MNTDEV | grep -E "compat_ro_flags" | while read -r l; do log "super: $l"; done
+	finish
+	;;
+toggle)
+	# Feature toggling through sysfs while writes are in flight.
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	do_mount $OPTS,noraid56_write_intent $MNTDEV
+	watchdog 150
+	writers_start
+	sleep 2
+	for i in 1 2 3; do
+		echo 1 > /sys/fs/btrfs/*/features/raid56_write_intent || log "ENABLE_FAIL"
+		sleep 1
+		echo 0 > /sys/fs/btrfs/*/features/raid56_write_intent || log "DISABLE_FAIL"
+		sleep 1
+	done
+	echo 1 > /sys/fs/btrfs/*/features/raid56_write_intent
+	writers_stop
+	sync
+	stats
+	umount $MNT || log "UMOUNT_FAIL"
+	btrfs inspect-internal dump-super $MNTDEV | grep -E "compat_ro_flags" | while read -r l; do log "super: $l"; done
+	finish
+	;;
+detach)
+	# A drive that fails every IO in the middle of writes (pulled cable),
+	# no crash.  Its stripes are kept in the log (sticky); after the drive
+	# is back, the next mount regenerates their parity.  Then the array
+	# must survive losing any other device.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	log "fs devices: $(btrfs filesystem show $MNT 2>/dev/null | grep devid | tr -s ' ' | tr '\n' ';')"
+	dd if=/dev/urandom of=$MNT/old bs=128K count=1 status=none; sync
+	md5sum $MNT/old | awk '{print $1}' > $T/umltest/old.md5.$TAG
+	writers_start
+	sleep 2
+	dm_detach $FAIL; log "detached device $FAIL"
+	sleep 4
+	writers_stop
+	sync
+	stats "while detached"
+	kmsg "write-intent|lost|error" 4
+	dm_heal $FAIL; log "healed device $FAIL"
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all
+	finish
+	;;
+flakey)
+	# Like detach, but the drive only fails writes (reads still work), and
+	# the filesystem is crashed while the drive is bad.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	log "fs devices: $(btrfs filesystem show $MNT 2>/dev/null | grep devid | tr -s ' ' | tr '\n' ';')"
+	dd if=/dev/urandom of=$MNT/old bs=128K count=1 status=none; sync
+	md5sum $MNT/old | awk '{print $1}' > $T/umltest/old.md5.$TAG
+	writers_start
+	sleep 2
+	dm_error_writes $FAIL; log "write errors on device $FAIL"
+	sleep 3
+	stats "with write errors"
+	kmsg "write-intent|error" 4
+	echo ${CRASH:-1} > /sys/module/btrfs/parameters/raid56_crash_point
+	dd if=/dev/urandom of=$MNT/new bs=4K count=1 conv=fsync status=none
+	log "NO_CRASH"
+	finish
+	;;
+degraded_write)
+	# The array is already degraded (device omitted by the host) while
+	# writes happen and the crash hits.  Recovery cannot regenerate the
+	# missing device's sectors; committed data on the present devices
+	# must still be intact and the loss must be detected, not silent.
+	do_mount $OPTS,degraded $MNTDEV
+	stats
+	dd if=/dev/urandom of=$MNT/old2 bs=128K count=1 status=none; sync
+	md5sum $MNT/old2 | awk '{print $1}' > $T/umltest/old2.md5.$TAG
+	echo ${CRASH:-1} > /sys/module/btrfs/parameters/raid56_crash_point
+	dd if=/dev/urandom of=$MNT/new bs=4K count=1 conv=fsync status=none
+	log "NO_CRASH"
+	finish
+	;;
+degraded_verify)
+	do_mount "$OPTS${OMITTED:+,degraded}" $MNTDEV
+	kmsg "write-intent|regenerat" 4
+	stats
+	verify_old FULL
+	echo 3 > /proc/sys/vm/drop_caches
+	M=$(md5sum $MNT/old2 2>&1 | awk '{print $1}')
+	[ "$M" = "$(cat $T/umltest/old2.md5.$TAG)" ] && log "OLD2_READ_OK" || { log "OLD2_READ_FAIL md5=$M"; kmsg "csum|error" 3; }
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+locate)
+	# Print the physical location of the first sector of 'old' on every
+	# device, for host-side corruption tests.
+	do_mount $OPTS,ro $MNTDEV
+	L=$(filefrag -v $MNT/old | sed -n 4p | awk -F: '{print $3}' | awk '{print $1}' | tr -d '.')
+	umount $MNT
+	log "old logical block $L"
+	btrfs-map-logical -l $((L * 4096)) -b 4096 $MNTDEV 2>&1 | while read -r l; do log "map: $l"; done
+	finish
+	;;
+writers)
+	# Plain concurrent writer workload for a fixed time, no failure.
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	do_mount $OPTS $MNTDEV
+	watchdog ${WATCH:-100}
+	writers_start
+	sleep ${DURATION:-30}
+	writers_stop
+	log "writers finished: $(ls $MNT | wc -l) files"
+	sync
+	stats
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+stale_parity)
+	# A device rejects writes for a while.  Every sector it does not take
+	# stays behind while the rest of its vertical stripe moves on, and
+	# because a single fault is within what RAID5/6 tolerates the writes
+	# are accepted: the writer is told they succeeded.  Nothing tracks
+	# those sectors afterwards.  For a file with no checksums a later read
+	# returns the stale bytes with no error at all, and the retry added to
+	# the write path only removes the case where the device recovers in
+	# time.  This reproduces that exposure; see the "remaining exposures"
+	# section of tools/testing/btrfs/raid56_redundancy_model.py.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	mkdir -p $MNT/nc; chattr +C $MNT/nc 2>/dev/null
+	dd if=/dev/urandom of=$MNT/nc/f bs=64K count=24 conv=fsync status=none
+	sync
+	md5sum $MNT/nc/f | awk '{print $1}' > $T/umltest/old.md5.$TAG
+	log "nocow file md5 $(cat $T/umltest/old.md5.$TAG)"
+	dm_error_writes $FAIL; log "write errors on device $FAIL"
+	# Sub-stripe rewrites: data and Q land, P on the bad device does not.
+	for off in 0 2 4 6 8 10 12 14 16 18 20 22; do
+		dd if=/dev/urandom of=$MNT/nc/f bs=4K count=1 seek=$((off * 16)) \
+			conv=notrunc,fsync status=none 2>/dev/null
+	done
+	sync
+	md5sum $MNT/nc/f | awk '{print $1}' > $T/umltest/new.md5.$TAG
+	log "after rewrites md5 $(cat $T/umltest/new.md5.$TAG)"
+	dm_heal $FAIL; log "healed device $FAIL"
+	kmsg "raid56:|does not match the Q syndrome" 6
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all
+	finish
+	;;
+stale_parity_verify)
+	# The array comes up with one data device missing: every read of the
+	# file needs a single-erasure rebuild.
+	dm_setup
+	dm_scan
+	do_mount "$OPTS${OMITTED:+,degraded}" /dev/mapper/d0
+	echo 3 > /proc/sys/vm/drop_caches
+	M=$(md5sum $MNT/nc/f 2>/dev/null | awk '{print $1}')
+	RC=$?
+	WANT=$(cat $T/umltest/new.md5.$TAG)
+	if [ -z "$M" ]; then
+		log "STALE_SECTOR_READ_REFUSED (detected)"
+	elif [ "$M" = "$WANT" ]; then
+		log "STALE_SECTOR_READ_CORRECT"
+	else
+		log "STALE_SECTOR_SILENT_CORRUPTION md5=$M want=$WANT (known exposure)"
+	fi
+	kmsg "does not match the Q syndrome|csum|error" 6
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all
+	finish
+	;;
+devstats)
+	# Directly exercise the new accounting: one device fails writes for a
+	# while (transient), so the RMW retry should fire and the device error
+	# counters should move.  Previously raid56.c touched neither.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	dd if=/dev/urandom of=$MNT/old bs=128K count=1 status=none; sync
+	md5sum $MNT/old | awk '{print $1}' > $T/umltest/old.md5.$TAG
+	log "stats before: $(btrfs device stats $MNT | tr '\n' ' ')"
+	dm_error_writes $FAIL; log "write errors on device $FAIL"
+	writers_start
+	sleep 4
+	dm_heal $FAIL; log "healed device $FAIL"
+	sleep 2
+	writers_stop
+	sync
+	log "stats after: $(btrfs device stats $MNT | grep -v ' 0$' | tr '\n' ' ')"
+	kmsg "raid56: (write|read) error|raid56: retrying" 6
+	if dmesg | grep -q "raid56: retrying"; then log "RETRY_OBSERVED"; else log "RETRY_NOT_OBSERVED"; fi
+	if btrfs device stats $MNT | grep -q "write_io_errs *[1-9]"; then log "DEVSTATS_OBSERVED"; else log "DEVSTATS_NOT_OBSERVED"; fi
+	stats
+	verify_old FULL
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all
+	finish
+	;;
+scrub)
+	do_mount $OPTS $MNTDEV
+	btrfs scrub start -B -d $MNT 2>&1 | grep -E "Error summary|corrected|uncorrectable|unverified" | while read -r l; do log "scrub: $l"; done
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+*)
+	log "UNKNOWN MODE"
+	finish
+	;;
+esac
