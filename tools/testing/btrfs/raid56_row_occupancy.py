@@ -194,6 +194,8 @@ def main():
     ap.add_argument("extent_dump", help="output of dump-tree -t extent")
     ap.add_argument("--sectorsize", type=int, default=None,
                     help="override the sector size read from the chunk dump")
+    ap.add_argument("--csv", help="also write the per-block-group rows here,"
+                    " ordered by how full the block group is")
     args = ap.parse_args()
 
     chunks = parse_chunks(args.chunk_dump, args.sectorsize)
@@ -203,8 +205,10 @@ def main():
     extents = parse_extents(args.extent_dump)
 
     totals = defaultdict(int)
+    rows = []
     print(f"{'block group':>16} {'profile':>7} {'nr_data':>7} "
-          f"{'used':>10} {'free':>10} {'stranded':>10} {'stranded%':>9}")
+          f"{'used':>10} {'free':>10} {'used%':>6} "
+          f"{'stranded':>10} {'stranded%':>9}")
     for c in chunks:
         live, free, stranded = occupancy(c, extents)
         ss = c.sectorsize
@@ -212,10 +216,22 @@ def main():
         totals["free"] += free * ss
         totals["stranded"] += stranded * ss
         pct = (100.0 * stranded / free) if free else 0.0
+        # How full this block group is.  Stranding is mostly a function of
+        # this, so the rows of one filesystem are already a curve.
+        usedpct = (100.0 * live / (live + free)) if (live + free) else 0.0
+        rows.append((c.start, c.profile, c.nr_data, live * ss, free * ss,
+                     usedpct, stranded * ss, pct))
         print(f"{c.start:>16} {c.profile:>7} {c.nr_data:>7} "
               f"{human(live * ss):>10} "
-              f"{human(free * ss):>10} "
+              f"{human(free * ss):>10} {usedpct:>5.1f}% "
               f"{human(stranded * ss):>10} {pct:>8.1f}%")
+
+    if args.csv:
+        with open(args.csv, "w") as f:
+            f.write("block_group,profile,nr_data,used,free,used_pct,stranded,stranded_pct\n")
+            for r in sorted(rows, key=lambda r: r[5]):
+                f.write("%d,%s,%d,%d,%d,%.3f,%d,%.3f\n" % r)
+        print(f"\nper-block-group rows written to {args.csv}", file=sys.stderr)
 
     free = totals["free"]
     stranded = totals["stranded"]
@@ -231,7 +247,9 @@ def main():
     print("A small stranded fraction means an immutable-stripe allocator is")
     print("practical with no on-disk format change.  A large one means that")
     print("family of designs runs out of space and only variable-width rows")
-    print("remain.")
+    print("remain.  Read the per-block-group rows before the total: stranding")
+    print("rises steeply with how full a block group is, so one filesystem's")
+    print("rows already show the shape of the curve.")
     return 0
 
 
