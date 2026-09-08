@@ -15,10 +15,15 @@ echo
 # like (nr_data 3 and 7).  At three or more data stripes the model reports
 # acknowledged loss; see docs/superpowers/needs-direction.md.  Listed
 # separately so the result is visible rather than absent.
-echo "### wider arrays (known open finding, not yet resolved)"
-for data in 3 4; do for parity in 1 2; do
+echo "### wider arrays"
+for data in 3 4 5; do for parity in 1 2; do
   run --data $data --parity $parity --depth 3
 done; done
+echo
+# Reverting the de-rate must reintroduce the loss it was added to prevent.
+echo "### sticky de-rate reverted must break something"
+run --data 3 --parity 1 --depth 3 --no-sticky-derate
+run --data 4 --parity 1 --depth 3 --no-sticky-derate
 echo
 echo "### each accounting fix reverted must break something"
 run --depth 3 --no-missing-faults

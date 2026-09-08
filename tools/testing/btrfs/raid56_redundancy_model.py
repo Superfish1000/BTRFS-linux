@@ -326,6 +326,14 @@ class Stripe:
                 faults.add(st.nr_data + p)
 
         budget = st.tolerated()
+        if policy["sticky_derate"] and st.recorded:
+            # This stripe already carries an error record, so a previous write
+            # spent redundancy that the current rbio cannot see: a data sector
+            # it could not write is carried only by the parity, or the parity
+            # itself was never updated.  error_bitmap covers one rbio, so
+            # counting this write's faults against the full profile tolerance
+            # would accept a second fault the stripe can no longer absorb.
+            budget -= 1
         if policy["replace_inflation"] and st.replacing:
             # handle_ops_on_dev_replace() raises bioc->max_errors by one for
             # the replace target copy, but the RAID56 layer never counts a
@@ -463,6 +471,9 @@ def main():
     ap.add_argument("--target-aliasing", action="store_true",
                     help="a failed replace-target copy counts as a failure of "
                          "the stripe it duplicates (upstream)")
+    ap.add_argument("--no-sticky-derate", action="store_true",
+                    help="do not reduce the fault budget of a stripe that "
+                         "already carries an error record")
     ap.add_argument("--no-missing-faults", action="store_true",
                     help="do not count a missing device as a fault of the "
                          "sectors this write did not cover (upstream)")
@@ -487,16 +498,18 @@ def main():
 
     if args.policy == "upstream":
         policy = dict(replace_inflation=True, target_aliasing=True,
-                      missing_faults=False)
+                      missing_faults=False, sticky_derate=False)
     else:
         policy = dict(replace_inflation=False, target_aliasing=False,
-                      missing_faults=True)
+                      missing_faults=True, sticky_derate=True)
     if args.replace_inflation:
         policy["replace_inflation"] = True
     if args.target_aliasing:
         policy["target_aliasing"] = True
     if args.no_missing_faults:
         policy["missing_faults"] = False
+    if args.no_sticky_derate:
+        policy["sticky_derate"] = False
 
     n, bad_state, bad = explore(args.data, args.parity, args.depth,
                                 policy, args.cache, args.replacing,
