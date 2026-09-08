@@ -69,10 +69,15 @@ echo "== redundancy model =="
 # documented residual exposures (see docs/superpowers/needs-direction.md);
 # they are expected to violate and are checked separately so that a change in
 # their status is not mistaken for a pass.
+# Only the default-width block starts with "--parity"; the wider-array block
+# starts with "--data" and is judged separately just below.
 bad=$(grep -E "^--parity" $LOG/sweep | grep -v -- "--in-place" | grep -v -- "--nodatasum" | grep -c "VIOLATION")
 [ "$bad" = 0 ] && pass "fixed accounting clean in every configuration" \
 	|| { fail "$bad configurations that should be clean now violate"
 	     grep -E "^--parity" $LOG/sweep | grep -v -- "--in-place" | grep -v -- "--nodatasum" | grep "VIOLATION"; }
+wide=$(sed -n '/wider arrays/,/reverted must break/p' $LOG/sweep | grep -cE "^--data.*VIOLATION")
+[ "$wide" -gt 0 ] && note "$wide wider-array configurations violate (known open finding)" \
+	|| pass "wider arrays now clean -- update needs-direction.md"
 known=$(grep -E "^--parity" $LOG/sweep | grep -E -- "--in-place|--nodatasum" | grep -c "VIOLATION")
 exp=$(grep -E "^--parity" $LOG/sweep | grep -cE -- "--in-place|--nodatasum")
 [ "$known" = "$exp" ] && note "$known/$exp known residual exposures still reported (expected)" \

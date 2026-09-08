@@ -10,6 +10,16 @@ for parity in 1 2; do for depth in 3 4; do
   run --parity $parity --depth $depth --nodatasum
 done; done
 echo
+# Realistic array widths.  Everything above runs at the default --data 2, i.e.
+# a 3-disk RAID5 and a 4-disk RAID6, which is NOT what the measured arrays look
+# like (nr_data 3 and 7).  At three or more data stripes the model reports
+# acknowledged loss; see docs/superpowers/needs-direction.md.  Listed
+# separately so the result is visible rather than absent.
+echo "### wider arrays (known open finding, not yet resolved)"
+for data in 3 4; do for parity in 1 2; do
+  run --data $data --parity $parity --depth 3
+done; done
+echo
 echo "### each accounting fix reverted must break something"
 run --depth 3 --no-missing-faults
 run --depth 3 --replacing --replace-inflation

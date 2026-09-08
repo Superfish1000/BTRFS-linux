@@ -83,6 +83,48 @@ the effect on the full-stripe versus sub-stripe ratio, which
 
 ---
 
+## 5. The model reports acknowledged loss at three or more data stripes
+
+**What.** `sweep.sh` never passed `--data`, so every configuration behind the
+"fixed accounting is clean everywhere" claim ran at the default of two data
+stripes -- a 3-disk RAID5 and a 4-disk RAID6. The arrays actually measured in
+this series have `nr_data` 3 and 7. At three or more the model reports
+acknowledged loss, for both RAID5 and RAID6:
+
+```
+history: ('rmw', (1,2), ('1','2','p0')) ; ('rmw', (2,), ('2',)) ; ('rmw', (1,), ('p0',))
+final:   disk=[0,102,2]  parity=[(0,1,101)]  committed=[0,102,101]
+```
+
+The second write puts 101 into stripe 2; its data write fails and only the
+parity carries the value. One fault against one parity, so the write is
+accepted. The third write touches stripe 1 and loses its parity write. Again
+one fault, again accepted -- but parity was the only copy of stripe 2, so that
+stripe's committed content now exists nowhere.
+
+`nr_data = 2` is clean at depth 5, so this is a width property and not a
+search-depth artifact.
+
+**Why it is not obviously a defect.** Each RMW counts faults within its own
+rbio, which is what `rbio_max_errors()` is for; neither write individually
+exceeds the profile. The stripe is left recorded as sticky in the write-intent
+log precisely because it completed with a device error, so the next mount
+scrubs it and restores redundancy. The exposure is the window between the
+failed write and that scrub.
+
+**The choice.** Whether an RMW should consult the log's sticky state for the
+stripe it is about to write and refuse, or de-rate its fault tolerance, when the
+stripe is already one fault down -- at the cost of failing writes that today
+succeed. Or whether this is inherent to a one-fault-tolerant profile taking two
+faults, and belongs in the documented exposures instead.
+
+**What was done meanwhile.** `sweep.sh` now runs `--data 3` and `--data 4` under
+a separate heading, and `regress.sh` reports the result rather than omitting it,
+so the finding is visible in every run instead of being invisible by
+construction.
+
+---
+
 ## 4. Two residual exposures the model checker still reports
 
 Both reproduce in `tools/testing/btrfs/raid56_redundancy_model.py` and are
