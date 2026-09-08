@@ -326,7 +326,20 @@ class Stripe:
                 faults.add(st.nr_data + p)
 
         budget = st.tolerated()
-        if policy["sticky_derate"] and st.recorded:
+        if policy["sticky_derate"] == "count":
+            # How much redundancy this stripe has already spent: every
+            # committed data sector whose on-disk content is stale (its value
+            # survives only in the parity), and every parity that is not
+            # current.  A flat de-rate of one is not enough -- a single write
+            # can fail several sectors at once, and each one costs an
+            # equation.
+            spent = sum(1 for d in range(st.nr_data)
+                        if st.committed[d] is not None
+                        and st.disk[d] != st.committed[d])
+            spent += sum(1 for p in range(st.nr_parity)
+                         if st.parity[p] != tuple(st.disk))
+            budget -= spent
+        elif policy["sticky_derate"] and st.recorded:
             # This stripe already carries an error record, so a previous write
             # spent redundancy that the current rbio cannot see: a data sector
             # it could not write is carried only by the parity, or the parity
@@ -534,7 +547,7 @@ def main():
                       drop_cache_on_fault=False)
     else:
         policy = dict(replace_inflation=False, target_aliasing=False,
-                      missing_faults=True, sticky_derate=True,
+                      missing_faults=True, sticky_derate="count",
                       drop_cache_on_fault=True)
     if args.replace_inflation:
         policy["replace_inflation"] = True
