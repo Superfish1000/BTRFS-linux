@@ -1,0 +1,14 @@
+# Residual exposures of the RAID56 redundancy model: the sweep rows in the
+# "residual exposures" block, reduced to VIOLATION or OK and sorted.
+# regress.sh diffs the current sweep against this.  It is an observation, not
+# an assertion of correctness: a row moving either way is a change worth
+# looking at.  A new VIOLATION is a new exposure; a VIOLATION that becomes OK
+# is one that closed, and docs/superpowers/needs-direction.md should lose it.
+--parity 1 --depth 3 --in-place --strict VIOLATION
+--parity 1 --depth 3 --nodatasum OK
+--parity 1 --depth 4 --in-place --strict VIOLATION
+--parity 1 --depth 4 --nodatasum OK
+--parity 2 --depth 3 --in-place --strict VIOLATION
+--parity 2 --depth 3 --nodatasum VIOLATION
+--parity 2 --depth 4 --in-place --strict VIOLATION
+--parity 2 --depth 4 --nodatasum VIOLATION

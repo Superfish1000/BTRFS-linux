@@ -70,3 +70,32 @@ only ever reporting that it did not.
 
 Kernel fixes are additionally verified by negative control: remove the fix,
 confirm the new test reports the failure, restore it, confirm a clean run.
+
+## Acknowledged loss at three or more data stripes -- closed
+
+Logged as an open question while the sweep only ever ran at `--data 2`. The
+choice it posed -- whether an RMW should de-rate its fault tolerance when the
+stripe it is about to write is already one fault down -- was taken: the model's
+`sticky_derate` policy computes the stripe's true remaining margin (the parities
+that still agree with the disk on every non-stale sector, minus the sectors that
+need them) and caps the fault budget with it.
+
+`sweep.sh` now runs `--data 3`, `--data 4` and `--data 5` at both parities and
+all six are clean. Reverting the de-rate (`--no-sticky-derate`) reintroduces
+acknowledged loss at `--data 3` and `--data 4`, which is what keeps the check
+from passing vacuously.
+
+An earlier form of the de-rate counted stale sectors *and* stale parities,
+charging two equations for one lost one. It over-derated enough to mask the
+`missing_faults` bug: reverting that fix stopped breaking anything, so the check
+meant to prove it load-bearing was passing for the wrong reason.
+
+## The residual-exposure check was checking nothing
+
+`regress.sh` asserted that every `--in-place` and `--nodatasum` row of the sweep
+violates. Four of the eight were `--in-place` rows run without `--strict`, and
+in that mode a failed write is *allowed* to destroy the data it overwrote -- so
+those rows can never violate and the assertion could only fail. The sweep now
+runs `--in-place` with `--strict`, and the check diffs against a recorded
+baseline instead, so a row moving in either direction is surfaced: a new
+exposure, or one that closed and should come out of the docs.

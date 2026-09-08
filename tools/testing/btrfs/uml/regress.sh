@@ -45,6 +45,16 @@ if [ "${1:-}" = "--self-check" ]; then
 	printf '\033[31mSELF-CHECK FAILED\033[0m\n'; exit 1
 fi
 
+# A second run against the same build directory relinks the kernel the first
+# one is booting, so both are testing something that no longer exists on disk
+# -- and neither says so.  Take the directory for the duration.
+mkdir -p $BUILD
+exec 9>$BUILD/.regress.lock
+if ! flock -n 9; then
+	echo "another regress.sh (or a build) holds $BUILD -- wait for it or use a different build dir" >&2
+	exit 1
+fi
+
 echo "== build =="
 # Drop the btrfs objects so the code under test is actually recompiled: make is
 # incremental, so without this a repeat run compiles nothing and any check on
@@ -59,8 +69,24 @@ if make -C $REPO ARCH=um O=$BUILD -j$(nproc) linux > $LOG/build 2>&1; then
 	else
 		pass "builds fs/btrfs clean from scratch"
 	fi
+	built=1
 else
 	fail "build failed"; tail -15 $LOG/build
+fi
+
+# Every scenario below boots $K against the btrfs-progs in $T.  Without them
+# each one fails for want of a rig, and the suite reports a screenful of
+# regressions that are really one missing kernel -- which is exactly how a
+# wiped $BTRFS_TEST_DIR reads.  Decide once, here, and say what to do about
+# it; the model checker needs neither and runs either way.
+rig=1
+if [ "${built:-0}" != 1 ]; then
+	rig=0
+	[ -f $BUILD/.config ] || note "no $BUILD/.config -- run ./setup.sh to recreate the rig"
+elif [ ! -x $K ]; then
+	rig=0; fail "no kernel at $K -- run ./setup.sh"
+elif [ ! -x $T/progs-install/bin/mkfs.btrfs ]; then
+	rig=0; fail "no btrfs-progs in $T/progs-install -- run ./setup.sh"
 fi
 
 echo "== redundancy model =="
@@ -71,21 +97,42 @@ echo "== redundancy model =="
 # their status is not mistaken for a pass.
 # Only the default-width block starts with "--parity"; the wider-array block
 # starts with "--data" and is judged separately just below.
-bad=$(grep -E "^--parity" $LOG/sweep | grep -v -- "--in-place" | grep -v -- "--nodatasum" | grep -c "VIOLATION")
+clean_block() { sed -n '/must be clean everywhere/,/residual exposures/p' $LOG/sweep; }
+bad=$(clean_block | grep -E "^--parity" | grep -c "VIOLATION")
 [ "$bad" = 0 ] && pass "fixed accounting clean in every configuration" \
 	|| { fail "$bad configurations that should be clean now violate"
-	     grep -E "^--parity" $LOG/sweep | grep -v -- "--in-place" | grep -v -- "--nodatasum" | grep "VIOLATION"; }
+	     clean_block | grep -E "^--parity" | grep "VIOLATION"; }
 wide=$(sed -n '/wider arrays/,/reverted must break/p' $LOG/sweep | grep -cE "^--data.*VIOLATION")
 [ "$wide" -gt 0 ] && note "$wide wider-array configurations violate (known open finding)" \
 	|| pass "wider arrays now clean -- update needs-direction.md"
-known=$(grep -E "^--parity" $LOG/sweep | grep -E -- "--in-place|--nodatasum" | grep -c "VIOLATION")
-exp=$(grep -E "^--parity" $LOG/sweep | grep -cE -- "--in-place|--nodatasum")
-[ "$known" = "$exp" ] && note "$known/$exp known residual exposures still reported (expected)" \
-	|| fail "residual exposures changed: $known of $exp still violate"
+# The residual exposures are compared against a recorded baseline rather than
+# asserted to all violate.  Requiring every row to violate is not a check: a
+# row that cannot violate in the configuration the sweep runs it in satisfies
+# nothing, and a row that stops violating is progress, not a regression.  A
+# diff surfaces both directions -- a new exposure, and one that closed and
+# should come out of the docs.
+BASE=$REPO/tools/testing/btrfs/uml/residual-exposures.txt
+sed -n '/residual exposures/,/wider arrays/p' $LOG/sweep | grep -E "^--parity" |
+	sed 's/  */ /g; s/ *$//' | sed 's/\(VIOLATION\).*/\1/; s/\(OK\):.*/\1/' |
+	sort > $LOG/residual
+if [ ! -f $BASE ]; then
+	fail "no residual baseline at $BASE"
+elif grep -v '^#' $BASE | diff -u - $LOG/residual > $LOG/residual.diff; then
+	note "residual exposures match the recorded baseline"
+else
+	fail "residual exposures changed -- update $BASE and needs-direction.md"
+	cat $LOG/residual.diff
+fi
 rev=$(sed -n '/reverted must break/,$p' $LOG/sweep | grep -cE "^--depth")
 revbad=$(sed -n '/reverted must break/,$p' $LOG/sweep | grep -E "^--depth" | grep -c "VIOLATION")
 [ "$rev" -gt 0 ] && [ "$rev" = "$revbad" ] && pass "every reverted accounting fix still breaks something ($rev/$rev)" \
 	|| fail "a reverted fix no longer breaks anything ($revbad/$rev)"
+
+if [ $rig != 1 ]; then
+	printf '\n\033[31mno rig -- the scenarios below were not run\033[0m\n'
+	printf '%d check(s) failed\n' $fails
+	exit 1
+fi
 
 echo "== in-kernel self tests =="
 cp -a $HERE/selftest.sh $T/umltest/ 2>/dev/null

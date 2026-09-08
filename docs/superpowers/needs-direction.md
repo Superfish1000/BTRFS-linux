@@ -83,48 +83,6 @@ the effect on the full-stripe versus sub-stripe ratio, which
 
 ---
 
-## 5. The model reports acknowledged loss at three or more data stripes
-
-**What.** `sweep.sh` never passed `--data`, so every configuration behind the
-"fixed accounting is clean everywhere" claim ran at the default of two data
-stripes -- a 3-disk RAID5 and a 4-disk RAID6. The arrays actually measured in
-this series have `nr_data` 3 and 7. At three or more the model reports
-acknowledged loss, for both RAID5 and RAID6:
-
-```
-history: ('rmw', (1,2), ('1','2','p0')) ; ('rmw', (2,), ('2',)) ; ('rmw', (1,), ('p0',))
-final:   disk=[0,102,2]  parity=[(0,1,101)]  committed=[0,102,101]
-```
-
-The second write puts 101 into stripe 2; its data write fails and only the
-parity carries the value. One fault against one parity, so the write is
-accepted. The third write touches stripe 1 and loses its parity write. Again
-one fault, again accepted -- but parity was the only copy of stripe 2, so that
-stripe's committed content now exists nowhere.
-
-`nr_data = 2` is clean at depth 5, so this is a width property and not a
-search-depth artifact.
-
-**Why it is not obviously a defect.** Each RMW counts faults within its own
-rbio, which is what `rbio_max_errors()` is for; neither write individually
-exceeds the profile. The stripe is left recorded as sticky in the write-intent
-log precisely because it completed with a device error, so the next mount
-scrubs it and restores redundancy. The exposure is the window between the
-failed write and that scrub.
-
-**The choice.** Whether an RMW should consult the log's sticky state for the
-stripe it is about to write and refuse, or de-rate its fault tolerance, when the
-stripe is already one fault down -- at the cost of failing writes that today
-succeed. Or whether this is inherent to a one-fault-tolerant profile taking two
-faults, and belongs in the documented exposures instead.
-
-**What was done meanwhile.** `sweep.sh` now runs `--data 3` and `--data 4` under
-a separate heading, and `regress.sh` reports the result rather than omitting it,
-so the finding is visible in every run instead of being invisible by
-construction.
-
----
-
 ## 6. RAID6 Q cross-check: tested, did not reproduce
 
 **The claim.** `recover_verify_q()` rejects a rebuild whenever the two parity
@@ -157,20 +115,46 @@ are what caught that.
 
 ## 4. Two residual exposures the model checker still reports
 
-Both reproduce in `tools/testing/btrfs/raid56_redundancy_model.py` and are
-documented rather than fixed, because both need a semantic decision about what
-a failed sector write should mean.
+Both reproduce in `tools/testing/btrfs/raid56_redundancy_model.py`; the sweep
+runs them under their own heading and `regress.sh` diffs the result against
+`tools/testing/btrfs/uml/residual-exposures.txt`. Both are documented rather
+than fixed, because both need a semantic decision about what a failed sector
+write should mean.
 
-**`--nodatasum`:** for data without checksums, a sector write that is accepted
-but fails leaves reads returning the pre-write content silently. Combined with
-a later parity failure that is two faults, and the data is gone.
+**`--in-place --strict`:** a `nodatacow` or prealloc write overwrites
+referenced sectors by definition, so committed data is at risk even when the
+write covers the full stripe. The log records these (`RBIO_INPLACE_BIT`) so
+parity is recoverable, but the overwritten data itself is not. It only shows
+under `--strict`, which is the mode that asks whether a *failed* write may
+destroy committed data; outside it a failed write is allowed to, so an
+`--in-place` row without `--strict` cannot violate and checking one proves
+nothing. Reported at both parities and both depths.
 
-**`--in-place`:** a `nodatacow` or prealloc write overwrites referenced sectors
-by definition, so committed data is at risk even when the write covers the full
-stripe. The log records these (`RBIO_INPLACE_BIT`) so parity is recoverable,
-but the overwritten data itself is not.
+**`--nodatasum`:** without checksums a stale sector cannot be told from a good
+one, so a reconstruction from a parity that a failed write left behind is
+returned as if it were correct. Reported for **RAID6 only**:
 
-**The choice.** Whether either should fail the write, return an error to the
-caller, or continue to be accepted with the exposure documented.
+```
+history: ('rmw',(1,),('1','p0','p1')) ; ('rmw',(1,),('p0','p1')) ; ('rmw',(1,),('p1',))
+final:   disk=[0,102] parity=[(0,102),(0,1)] committed=[0,102]
+```
+
+The last write lands its data and p0 but not p1, so one fault against a
+two-parity profile and the write is accepted. Its true margin is one, and the
+de-rate charges exactly that -- so `len(faults) <= budget` holds. Lose the data
+device and p0 and the only equation left is the stale p1, which reconstructs
+the pre-write value. With checksums that is a detected unreadable sector and
+the stripe is recorded for repair; without them it is returned as data.
+
+RAID5 does not show it: a single parity that fails a write leaves a margin of
+zero, so the write is not accepted in the first place.
+
+**The choice.** Whether a write that spends redundancy should be refused
+outright on a `nodatasum` filesystem -- which means any transient write error
+on any one device fails the whole write, on the profile that is supposed to
+absorb it -- or continue to be accepted with the exposure documented. The
+write-intent log narrows the window (the stripe is recorded and the next scrub
+repairs it) but does not close it: devices that die before that scrub runs are
+enough.
 
 ---

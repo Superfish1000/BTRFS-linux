@@ -5,8 +5,17 @@ echo "### fixed accounting must be clean everywhere"
 for parity in 1 2; do for depth in 3 4; do
   run --parity $parity --depth $depth
   run --parity $parity --depth $depth --replacing
-  run --parity $parity --depth $depth --in-place
   run --parity $parity --depth $depth --missing 0
+done; done
+echo
+# The two documented residual exposures (docs/superpowers/needs-direction.md).
+# --in-place only shows under --strict: an overwrite that fails destroys the
+# data it was overwriting, and outside --strict a failed write is allowed to
+# do that.  Run without it, an --in-place row can never violate, so a check
+# that expects one to is checking nothing.
+echo "### residual exposures (expected to violate)"
+for parity in 1 2; do for depth in 3 4; do
+  run --parity $parity --depth $depth --in-place --strict
   run --parity $parity --depth $depth --nodatasum
 done; done
 echo
