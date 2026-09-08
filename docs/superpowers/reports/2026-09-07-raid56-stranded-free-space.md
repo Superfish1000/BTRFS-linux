@@ -237,6 +237,40 @@ establish it.
 The free-space measurement says what the immutable-stripe rule costs; the write
 profile says what it buys. Neither is worth much alone.
 
+## What the write-intent log actually costs
+
+The log is the other half of the comparison, and its cost was asserted rather
+than measured. Its *space* cost genuinely is fixed and width-independent: 8 KiB
+per device at a fixed offset, inside the 1 MiB btrfs already reserves. Its *IO*
+cost is neither.
+
+`btrfs_wib_mark()` records a stripe before the RMW submits anything, and
+`wib_write_block_locked()` skips the device writes when the block it builds is
+byte-identical to the last one that reached every device. How often that fires
+decides the cost, so the eight-disk aging run was repeated with the log's own
+counters captured:
+
+```
+marks 38879   commits 29287   commit_flushes 34   commit_errors 0
+sub_stripe_writes 38879
+```
+
+- Marks track sub-stripe writes exactly 1:1, as designed.
+- 75.3% of them still forced an all-device round trip; the dedup saves 24.7%.
+- That is 234,296 FUA writes of 4 KiB -- 915 MiB -- against 5765 MiB of RMW
+  data and parity, so **15.9% of the read-modify-write traffic** and 7.6% of the
+  12 GiB the workload wrote in total.
+- Per sub-stripe write: 24 KiB of log for 152 KiB of payload.
+
+The cost is O(devices) per commit, so it grows with array width -- the opposite
+of the space cost. The same workload on four disks would pay about half.
+
+That is a real number to weigh against stranding, and it is not negligible.
+It also identifies the optimisation worth doing first: Ceph never cleans up its
+rollback state synchronously, it piggybacks the cleanup on the following write.
+The 24.7% the byte-identical check already saves suggests how much more
+deferring or batching the clears could recover.
+
 ## Reproducing
 
     export BTRFS_TEST_DIR=/var/tmp/btrfs-test
