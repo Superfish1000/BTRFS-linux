@@ -208,12 +208,22 @@ def main():
 
     chunks = parse_chunks(args.chunk_dump, args.sectorsize)
     if args.stripe_len:
+        kept = []
+        dropped = 0
         for c in chunks:
+            # A chunk whose length is not a whole number of modelled full
+            # stripes cannot be re-gridded, and leaving it in at its real
+            # stripe unit would silently mix two granules in one total.
             if c.length % (c.nr_data * args.stripe_len):
-                print(f"chunk {c.start}: length not a multiple of the modelled "
-                      f"full stripe, skipping", file=sys.stderr)
+                dropped += c.length
                 continue
             c.stripe_len = args.stripe_len
+            kept.append(c)
+        if dropped:
+            print(f"excluded {human(dropped)} of chunks whose length is not a "
+                  f"whole number of {args.stripe_len}-byte full stripes",
+                  file=sys.stderr)
+        chunks = kept
     if not chunks:
         print("no RAID5/6 data chunks found", file=sys.stderr)
         return 1
