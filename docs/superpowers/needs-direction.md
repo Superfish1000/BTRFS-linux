@@ -125,6 +125,36 @@ construction.
 
 ---
 
+## 6. RAID6 Q cross-check: tested, did not reproduce
+
+**The claim.** `recover_verify_q()` rejects a rebuild whenever the two parity
+blocks disagree, and they legitimately disagree on stripes holding no committed
+data -- so a degraded RAID6 array could not write into fresh space at all.
+
+**Tested.** `uml/degraded_fresh.sh` boots an array degraded from the first
+mount and writes into never-written space. On six devices with one omitted,
+where the chunk is wide enough for sub-stripe writes to exist at all
+(`sub_stripe_writes 23`), all 21 writes plus an in-place nodatacow overwrite
+succeeded, with no Q-syndrome warning.
+
+**Why not.** The premise does not hold on these images: unwritten space is
+zeros, so P and Q are both zero and agree trivially. The check needs unwritten
+space holding *garbage* -- a disk reused from something else -- before P and Q
+disagree there.
+
+**What is left.** A narrower question than the original: whether a reused disk
+with non-zero content in never-written regions can make a degraded RAID6 refuse
+sub-stripe writes. Reproducing it means seeding the images with garbage before
+mkfs, which the rig does not currently do. Recorded rather than closed, because
+"did not reproduce under the conditions I tried" is not "cannot happen".
+
+Note the first attempt at this test passed while proving nothing: on four
+devices with one omitted the chunk is three wide, `nr_data` is 1, and no write
+can be sub-stripe -- `sub_stripe_writes` stayed 0. The write profile counters
+are what caught that.
+
+---
+
 ## 4. Two residual exposures the model checker still reports
 
 Both reproduce in `tools/testing/btrfs/raid56_redundancy_model.py` and are

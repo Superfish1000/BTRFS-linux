@@ -448,6 +448,41 @@ flakey)
 	log "NO_CRASH"
 	finish
 	;;
+degraded_fresh)
+	# A RAID6 array that is degraded from the start, writing into space
+	# that has never been written.  The parity of a never-written vertical
+	# stripe is whatever was on the disk, so P and Q disagree; a missing
+	# device makes every such stripe need reconstruction, and free space
+	# has no checksum to vouch for the result.  If the Q cross-check in
+	# recover_vertical() rejects that, a degraded array cannot write into
+	# fresh space at all.
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	do_mount $OPTS,degraded $MNTDEV
+	watchdog 120
+	fails=0
+	for i in $(seq 1 20); do
+		dd if=/dev/urandom of=$MNT/f$i bs=4K count=1 conv=fsync status=none \
+			2>/dev/null || fails=$((fails+1))
+	done
+	sync 2>/dev/null || fails=$((fails+1))
+	log "degraded fresh sub-stripe writes: $fails of 21 failed"
+	btrfs filesystem df $MNT 2>&1 | while read -r l; do log "df: $l"; done
+	# Force a genuine read-modify-write: overwrite part of an existing
+	# extent in place, which cannot be redirected to fresh space.
+	dd if=/dev/urandom of=$MNT/big bs=1M count=4 conv=fsync status=none 2>/dev/null
+	sync
+	chattr +C $MNT/nocow 2>/dev/null
+	dd if=/dev/zero of=$MNT/nocow bs=1M count=2 conv=fsync status=none 2>/dev/null
+	sync
+	dd if=/dev/urandom of=$MNT/nocow bs=4K count=4 seek=7 conv=notrunc,fsync \
+		status=none 2>/dev/null || log "INPLACE_WRITE_FAIL"
+	sync
+	[ "$fails" = 0 ] && log "DEGRADED_FRESH_OK" || log "DEGRADED_FRESH_FAIL"
+	kmsg "does not match the Q syndrome" 3
+	stats
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
 degraded_write)
 	# The array is already degraded (device omitted by the host) while
 	# writes happen and the crash hits.  Recovery cannot regenerate the
