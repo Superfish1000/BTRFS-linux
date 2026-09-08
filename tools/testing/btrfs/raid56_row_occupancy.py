@@ -147,6 +147,8 @@ def occupancy(chunk, extents):
     """
     sectorsize = chunk.sectorsize
     sectors_per_stripe = chunk.stripe_len // sectorsize
+    # Zero would make the loop below no-op and report nothing stranded.
+    assert sectors_per_stripe > 0, "stripe_len smaller than the sector size"
     live = free = stranded = 0
 
     # Bitmap of allocated sectors within the chunk, by chunk-relative index.
@@ -208,6 +210,17 @@ def main():
 
     chunks = parse_chunks(args.chunk_dump, args.sectorsize)
     if args.stripe_len:
+        # A stripe unit below the sector size gives sectors_per_stripe == 0, so
+        # the occupancy loop never runs and every chunk reports zero stranded --
+        # an all-zero table that reads as "nothing is wasted", which happens to
+        # be the answer that flatters the design.  Refuse instead.
+        small = [c for c in chunks if args.stripe_len < c.sectorsize]
+        if small:
+            print(f"--stripe-len {args.stripe_len} is below the "
+                  f"{small[0].sectorsize}-byte sector size of chunk "
+                  f"{small[0].start}; a vertical stripe cannot be finer than a "
+                  f"sector", file=sys.stderr)
+            return 1
         kept = []
         dropped = 0
         for c in chunks:

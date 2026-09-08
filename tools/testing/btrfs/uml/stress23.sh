@@ -9,6 +9,7 @@ KERNEL=$1; TAG=$2; PROFILE=$3; OPTS=$4; NDEV=${5:-4}; ITER=${6:-3}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
 cp $HERE/init-final3.sh $T/umltest/init-final3.sh
+cp $HERE/../raid56_wib_dump.py $T/umltest/ 2>/dev/null || true
 D=$T/umltest/$TAG
 rm -rf $D; mkdir -p $D
 rm -f $T/umltest/results.$TAG

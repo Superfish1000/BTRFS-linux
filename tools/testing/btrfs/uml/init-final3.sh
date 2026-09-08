@@ -169,7 +169,7 @@ prepare)
 	fi
 	# Arm the injection: the next sub-stripe RMW drops P/Q (1) or data (2)
 	# writes, waits for the rest to land and panics.
-	echo $CRASH > /sys/module/btrfs/parameters/raid56_crash_point
+	echo $CRASH > /sys/module/btrfs/parameters/raid56_crash_point 2>/dev/null || log "CRASH_ARM_FAIL"
 	dd if=/dev/urandom of=$MNT/new bs=4K count=1 status=none
 	sync
 	# Not reached when the injection fired.
@@ -218,7 +218,7 @@ prepare_fsync)
 	echo "$MNT/g $(md5sum $MNT/g | awk '{print $1}')" >> $MAN
 	log "f layout: $(filefrag -v $MNT/f | sed -n 4p | tr -s ' ')"
 	log "g layout: $(filefrag -v $MNT/g | sed -n 4p | tr -s ' ')"
-	echo $CRASH > /sys/module/btrfs/parameters/raid56_crash_point
+	echo $CRASH > /sys/module/btrfs/parameters/raid56_crash_point 2>/dev/null || log "CRASH_ARM_FAIL"
 	dd if=/dev/urandom of=$MNT/new bs=4K count=1 conv=fsync status=none
 	log "NO_CRASH: raid56_crash_point=$(cat /sys/module/btrfs/parameters/raid56_crash_point)"
 	umount $MNT
@@ -235,7 +235,7 @@ inplace)
 	dd if=/dev/urandom of=$MNT/nocow bs=64K count=12 conv=fsync status=none
 	sync
 	log "nocow layout: $(filefrag -v $MNT/nocow | sed -n 4p | tr -s ' ')"
-	echo $CRASH > /sys/module/btrfs/parameters/raid56_crash_point
+	echo $CRASH > /sys/module/btrfs/parameters/raid56_crash_point 2>/dev/null || log "CRASH_ARM_FAIL"
 	dd if=/dev/urandom of=$MNT/nocow bs=64K count=12 conv=fsync,notrunc status=none
 	log "NO_CRASH: raid56_crash_point=$(cat /sys/module/btrfs/parameters/raid56_crash_point)"
 	umount $MNT
@@ -274,7 +274,8 @@ check)
 	btrfs check $MNTDEV > $T/umltest/check.$TAG 2>&1 && log "CHECK_OK" || log "CHECK_FAIL rc=$?"
 	grep -E "error|ERROR|found|compat" $T/umltest/check.$TAG | head -n 5 | while read -r l; do log "check: $l"; done
 	btrfs inspect-internal dump-super $MNTDEV | grep -E "compat_ro_flags|incompat_flags" | while read -r l; do log "super: $l"; done
-	python3 /home/user/BTRFS-linux/tools/testing/btrfs/raid56_wib_dump.py $DEVS | head -n 12 | while read -r l; do log "wib: $l"; done
+	python3 $T/umltest/raid56_wib_dump.py $DEVS 2>/dev/null | head -n 12 |
+		while read -r l; do log "wib: $l"; done || log "WIB_DUMP_FAIL"
 	finish
 	;;
 stress)
@@ -442,7 +443,7 @@ flakey)
 	sleep 3
 	stats "with write errors"
 	kmsg "write-intent|error" 4
-	echo ${CRASH:-1} > /sys/module/btrfs/parameters/raid56_crash_point
+	echo ${CRASH:-1} > /sys/module/btrfs/parameters/raid56_crash_point 2>/dev/null || log "CRASH_ARM_FAIL"
 	dd if=/dev/urandom of=$MNT/new bs=4K count=1 conv=fsync status=none
 	log "NO_CRASH"
 	finish
@@ -456,7 +457,7 @@ degraded_write)
 	stats
 	dd if=/dev/urandom of=$MNT/old2 bs=128K count=1 status=none; sync
 	md5sum $MNT/old2 | awk '{print $1}' > $T/umltest/old2.md5.$TAG
-	echo ${CRASH:-1} > /sys/module/btrfs/parameters/raid56_crash_point
+	echo ${CRASH:-1} > /sys/module/btrfs/parameters/raid56_crash_point 2>/dev/null || log "CRASH_ARM_FAIL"
 	dd if=/dev/urandom of=$MNT/new bs=4K count=1 conv=fsync status=none
 	log "NO_CRASH"
 	finish

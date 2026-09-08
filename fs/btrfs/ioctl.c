@@ -4286,27 +4286,36 @@ static int btrfs_ioctl_set_features(struct file *file, void __user *arg)
 	 * promises it is set, and stops being maintained (once the superblock
 	 * without the flag is durable) when it is cleared, like in sysfs.
 	 */
-	if (flags[0].compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT) {
-		if (flags[1].compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT) {
-			/*
-			 * Requested rather than done here so that the log is
-			 * written out by the same commit that carries the
-			 * flag: if that commit never happens, or the log
-			 * write fails and aborts it, the flag does not become
-			 * durable either.
-			 */
-			ret = btrfs_wib_request_enable(fs_info, false);
-			if (ret)
-				goto out_drop_write;
-		} else {
-			btrfs_wib_disable(fs_info);
-		}
-	}
-
 	trans = btrfs_start_transaction(root, 0);
 	if (IS_ERR(trans)) {
 		ret = PTR_ERR(trans);
 		goto out_drop_write;
+	}
+
+	/*
+	 * Only once the transaction exists.  Both calls set state that a later
+	 * commit acts on -- the enable also sets the feature flag in the
+	 * in-memory superblock -- so doing it before btrfs_start_transaction()
+	 * meant a failure there returned an error to the caller while leaving
+	 * the log to be turned on, and the flag to be written out, by whatever
+	 * committed next.  From here to btrfs_commit_transaction() below there
+	 * is no failure path, so the request cannot be stranded.
+	 *
+	 * Requested rather than done here so that the log is written out by
+	 * the same commit that carries the flag: if that commit fails, or the
+	 * log write aborts it, the flag does not become durable either.
+	 * Neither call does IO; both take only wib->lock and super_lock.
+	 */
+	if (flags[0].compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT) {
+		if (flags[1].compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT) {
+			ret = btrfs_wib_request_enable(fs_info, false);
+			if (ret) {
+				btrfs_end_transaction(trans);
+				goto out_drop_write;
+			}
+		} else {
+			btrfs_wib_disable(fs_info);
+		}
 	}
 
 	spin_lock(&fs_info->super_lock);

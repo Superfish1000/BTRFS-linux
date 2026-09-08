@@ -46,11 +46,18 @@ if [ "${1:-}" = "--self-check" ]; then
 fi
 
 echo "== build =="
+# Drop the btrfs objects so the code under test is actually recompiled: make is
+# incremental, so without this a repeat run compiles nothing and any check on
+# the log passes by seeing an empty file.
+rm -f $BUILD/fs/btrfs/*.o $BUILD/fs/btrfs/tests/*.o 2>/dev/null
 if make -C $REPO ARCH=um O=$BUILD -j$(nproc) linux > $LOG/build 2>&1; then
-	if grep -qE "^[^ ]*(error|warning):" $LOG/build; then
-		fail "build emitted diagnostics"; grep -E "(error|warning):" $LOG/build | head -5
+	# Compiler diagnostics are indented or preceded by a file:line: prefix and
+	# a space, so the pattern must not anchor "warning:" to the line start.
+	if grep -qE "(^|[[:space:]])(error|warning):" $LOG/build; then
+		fail "build emitted diagnostics"
+		grep -E "(^|[[:space:]])(error|warning):" $LOG/build | head -5
 	else
-		pass "builds clean"
+		pass "builds fs/btrfs clean from scratch"
 	fi
 else
 	fail "build failed"; tail -15 $LOG/build
@@ -89,6 +96,11 @@ check_scenario() { # <tag> <resultfile> <label>
 	local tag=$1 f=$2 label=$3
 	grep -aqE "BUG:|KASAN|Oops|possible circular|hung task" $f \
 		&& { fail "$label: kernel splat"; return; }
+	# A scenario whose crash injection never armed proves nothing: without
+	# CONFIG_BTRFS_DEBUG the knob is absent, no crash happens, and the run
+	# still ends in a clean mount and a successful read.
+	grep -aq "CRASH_ARM_FAIL" $f \
+		&& { fail "$label: crash injection failed to arm"; return; }
 	grep -aq "FULL_READ_OK" $f || { fail "$label: committed data did not read back after recovery"; return; }
 	local nrec ndeg nfail
 	nrec=$(grep -ac "boot recover .*rc=0" $f)
