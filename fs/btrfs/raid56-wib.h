@@ -166,6 +166,13 @@ struct btrfs_wib {
 	 */
 	void *prepared;
 	bool prepared_valid;
+	/*
+	 * The same, for the flush-and-drop path, which takes its own snapshot
+	 * before flushing.  It needs a buffer of its own: wib->block is the
+	 * scratch that block building writes into, and @prepared belongs to
+	 * the transaction commit.
+	 */
+	void *flushsnap;
 
 	/* IO completion tracking for one commit, commit_mutex held. */
 	atomic_t io_pending;

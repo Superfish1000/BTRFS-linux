@@ -320,6 +320,12 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 	struct btrfs_wib_disk_entry *de = block + sizeof(*hdr);
 	u32 nr = 0;
 
+	/*
+	 * @base is unioned in below, after this memset has cleared @block.
+	 * Aliasing them would zero the base and silently drop everything it
+	 * lists.
+	 */
+	ASSERT(block != base);
 	memset(block, 0, BTRFS_WIB_SLOT_SIZE);
 
 	spin_lock(&wib->lock);
@@ -864,19 +870,23 @@ static int wib_flush_and_drop_locked(struct btrfs_wib *wib, u64 seq, bool force)
 		bool flushed;
 
 		/*
-		 * Build into wib->block, never into wib->prepared: that holds
-		 * the snapshot a transaction commit took before its barriers,
-		 * and the commit drops against it on the strength of those
-		 * barriers.  Replacing it here with a snapshot taken after
+		 * Build into wib->flushsnap.  Not wib->prepared: that holds the
+		 * snapshot a transaction commit took before its barriers, and
+		 * the commit drops against it on the strength of those
+		 * barriers, so replacing it here with a snapshot taken after
 		 * them would let that commit drop a stripe no flush covered.
-		 * wib->block is safe scratch, wib_write_block_locked() rebuilds
-		 * it from scratch.
+		 * And not wib->block either: wib_drop_locked() hands the
+		 * snapshot to wib_write_block_locked(), which builds into
+		 * wib->block and memsets it first -- the snapshot would be
+		 * zeroed before it was read, silently contributing nothing,
+		 * and the block written would then omit every stripe that
+		 * finished during the flush.
 		 */
-		ret = btrfs_wib_build_block(wib, wib->block, seq, NULL);
+		ret = btrfs_wib_build_block(wib, wib->flushsnap, seq, NULL);
 		/* The in-memory set always fits. */
 		ASSERT(ret == 0);
 		flushed = wib_flush_all_devices(wib);
-		ret = wib_drop_locked(wib, seq, wib->block, flushed, force);
+		ret = wib_drop_locked(wib, seq, wib->flushsnap, flushed, force);
 	}
 	return ret;
 }
@@ -1347,10 +1357,12 @@ int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
 	wib->block = (void *)get_zeroed_page(GFP_KERNEL);
 	wib->last = (void *)get_zeroed_page(GFP_KERNEL);
 	wib->prepared = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!wib->block || !wib->last || !wib->prepared) {
+	wib->flushsnap = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!wib->block || !wib->last || !wib->prepared || !wib->flushsnap) {
 		free_page((unsigned long)wib->block);
 		free_page((unsigned long)wib->last);
 		free_page((unsigned long)wib->prepared);
+		free_page((unsigned long)wib->flushsnap);
 		kfree(wib);
 		return -ENOMEM;
 	}
@@ -1374,6 +1386,7 @@ void btrfs_wib_free(struct btrfs_fs_info *fs_info)
 	free_page((unsigned long)wib->block);
 	free_page((unsigned long)wib->last);
 	free_page((unsigned long)wib->prepared);
+	free_page((unsigned long)wib->flushsnap);
 	kvfree(wib->pending);
 	kfree(wib);
 }
