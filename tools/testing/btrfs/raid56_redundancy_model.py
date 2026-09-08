@@ -333,12 +333,24 @@ class Stripe:
             # current.  A flat de-rate of one is not enough -- a single write
             # can fail several sectors at once, and each one costs an
             # equation.
-            spent = sum(1 for d in range(st.nr_data)
-                        if st.committed[d] is not None
-                        and st.disk[d] != st.committed[d])
-            spent += sum(1 for p in range(st.nr_parity)
-                         if st.parity[p] != tuple(st.disk))
-            budget -= spent
+            # Count the margin the read path actually has, not the number of
+            # things that look wrong.  A failed data write makes the sector
+            # stale AND leaves the parity disagreeing with the disk, so
+            # counting both charges two equations for one lost one -- which
+            # over-derates enough to mask other accounting bugs.
+            #
+            # A sector is stale when its on-disk content is not what was
+            # committed; its value survives only in a parity.  A parity is
+            # usable for recovering them when it agrees with the disk on every
+            # sector that is not stale -- the same test read() applies.  So the
+            # margin is the usable parities minus the sectors needing them.
+            stale = [d for d in range(st.nr_data)
+                     if st.committed[d] is not None
+                     and st.disk[d] != st.committed[d]]
+            usable = sum(1 for p in range(st.nr_parity)
+                         if all(st.parity[p][d] == st.disk[d]
+                                for d in range(st.nr_data) if d not in stale))
+            budget = min(budget, usable - len(stale))
         elif policy["sticky_derate"] and st.recorded:
             # This stripe already carries an error record, so a previous write
             # spent redundancy that the current rbio cannot see: a data sector

@@ -26,7 +26,11 @@ run --data 3 --parity 1 --depth 3 --no-sticky-derate
 run --data 4 --parity 1 --depth 3 --no-sticky-derate
 echo
 echo "### each accounting fix reverted must break something"
-run --depth 3 --no-missing-faults
+# --no-sticky-derate as well: the de-rate computes the stripe's true remaining
+# margin, which subsumes the cruder "a missing device faults the whole vertical
+# stripe" rule.  With the de-rate on, reverting missing_faults alone no longer
+# breaks anything, so the check has to isolate the two or it proves nothing.
+run --depth 3 --no-missing-faults --no-sticky-derate
 run --depth 3 --replacing --replace-inflation
 run --depth 3 --replacing --target-aliasing --availability
 run --depth 4 --policy upstream
