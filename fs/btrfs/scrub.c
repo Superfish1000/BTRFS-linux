@@ -185,6 +185,8 @@ struct scrub_stripe {
 struct scrub_ctx {
 	struct scrub_stripe	stripes[SCRUB_TOTAL_STRIPES];
 	struct scrub_stripe	*raid56_data_stripes;
+	/* How many of them are allocated, 0 when the array is not there. */
+	int			nr_raid56_data_stripes;
 	struct btrfs_fs_info	*fs_info;
 	struct btrfs_path	extent_path;
 	struct btrfs_path	csum_path;
@@ -419,6 +421,64 @@ static void scrub_blocked_if_needed(struct btrfs_fs_info *fs_info)
 	scrub_pause_off(fs_info);
 }
 
+static void scrub_free_raid56_data_stripes(struct scrub_ctx *sctx)
+{
+	if (!sctx->raid56_data_stripes)
+		return;
+	for (int i = 0; i < sctx->nr_raid56_data_stripes; i++)
+		release_scrub_stripe(&sctx->raid56_data_stripes[i]);
+	kfree(sctx->raid56_data_stripes);
+	sctx->raid56_data_stripes = NULL;
+	sctx->nr_raid56_data_stripes = 0;
+}
+
+/*
+ * Make sure @sctx carries @nr_data_stripes data stripes for the chunk about
+ * to be scrubbed, reusing the ones it already has.  Chunks of one filesystem
+ * can differ in width, so the array is only reallocated when the count does
+ * not match.
+ */
+static int scrub_alloc_raid56_data_stripes(struct scrub_ctx *sctx,
+					   struct btrfs_block_group *bg,
+					   int nr_data_stripes)
+{
+	struct btrfs_fs_info *fs_info = sctx->fs_info;
+
+	if (sctx->nr_raid56_data_stripes != nr_data_stripes) {
+		scrub_free_raid56_data_stripes(sctx);
+		sctx->raid56_data_stripes = kzalloc_objs(struct scrub_stripe,
+							 nr_data_stripes);
+		if (!sctx->raid56_data_stripes)
+			return -ENOMEM;
+		sctx->nr_raid56_data_stripes = nr_data_stripes;
+		for (int i = 0; i < nr_data_stripes; i++) {
+			int ret;
+
+			ret = init_scrub_stripe(fs_info,
+						&sctx->raid56_data_stripes[i]);
+			if (ret < 0) {
+				/*
+				 * Do not leave a short array behind that a
+				 * retry with the same width would take for
+				 * a usable one.
+				 */
+				scrub_free_raid56_data_stripes(sctx);
+				return ret;
+			}
+			sctx->raid56_data_stripes[i].sctx = sctx;
+		}
+	}
+	/*
+	 * A reused stripe still points at the previous chunk's block group,
+	 * which scrub_reset_stripe() does not clear and stripe_length() reads
+	 * for the geometry.  scrub_raid56_parity_stripe() resets everything
+	 * else it uses.
+	 */
+	for (int i = 0; i < nr_data_stripes; i++)
+		sctx->raid56_data_stripes[i].bg = bg;
+	return 0;
+}
+
 static noinline_for_stack void scrub_free_ctx(struct scrub_ctx *sctx)
 {
 	int i;
@@ -426,6 +486,7 @@ static noinline_for_stack void scrub_free_ctx(struct scrub_ctx *sctx)
 	if (!sctx)
 		return;
 
+	scrub_free_raid56_data_stripes(sctx);
 	for (i = 0; i < SCRUB_TOTAL_STRIPES; i++)
 		release_scrub_stripe(&sctx->stripes[i]);
 
@@ -2483,6 +2544,7 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
 			ret = -ENOMEM;
 			goto out;
 		}
+		sctx->nr_raid56_data_stripes = nr_data_stripes(map);
 		for (int i = 0; i < nr_data_stripes(map); i++) {
 			ret = init_scrub_stripe(fs_info,
 						&sctx->raid56_data_stripes[i]);
@@ -2582,12 +2644,7 @@ out:
 	btrfs_release_path(&sctx->extent_path);
 	btrfs_release_path(&sctx->csum_path);
 
-	if (sctx->raid56_data_stripes) {
-		for (int i = 0; i < nr_data_stripes(map); i++)
-			release_scrub_stripe(&sctx->raid56_data_stripes[i]);
-		kfree(sctx->raid56_data_stripes);
-		sctx->raid56_data_stripes = NULL;
-	}
+	scrub_free_raid56_data_stripes(sctx);
 
 	if (sctx->is_dev_replace && ret >= 0) {
 		ret2 = sync_write_pointer_for_zoned(sctx,
@@ -3178,6 +3235,61 @@ out:
 }
 
 /*
+ * Set up what a run of btrfs_scrub_raid56_full_stripe() calls needs, and hold
+ * it across the whole run.
+ *
+ * A scrub_ctx carries SCRUB_TOTAL_STRIPES inline stripes with a full
+ * BTRFS_STRIPE_LEN of pages each, so it is roughly 8 MiB; the data stripes of
+ * the chunk come on top.  Allocating and freeing that for every full stripe
+ * the log recorded makes a long recovery do nothing else, and every one of
+ * those allocations is a chance to fail: wib_recover_one() turns -ENOMEM into
+ * a failed mount, so a recovery of many stripes under memory pressure is far
+ * more likely to fail than a recovery of one, for no reason inherent to the
+ * work.  Allocated once here, the per-stripe cost is a reset.
+ *
+ * The workqueue reference is held for the same reason: without an outer one
+ * the workqueue is created and destroyed again for every full stripe, and the
+ * inner get can fail.  With it held the inner get is a refcount increment.
+ *
+ * Returns the context to pass to btrfs_scrub_raid56_full_stripe(), or an
+ * ERR_PTR.
+ */
+struct scrub_ctx *btrfs_scrub_raid56_recovery_begin(struct btrfs_fs_info *fs_info)
+{
+	struct scrub_ctx *sctx;
+	int ret;
+
+	sctx = scrub_setup_ctx(fs_info, false);
+	if (IS_ERR(sctx))
+		return sctx;
+	sctx->readonly = false;
+	/*
+	 * Deliberately not published in fs_info->scrubs_running.  This runs
+	 * from the mount path, registers no device scrub_ctx, and cannot wait
+	 * for a transaction; counting it would make btrfs_scrub_cancel() block
+	 * uninterruptibly on a scrub it cannot reach, and would hold off a
+	 * commit through the pause protocol for the whole recovery.
+	 * Cancellation is handled by the signal check in should_cancel_scrub().
+	 */
+	sctx->internal = true;
+
+	ret = scrub_workers_get(fs_info);
+	if (ret < 0) {
+		scrub_put_ctx(sctx);
+		return ERR_PTR(ret);
+	}
+	return sctx;
+}
+
+void btrfs_scrub_raid56_recovery_end(struct btrfs_fs_info *fs_info,
+				     struct scrub_ctx *sctx)
+{
+	scrub_workers_put(fs_info);
+	if (!IS_ERR_OR_NULL(sctx))
+		scrub_put_ctx(sctx);
+}
+
+/*
  * Scrub one RAID56 full stripe for the write-intent log recovery: verify
  * every sector that holds an extent (data checksums, tree block headers),
  * repair the bad ones from the parity and write them back, and recompute
@@ -3202,30 +3314,12 @@ out:
  * where it may still allow the repair later), -ENOENT if @full_stripe_start
  * is not in a RAID56 block group (anymore), or another negative error.
  */
-/*
- * Hold the scrub workqueue across a run of btrfs_scrub_raid56_full_stripe()
- * calls.  Each of those takes its own reference, so without an outer one the
- * workqueue is created and destroyed again for every full stripe: a long
- * recovery pays that per stripe, and an allocation shortage part way through
- * turns into -ENOMEM on a stripe and fails the mount.  With the reference
- * held the inner get is a refcount increment that cannot fail.
- */
-int btrfs_scrub_raid56_recovery_begin(struct btrfs_fs_info *fs_info)
-{
-	return scrub_workers_get(fs_info);
-}
-
-void btrfs_scrub_raid56_recovery_end(struct btrfs_fs_info *fs_info)
-{
-	scrub_workers_put(fs_info);
-}
-
 int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
+				   struct scrub_ctx *sctx,
 				   u64 full_stripe_start, bool trusted)
 {
 	struct btrfs_block_group *bg;
 	struct btrfs_chunk_map *map = NULL;
-	struct scrub_ctx *sctx = NULL;
 	u64 fstripe_len;
 	bool missing = false;
 	int data_stripes;
@@ -3255,38 +3349,10 @@ int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 			missing = true;
 	}
 
-	sctx = scrub_setup_ctx(fs_info, false);
-	if (IS_ERR(sctx)) {
-		ret = PTR_ERR(sctx);
-		sctx = NULL;
-		goto out_map;
-	}
-	sctx->readonly = false;
-	sctx->internal = true;
-	sctx->raid56_data_stripes = kzalloc_objs(struct scrub_stripe, data_stripes);
-	if (!sctx->raid56_data_stripes) {
-		ret = -ENOMEM;
-		goto out_ctx;
-	}
-	for (int i = 0; i < data_stripes; i++) {
-		ret = init_scrub_stripe(fs_info, &sctx->raid56_data_stripes[i]);
-		if (ret < 0)
-			goto out_stripes;
-		sctx->raid56_data_stripes[i].bg = bg;
-		sctx->raid56_data_stripes[i].sctx = sctx;
-	}
-	ret = scrub_workers_get(fs_info);
+	/* Reused across the run; only a differently shaped chunk reallocates. */
+	ret = scrub_alloc_raid56_data_stripes(sctx, bg, data_stripes);
 	if (ret < 0)
-		goto out_stripes;
-
-	/*
-	 * Deliberately not published in fs_info->scrubs_running.  This runs
-	 * from the mount path, registers no device scrub_ctx, and cannot wait
-	 * for a transaction; counting it would make btrfs_scrub_cancel() block
-	 * uninterruptibly on a scrub it cannot reach, and would hold off a
-	 * commit through the pause protocol for the whole recovery.
-	 * Cancellation is handled by the signal check in should_cancel_scrub().
-	 */
+		goto out_map;
 
 	/*
 	 * Every parity stripe of the full stripe is regenerated by a separate
@@ -3352,14 +3418,6 @@ int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 		}
 	}
 
-	scrub_workers_put(fs_info);
-out_stripes:
-	for (int i = 0; i < data_stripes; i++)
-		release_scrub_stripe(&sctx->raid56_data_stripes[i]);
-	kfree(sctx->raid56_data_stripes);
-	sctx->raid56_data_stripes = NULL;
-out_ctx:
-	scrub_put_ctx(sctx);
 out_map:
 	btrfs_free_chunk_map(map);
 out_bg:
