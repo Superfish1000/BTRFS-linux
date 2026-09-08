@@ -47,7 +47,7 @@ is what copy-on-write perforates stripes with.
 
 ## Results
 
-| profile | devices | nr_data | aged at | free | stranded | per-block-group range | random-placement bound |
+| profile | devices | nr_data | aged at | free | stranded | per-block-group range | if placement were random |
 |---|---|---|---|---|---|---|---|
 | RAID6 | 4 | 2 | 80.9% full | 908 MiB | **66 MiB (7.3%)** | 0.8% – 20.1% | 53% – 97.0% |
 | RAID5 | 4 | 3 | 80.7% full | 1.3 GiB | **227 MiB (17.2%)** | 0.3% – 60.4% | 64% – 99.8% |
@@ -89,7 +89,7 @@ The eight-disk rows, where it goes wrong:
 
 The block group at 89.1% full strands **100.0%** of its free space: every free
 sector in it shares a vertical stripe with a live one. It has reached the
-random-placement bound, meaning the allocator's clustering has stopped buying
+random-placement figure, meaning the allocator's clustering has stopped buying
 anything at all.
 
 Both wide filesystems also grew narrower block groups than the profile asks for
@@ -171,8 +171,15 @@ traffic becomes its own cost, and nothing here measures that.
 The last column is what the same fullness would strand if live sectors were
 scattered at random: a vertical stripe of `nr_data` sectors holds live data with
 probability `1 - (1-u)^nr_data`, and every free sector in such a stripe is lost.
-That bound runs from 53% to 100% across these filesystems. The measurements run
-from 0.3% to 100%.
+That figure runs from 53% to 100% across these filesystems, and the
+measurements run from 0.3% to 100%.
+
+It is a reference point, not a ceiling. The true maximum stranding at occupancy
+`u` is `min(1, u*(nr_data-1)/(1-u))` -- reached when live sectors are spread so
+that each occupies a stripe of its own -- and that is 100% for most of the rows
+here, which makes it useless as a comparison. Random placement is the useful
+comparison precisely because it is what an allocator that made no effort would
+achieve.
 
 Almost all of the free space an immutable-stripe allocator would keep is free
 only because `find_free_extent()` already packs live data into clusters instead
@@ -181,7 +188,7 @@ standing on btrfs's allocation policy. Worth writing down, because an allocator
 change made for unrelated reasons could move this number a long way.
 
 The wide array shows the other end of that: on a seven-data-stripe block group
-at 89% full, the measurement *equals* the random bound. Clustering had stopped
+at 89% full, the measurement *equals* the random-placement figure. Clustering had stopped
 helping entirely. Whatever margin this design has, it comes from the allocator,
 and on wide arrays the allocator runs out of margin to give.
 
