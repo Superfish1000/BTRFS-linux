@@ -338,8 +338,17 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 	if (base) {
 		const struct btrfs_wib_disk_header *bh = base;
 		const struct btrfs_wib_disk_entry *be = base + sizeof(*bh);
-		const u32 bnr = le64_to_cpu(bh->magic) == BTRFS_WIB_MAGIC ?
-				le32_to_cpu(bh->nr_entries) : 0;
+		/*
+		 * @base is always a block this kernel built -- wib->last or
+		 * wib->prepared -- so its count is in range.  Nothing here
+		 * enforces that though, and an out-of-range count would walk
+		 * be[] off the end of the slot, so clamp rather than trust
+		 * the caller to stay disciplined.
+		 */
+		const u32 bnr = min_t(u32,
+				      le64_to_cpu(bh->magic) == BTRFS_WIB_MAGIC ?
+				      le32_to_cpu(bh->nr_entries) : 0,
+				      BTRFS_WIB_MAX_ENTRIES);
 
 		for (u32 i = 0; i < bnr; i++) {
 			u32 j;
@@ -388,6 +397,22 @@ bool btrfs_wib_block_valid(const struct btrfs_fs_info *fs_info, const void *bloc
 		return false;
 	if (le32_to_cpu(hdr->nr_entries) > BTRFS_WIB_MAX_ENTRIES)
 		return false;
+	/*
+	 * Nothing sets these yet, and btrfs_wib_build_block() zeroes the whole
+	 * slot, so a block that has them set was written by something this
+	 * kernel does not understand.  Reject it rather than guess: ignoring a
+	 * log leaves the stripes it covers unrecovered, which is exactly the
+	 * behaviour without the feature, whereas misreading one could scrub
+	 * the wrong stripes or silently skip the right ones.  The feature is
+	 * compat_ro, so an older kernel will not have written this block --
+	 * only a newer one with a format change will, which is the case this
+	 * guards.  block_shift above is checked for the same reason.
+	 */
+	if (hdr->flags != 0)
+		return false;
+	for (int i = 0; i < ARRAY_SIZE(hdr->reserved); i++)
+		if (hdr->reserved[i] != 0)
+			return false;
 	btrfs_csum(fs_info->csum_type, block + BTRFS_CSUM_SIZE,
 		   BTRFS_WIB_SLOT_SIZE - BTRFS_CSUM_SIZE, csum);
 	if (memcmp(csum, hdr->csum, fs_info->csum_size) != 0)

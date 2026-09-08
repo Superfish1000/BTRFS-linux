@@ -326,6 +326,18 @@ out:
 	return ret;
 }
 
+/*
+ * Re-stamp the checksum after doctoring a header field, so that a rejection
+ * proves the field check fired rather than the checksum.
+ */
+static void restamp(struct btrfs_fs_info *fs_info, void *block)
+{
+	struct btrfs_wib_disk_header *hdr = block;
+
+	btrfs_csum(fs_info->csum_type, block + BTRFS_CSUM_SIZE,
+		   BTRFS_WIB_SLOT_SIZE - BTRFS_CSUM_SIZE, hdr->csum);
+}
+
 static int test_torn_block(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
@@ -370,6 +382,53 @@ static int test_torn_block(struct btrfs_fs_info *fs_info)
 	memset(block, 0, BTRFS_WIB_SLOT_SIZE);
 	if (btrfs_wib_block_valid(fs_info, block)) {
 		test_err("zeroed block accepted");
+		goto out;
+	}
+
+	/*
+	 * A block written by a kernel that understands more of the format than
+	 * this one.  Each field is set and the checksum re-stamped, so that
+	 * what rejects the block is the field check and not merely a checksum
+	 * that no longer matches -- otherwise these would pass whether or not
+	 * the checks exist.
+	 */
+	btrfs_wib_build_block(wib, block, 43, NULL);
+	hdr->flags = cpu_to_le64(1);
+	restamp(fs_info, block);
+	if (btrfs_wib_block_valid(fs_info, block)) {
+		test_err("block with an unknown flag accepted");
+		goto out;
+	}
+
+	btrfs_wib_build_block(wib, block, 44, NULL);
+	hdr->reserved[3] = cpu_to_le64(0xdeadbeef);
+	restamp(fs_info, block);
+	if (btrfs_wib_block_valid(fs_info, block)) {
+		test_err("block using a reserved field accepted");
+		goto out;
+	}
+
+	btrfs_wib_build_block(wib, block, 45, NULL);
+	hdr->block_shift = cpu_to_le32(BTRFS_WIB_BLOCK_SHIFT + 1);
+	restamp(fs_info, block);
+	if (btrfs_wib_block_valid(fs_info, block)) {
+		test_err("block with a different granularity accepted");
+		goto out;
+	}
+
+	/* An entry count that would index past the end of the slot. */
+	btrfs_wib_build_block(wib, block, 46, NULL);
+	hdr->nr_entries = cpu_to_le32(BTRFS_WIB_MAX_ENTRIES + 1);
+	restamp(fs_info, block);
+	if (btrfs_wib_block_valid(fs_info, block)) {
+		test_err("block with an out of range entry count accepted");
+		goto out;
+	}
+
+	/* And the same block is still good once the field is put back. */
+	btrfs_wib_build_block(wib, block, 47, NULL);
+	if (!btrfs_wib_block_valid(fs_info, block)) {
+		test_err("rebuilt block not valid");
 		goto out;
 	}
 	ret = 0;
