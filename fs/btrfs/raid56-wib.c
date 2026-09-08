@@ -387,6 +387,7 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 bool btrfs_wib_block_valid(const struct btrfs_fs_info *fs_info, const void *block)
 {
 	const struct btrfs_wib_disk_header *hdr = block;
+	const struct btrfs_wib_disk_entry *de;
 	u8 csum[BTRFS_CSUM_SIZE];
 
 	if (le64_to_cpu(hdr->magic) != BTRFS_WIB_MAGIC)
@@ -423,6 +424,27 @@ bool btrfs_wib_block_valid(const struct btrfs_fs_info *fs_info, const void *bloc
 		   BTRFS_WIB_SLOT_SIZE - BTRFS_CSUM_SIZE, csum);
 	if (memcmp(csum, hdr->csum, fs_info->csum_size) != 0)
 		return false;
+	/*
+	 * Only now that the block is known to be intact, check what it says.
+	 * Every user of an entry -- the union in btrfs_wib_build_block(), the
+	 * lookup in wib_find_entry(), the bit arithmetic in
+	 * btrfs_wib_range_mask() -- assumes the address is the base of an
+	 * entry.  None of them can be made unsafe by an unaligned one
+	 * (range_mask clamps to the entry and returns 0 on an empty
+	 * intersection), but they would silently work on a different range
+	 * than the one recorded, so recovery would scrub somewhere else and
+	 * leave the real stripe alone.
+	 */
+	de = block + sizeof(*hdr);
+	for (u32 i = 0; i < le32_to_cpu(hdr->nr_entries); i++) {
+		const u64 bytenr = le64_to_cpu(de[i].bytenr);
+
+		if (!IS_ALIGNED(bytenr, BTRFS_WIB_ENTRY_SIZE))
+			return false;
+		/* An entry ending past the end of the address space. */
+		if (bytenr > U64_MAX - BTRFS_WIB_ENTRY_SIZE)
+			return false;
+	}
 	return true;
 }
 

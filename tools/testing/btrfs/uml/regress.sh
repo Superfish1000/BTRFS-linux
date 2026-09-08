@@ -102,9 +102,24 @@ bad=$(clean_block | grep -E "^--parity" | grep -c "VIOLATION")
 [ "$bad" = 0 ] && pass "fixed accounting clean in every configuration" \
 	|| { fail "$bad configurations that should be clean now violate"
 	     clean_block | grep -E "^--parity" | grep "VIOLATION"; }
-wide=$(sed -n '/wider arrays/,/reverted must break/p' $LOG/sweep | grep -cE "^--data.*VIOLATION")
-[ "$wide" -gt 0 ] && note "$wide wider-array configurations violate (known open finding)" \
-	|| pass "wider arrays now clean -- update needs-direction.md"
+# The wider arrays are the open finding of needs-direction.md item 5, so they
+# are expected to violate.  Reported both ways round: if they stop violating
+# without a kernel change, the model's policy has drifted away from the kernel
+# again, which is how the finding got deleted as resolved once already.
+wide=$(sed -n '/### wider arrays/,/### de-rate/p' $LOG/sweep | grep -cE "^--data.*VIOLATION")
+widetot=$(sed -n '/### wider arrays/,/### de-rate/p' $LOG/sweep | grep -cE "^--data")
+[ "$wide" -gt 0 ] && note "$wide/$widetot wider-array configurations violate (open, needs-direction item 5)" \
+	|| fail "wider arrays no longer violate -- is that a kernel change, or did the model's default policy drift?"
+# The de-rate proposals are the measurement item 5 rests on: the flat variant
+# must close the wider-array loss, and must still cost availability.  If either
+# stops being true the entry needs rewriting.
+derate=$(sed -n '/### de-rate/,/### each accounting/p' $LOG/sweep)
+[ "$(echo "$derate" | grep -cE '^--data.*OK:')" = "$(echo "$derate" | grep -cE '^--data')" ] \
+	&& pass "both de-rate proposals still close the wider-array loss" \
+	|| fail "a de-rate proposal no longer closes the wider-array loss -- update needs-direction.md"
+echo "$derate" | grep -q -- "--availability.*VIOLATION (spurious" \
+	&& note "the flat de-rate still costs availability (why it is not applied)" \
+	|| fail "the flat de-rate no longer costs availability -- reconsider needs-direction item 5"
 # The residual exposures are compared against a recorded baseline rather than
 # asserted to all violate.  Requiring every row to violate is not a check: a
 # row that cannot violate in the configuration the sweep runs it in satisfies

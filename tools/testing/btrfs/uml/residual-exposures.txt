@@ -5,9 +5,9 @@
 # looking at.  A new VIOLATION is a new exposure; a VIOLATION that becomes OK
 # is one that closed, and docs/superpowers/needs-direction.md should lose it.
 --parity 1 --depth 3 --in-place --strict VIOLATION
---parity 1 --depth 3 --nodatasum OK
+--parity 1 --depth 3 --nodatasum VIOLATION
 --parity 1 --depth 4 --in-place --strict VIOLATION
---parity 1 --depth 4 --nodatasum OK
+--parity 1 --depth 4 --nodatasum VIOLATION
 --parity 2 --depth 3 --in-place --strict VIOLATION
 --parity 2 --depth 3 --nodatasum VIOLATION
 --parity 2 --depth 4 --in-place --strict VIOLATION

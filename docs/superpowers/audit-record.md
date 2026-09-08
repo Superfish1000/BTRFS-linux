@@ -71,24 +71,50 @@ only ever reporting that it did not.
 Kernel fixes are additionally verified by negative control: remove the fix,
 confirm the new test reports the failure, restore it, confirm a clean run.
 
-## Acknowledged loss at three or more data stripes -- closed
+## A model whose default policy was not the kernel's
 
-Logged as an open question while the sweep only ever ran at `--data 2`. The
-choice it posed -- whether an RMW should de-rate its fault tolerance when the
-stripe it is about to write is already one fault down -- was taken: the model's
-`sticky_derate` policy computes the stripe's true remaining margin (the parities
-that still agree with the disk on every non-stale sector, minus the sectors that
-need them) and caps the fault budget with it.
+Logged as closed, wrongly, and then reopened. Worth keeping because of how it
+happened rather than what it was.
 
-`sweep.sh` now runs `--data 3`, `--data 4` and `--data 5` at both parities and
-all six are clean. Reverting the de-rate (`--no-sticky-derate`) reintroduces
-acknowledged loss at `--data 3` and `--data 4`, which is what keeps the check
-from passing vacuously.
+The model gained a `sticky_derate` policy that caps a write's fault budget by
+what the stripe has left, and it was made the *default* of the "fixed" policy.
+The sweep then reported the wider-array configurations clean, the regression
+suite reported "wider arrays now clean -- update needs-direction.md", and the
+entry was deleted as resolved.
 
-An earlier form of the de-rate counted stale sectors *and* stale parities,
-charging two equations for one lost one. It over-derated enough to mask the
-`missing_faults` bug: reverting that fix stopped breaking anything, so the check
-meant to prove it load-bearing was passing for the wrong reason.
+Nothing in the kernel had changed. `rbio_max_errors()` is
+`real_stripes - nr_data` -- the flat profile tolerance -- and no caller
+consults the write-intent log before a write. The model was validating a policy
+that existed only in the model, and every check built on it agreed, because
+they all measured the model against itself.
+
+Caught by asking a question the checks could not: which line of the kernel
+implements the policy the model says is load-bearing? There was none.
+
+Two things came out of it. The model's default is now the kernel's behaviour,
+so a proposal has to be asked for by name (`--flat-sticky-derate`,
+`--counted-sticky-derate`), and both are run by `sweep.sh` under a heading that
+says they are not implemented. And the de-rate was then implemented and backed
+out, which is what turned it from an argument into a measurement -- the flat
+variant does close the loss, and on a degraded RAID5 it makes every write after
+the first to a given stripe return EIO, because the sticky bit cannot say
+whether the fault it records was a transient error or the missing device that
+is already being counted. See needs-direction.md item 5.
+
+## An availability check that no correct fix could pass
+
+While measuring the de-rate, the model's `--availability` check reported it as
+a spurious failure. The check was `(not acked) and len(real_faults) <=
+tolerated()` -- it measures a refusal against the *nominal* profile, which is
+precisely what a de-rate departs from, so it would flag any correct de-rate.
+
+Two replacements were tried and both were wrong in a different way: "would
+acking have been safe" is vacuously true once the array is past its tolerance
+(a RAID5 with two devices gone is right to refuse), and adding a
+within-tolerance guard still ignores that acking also creates the commitment
+the write then has to satisfy. Reverted to the original rather than shipped
+half-converged. The tension is real and is recorded in needs-direction.md as
+part of the cost of the de-rate, not papered over in the checker.
 
 ## The residual-exposure check was checking nothing
 

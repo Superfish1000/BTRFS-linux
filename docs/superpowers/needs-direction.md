@@ -83,6 +83,80 @@ the effect on the full-stripe versus sub-stripe ratio, which
 
 ---
 
+## 5. The model reports acknowledged loss at three or more data stripes
+
+**What.** `sweep.sh` originally never passed `--data`, so every configuration
+behind the "fixed accounting is clean everywhere" claim ran at the default of
+two data stripes -- a 3-disk RAID5 and a 4-disk RAID6. The arrays actually
+measured in this series have `nr_data` 3 and 7. At three or more the model
+reports acknowledged loss, for both RAID5 and RAID6:
+
+```
+history: ('rmw', (1,2), ('1','2','p0')) ; ('rmw', (2,), ('2',)) ; ('rmw', (1,), ('p0',))
+final:   disk=[0,102,2]  parity=[(0,1,101)]  committed=[0,102,101]
+```
+
+The second write puts 101 into stripe 2; its data write fails and only the
+parity carries the value. One fault against one parity, so the write is
+accepted. The third write touches stripe 1 and loses its parity write. Again
+one fault, again accepted -- but parity was the only copy of stripe 2, so that
+stripe's committed content now exists nowhere.
+
+`nr_data = 2` is clean at depth 5, so this is a width property and not a
+search-depth artifact.
+
+**Why it is not obviously a defect.** Each RMW counts faults within its own
+rbio, which is what `rbio_max_errors()` is for; neither write individually
+exceeds the profile. The stripe is left recorded as sticky in the write-intent
+log precisely because it completed with a device error, so the next mount
+scrubs it and restores redundancy. The exposure is the window between the
+failed write and that scrub.
+
+**The choice.** Whether an RMW should de-rate its fault tolerance when the
+stripe it is about to write is already one fault down -- at the cost of failing
+writes that today succeed. Or whether this is inherent to a one-fault-tolerant
+profile taking two faults, and belongs in the documented exposures instead.
+
+### Both de-rate variants were built and measured
+
+Written, run, and then backed out. `sweep.sh` runs both so the numbers stay
+visible.
+
+**Flat (`--flat-sticky-derate`).** `btrfs_wib_has_sticky()` before the writes,
+then `rbio_max_errors(rbio) - degraded` after them. Implementable: it needs
+only the log's sticky bit. It **does** close the wider-array loss at `--data 3`
+and `--data 4`, for both parities.
+
+It also breaks degraded arrays. The sticky bit does not say why it was set, and
+a missing device sets one on every write it touches -- but that same fault is
+already counted against the next write by the `missing_faults` rule, so
+de-rating for it charges one lost equation twice. On a RAID5 with a device
+gone that is the entire budget: the first write to a full stripe succeeds and
+records it, and every write to that stripe afterwards returns EIO. A degraded
+array goes read-only one stripe at a time.
+
+Suppressing the de-rate while any device is missing fixes that particular case
+and leaves the real cost: on a healthy array, a stripe that took one transient
+write error refuses its next failing write until a scrub clears the record.
+That is correct for integrity and is a loss of availability, which is the
+trade-off this entry exists to have decided.
+
+**Counted (`--counted-sticky-derate`).** Caps the budget by the stripe's true
+remaining margin -- the parities still agreeing with the disk on every
+non-stale sector, minus the sectors needing them. Strictly stronger, and *not*
+implementable the same way: computing it needs every parity compared against
+every sector on disk, which the write path does not have and cannot afford to
+read. It is in the model to show what the extra strength would buy, not as a
+candidate.
+
+**The trap this walked into.** For a while the model's default policy was the
+counted de-rate while the kernel had neither, so the sweep reported "wider
+arrays clean" and this entry was deleted as resolved. Nothing in the kernel had
+changed. The model's default is now the kernel's behaviour -- no de-rate -- and
+a variant has to be asked for by name.
+
+---
+
 ## 6. RAID6 Q cross-check: tested, did not reproduce
 
 **The claim.** `recover_verify_q()` rejects a rebuild whenever the two parity
@@ -132,22 +206,20 @@ nothing. Reported at both parities and both depths.
 
 **`--nodatasum`:** without checksums a stale sector cannot be told from a good
 one, so a reconstruction from a parity that a failed write left behind is
-returned as if it were correct. Reported for **RAID6 only**:
+returned as if it were correct. Reported at both parities:
 
 ```
-history: ('rmw',(1,),('1','p0','p1')) ; ('rmw',(1,),('p0','p1')) ; ('rmw',(1,),('p1',))
-final:   disk=[0,102] parity=[(0,102),(0,1)] committed=[0,102]
+history: ('rmw', (1,), ('1', 'p0')) ; ('rmw', (1,), ('p0',))
+final:   disk=[0, 101] parity=[(0, 1)] committed=[0, 101]
+         read of stripe 1 after losing device 1 returns 1, not 101
 ```
 
-The last write lands its data and p0 but not p1, so one fault against a
-two-parity profile and the write is accepted. Its true margin is one, and the
-de-rate charges exactly that -- so `len(faults) <= budget` holds. Lose the data
-device and p0 and the only equation left is the stale p1, which reconstructs
-the pre-write value. With checksums that is a detected unreadable sector and
-the stripe is recorded for repair; without them it is returned as data.
-
-RAID5 does not show it: a single parity that fails a write leaves a margin of
-zero, so the write is not accepted in the first place.
+The second write lands 101 on the data device and loses only its parity write:
+one fault, inside the profile's tolerance, so it is accepted. The parity is now
+stale -- it still describes the pre-write value. Lose the data device and the
+reconstruction from that parity returns 1. With checksums that is a detected
+mismatch and the read fails; without them it is returned as data, and the
+acknowledged write is silently undone.
 
 **The choice.** Whether a write that spends redundancy should be refused
 outright on a `nodatasum` filesystem -- which means any transient write error

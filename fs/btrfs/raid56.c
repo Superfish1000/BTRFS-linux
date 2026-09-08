@@ -2970,15 +2970,6 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	}
 out:
 	/*
-	 * All writes of this RMW have completed (or none were submitted),
-	 * the stripe can leave the in-flight set.  The on-disk log is
-	 * updated lazily with a flush, see raid56-wib.c.
-	 *
-	 * If any write failed (device error or missing device) the stripe is
-	 * inconsistent on that device even without a crash; it stays logged
-	 * so that the parity is regenerated at the next mount.
-	 */
-	/*
 	 * The caller is told this write failed.  The stripe pages hold data
 	 * that is not on disk, so they must not seed a later RMW through the
 	 * stripe cache (cache_rbio()) or the plug list hand-off
@@ -2994,6 +2985,15 @@ out:
 	if (ret < 0)
 		clear_bit(RBIO_CACHE_READY_BIT, &rbio->flags);
 
+	/*
+	 * All writes of this RMW have completed (or none were submitted), so
+	 * the stripe can leave the in-flight set.  The on-disk log is updated
+	 * lazily with a flush, see raid56-wib.c.
+	 *
+	 * If any write failed (device error or missing device) the stripe is
+	 * inconsistent on that device even without a crash; it stays logged
+	 * so that the parity is regenerated at the next mount.
+	 */
 	if (logged)
 		btrfs_wib_done(fs_info, full_stripe_start, full_stripe_len,
 			       ret < 0 || !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors));

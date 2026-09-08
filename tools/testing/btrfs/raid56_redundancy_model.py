@@ -335,6 +335,7 @@ class Stripe:
 
         budget = st.tolerated()
         if policy["sticky_derate"] == "count":
+            # NOT what rmw_rbio() does; see --counted-sticky-derate.
             # How much redundancy this stripe has already spent: every
             # committed data sector whose on-disk content is stale (its value
             # survives only in the parity), and every parity that is not
@@ -359,13 +360,34 @@ class Stripe:
                          if all(st.parity[p][d] == st.disk[d]
                                 for d in range(st.nr_data) if d not in stale))
             budget = min(budget, usable - len(stale))
-        elif policy["sticky_derate"] and st.recorded:
+        elif (policy["sticky_derate"] and st.recorded and
+              not any(st.missing)):
+            # What rmw_rbio() does: btrfs_wib_has_sticky() before the writes,
+            # then rbio_max_errors(rbio) - degraded after them.
+            #
+            # Not while a device of the stripe is missing.  The record does
+            # not say why it was made, and a missing device makes one on every
+            # write it touches -- but that fault is already counted against
+            # this write too (missing_faults), so de-rating for it as well
+            # charges the same lost equation twice.  On a RAID5 with a device
+            # gone that is the whole budget: the first write to a stripe
+            # succeeds and records it, and every write after that fails, which
+            # turns a degraded array read-only one stripe at a time.  The
+            # price of leaving it out is a stripe that is BOTH degraded and
+            # carrying an older transient error, which is not de-rated.
+            #
             # This stripe already carries an error record, so a previous write
             # spent redundancy that the current rbio cannot see: a data sector
             # it could not write is carried only by the parity, or the parity
             # itself was never updated.  error_bitmap covers one rbio, so
             # counting this write's faults against the full profile tolerance
             # would accept a second fault the stripe can no longer absorb.
+            #
+            # One is what the sticky bit can say.  It is a bit per stripe, not
+            # a count of equations, so it cannot distinguish a stripe that lost
+            # one from a stripe that lost two -- but a second failed write sets
+            # it again on a stripe that is already de-rated, and the de-rated
+            # tolerance is what refuses that write in the first place.
             budget -= 1
         if policy["replace_inflation"] and st.replacing:
             # handle_ops_on_dev_replace() raises bioc->max_errors by one for
@@ -536,9 +558,22 @@ def main():
     ap.add_argument("--no-drop-cache-on-fault", action="store_true",
                     help="let a write accepted within the tolerance still "
                          "seed the stripe cache")
-    ap.add_argument("--no-sticky-derate", action="store_true",
-                    help="do not reduce the fault budget of a stripe that "
-                         "already carries an error record")
+    ap.add_argument("--flat-sticky-derate", action="store_true",
+                    help="de-rate a stripe that already carries an error "
+                         "record by one.  A PROPOSAL, not what the kernel "
+                         "does: rbio_max_errors() is the flat profile "
+                         "tolerance and nothing consults the log before a "
+                         "write.  It is the variant the kernel could "
+                         "implement, needing only the sticky bit.  See "
+                         "docs/superpowers/needs-direction.md.")
+    ap.add_argument("--counted-sticky-derate", action="store_true",
+                    help="de-rate a stripe that already carries an error "
+                         "record by its computed remaining margin rather than "
+                         "by one.  Strictly stronger than what rmw_rbio() "
+                         "does, and not implementable the same way: it needs "
+                         "every parity compared against every sector on disk, "
+                         "which the write path does not have.  Here to show "
+                         "what the extra strength would and would not buy.")
     ap.add_argument("--no-missing-faults", action="store_true",
                     help="do not count a missing device as a fault of the "
                          "sectors this write did not cover (upstream)")
@@ -567,7 +602,7 @@ def main():
                       drop_cache_on_fault=False)
     else:
         policy = dict(replace_inflation=False, target_aliasing=False,
-                      missing_faults=True, sticky_derate="count",
+                      missing_faults=True, sticky_derate=False,
                       drop_cache_on_fault=True)
     if args.replace_inflation:
         policy["replace_inflation"] = True
@@ -575,8 +610,10 @@ def main():
         policy["target_aliasing"] = True
     if args.no_missing_faults:
         policy["missing_faults"] = False
-    if args.no_sticky_derate:
-        policy["sticky_derate"] = False
+    if args.flat_sticky_derate:
+        policy["sticky_derate"] = True
+    if args.counted_sticky_derate:
+        policy["sticky_derate"] = "count"
     if args.no_drop_cache_on_fault:
         policy["drop_cache_on_fault"] = False
 
