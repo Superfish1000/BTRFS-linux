@@ -147,6 +147,13 @@ struct btrfs_wib {
 	 */
 	bool disable_requested;
 	bool disable_armed;
+	/*
+	 * A commit sampled enable_requested and is writing the log out.  The
+	 * log is not enabled yet, so a disable arriving now cannot express
+	 * itself through disable_requested the usual way; this tells it to
+	 * do so anyway, and tells the commit not to set the feature flag.
+	 */
+	bool enable_in_progress;
 
 	/* In-flight sub-stripe writes, bitmap == 0 means the entry is free. */
 	struct btrfs_wib_entry entries[BTRFS_WIB_MAX_ENTRIES];

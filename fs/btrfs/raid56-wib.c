@@ -1135,6 +1135,35 @@ void btrfs_wib_commit_prepare(struct btrfs_fs_info *fs_info)
 }
 
 /*
+ * Overwrite @nr_slots of every device with the current in-memory set, each
+ * write preceded by a flush.  Writing every slot leaves no older block behind
+ * that a later mount could pick as the newest one; writing a single slot is
+ * enough when only the newest block matters.
+ */
+static int wib_persist_all_slots(struct btrfs_wib *wib, int nr_slots)
+{
+	int ret = 0;
+
+	mutex_lock(&wib->commit_mutex);
+	for (int i = 0; i < nr_slots; i++) {
+		u64 seq;
+
+		spin_lock(&wib->lock);
+		seq = ++wib->snap_seq;
+		spin_unlock(&wib->lock);
+		ret = wib_flush_and_drop_locked(wib, seq, true);
+		if (ret < 0)
+			break;
+	}
+	mutex_unlock(&wib->commit_mutex);
+	if (ret < 0)
+		btrfs_err(wib->fs_info,
+			  "raid56 write-intent log: failed to write the log: %d",
+			  ret);
+	return ret;
+}
+
+/*
  * Called at transaction commit (and log commit) time, after the device
  * barriers and before the superblocks are written.  Persists the current
  * in-flight set, dropping stripes that finished before the snapshot taken
@@ -1158,6 +1187,13 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	enabled = wib->enabled;
 	enable = wib->enable_requested;
 	disable = wib->disable_requested;
+	/*
+	 * Tell a concurrent btrfs_wib_disable() that an enable it cannot see
+	 * in wib->enabled is under way, so that it is not lost between here
+	 * and the re-check below.
+	 */
+	if (enable)
+		wib->enable_in_progress = true;
 	spin_unlock(&wib->lock);
 
 	if (enable) {
@@ -1167,9 +1203,22 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 		 * durable before that, so a failure has to fail the commit.
 		 */
 		ret = btrfs_wib_enable(fs_info);
+		spin_lock(&wib->lock);
+		wib->enable_in_progress = false;
+		disable = wib->disable_requested;
+		spin_unlock(&wib->lock);
 		if (ret)
 			return ret;
-		btrfs_set_fs_compat_ro(fs_info, RAID56_WRITE_INTENT);
+		/*
+		 * A disable that arrived while the log was being written out
+		 * already cleared the flag from the in-memory superblock.
+		 * Setting it again here would make this commit persist a
+		 * feature the administrator was told had been turned off; the
+		 * log stays enabled for one commit and the disable completes
+		 * at the next one, as it does in the ordinary case.
+		 */
+		if (!disable)
+			btrfs_set_fs_compat_ro(fs_info, RAID56_WRITE_INTENT);
 		return 0;
 	}
 	if (!enabled)
@@ -1190,6 +1239,23 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 			wib->disable_requested = false;
 			wib->disable_armed = false;
 			spin_unlock(&wib->lock);
+			/*
+			 * Nothing refreshes the log from here on, so whatever
+			 * block the devices carry is the one they keep -- and
+			 * it lists the stripes that were in flight at some
+			 * earlier commit, which have long since completed.
+			 * The next mount reads it (btrfs_wib_load() does not
+			 * look at the feature flag) and scrubs every stripe
+			 * in it, so leaving a stale block turns a disable
+			 * into a slow mount later on, for stripes that are
+			 * fine.  Write the current set once instead: the
+			 * writes still in flight, and the stripes recorded as
+			 * damaged, which do want that scrub.
+			 */
+			ret = wib_persist_all_slots(wib, BTRFS_WIB_NR_SLOTS);
+			if (ret < 0)
+				btrfs_warn(fs_info,
+	"raid56 write-intent log: could not write the final log block, the next mount will scrub the stripes the previous one listed");
 			if (!btrfs_is_testing(fs_info))
 				btrfs_info(fs_info, "raid56 write-intent log disabled");
 			return 0;
@@ -1254,8 +1320,15 @@ int btrfs_wib_enable(struct btrfs_fs_info *fs_info)
 	was_enabled = wib->enabled;
 	wib->enabled = true;
 	wib->enable_requested = false;
-	wib->disable_requested = false;
-	wib->disable_armed = false;
+	/*
+	 * Only a disable this enable supersedes is cancelled.  One raised
+	 * against this very enable (enable_in_progress) has to survive: the
+	 * caller re-checks it and leaves the feature flag clear.
+	 */
+	if (!wib->enable_in_progress) {
+		wib->disable_requested = false;
+		wib->disable_armed = false;
+	}
 	spin_unlock(&wib->lock);
 
 	spin_lock(&wib->lock);
@@ -1288,7 +1361,7 @@ void btrfs_wib_disable(struct btrfs_fs_info *fs_info)
 		return;
 	spin_lock(&wib->lock);
 	wib->enable_requested = false;
-	if (wib->enabled) {
+	if (wib->enabled || wib->enable_in_progress) {
 		wib->disable_requested = true;
 		wib->disable_armed = false;
 	}
@@ -1613,7 +1686,8 @@ struct wib_recovery_stats {
  * receive the full stripe geometry (@len is 0 if there is no such stripe
  * anymore).
  */
-static int wib_recover_one(struct btrfs_fs_info *fs_info, u64 logical, bool trusted,
+static int wib_recover_one(struct btrfs_fs_info *fs_info, struct scrub_ctx *sctx,
+			   u64 logical, bool trusted,
 			   bool log_replay_pending, u64 *start, u64 *len,
 			   struct wib_recovery_stats *st)
 {
@@ -1630,7 +1704,7 @@ static int wib_recover_one(struct btrfs_fs_info *fs_info, u64 logical, bool trus
 	if (ret < 0)
 		return ret;
 
-	ret = btrfs_scrub_raid56_full_stripe(fs_info, *start, trusted);
+	ret = btrfs_scrub_raid56_full_stripe(fs_info, sctx, *start, trusted);
 	if (ret == -ENOENT) {
 		st->skipped++;
 		return 0;
@@ -1691,33 +1765,6 @@ static int wib_recover_one(struct btrfs_fs_info *fs_info, u64 logical, bool trus
 }
 
 /*
- * Make the recovery's writes durable and persist the in-memory set,
- * overwriting @nr_slots slots on every device.
- */
-static int wib_commit_after_recovery(struct btrfs_wib *wib, int nr_slots)
-{
-	int ret = 0;
-
-	mutex_lock(&wib->commit_mutex);
-	for (int i = 0; i < nr_slots; i++) {
-		u64 seq;
-
-		spin_lock(&wib->lock);
-		seq = ++wib->snap_seq;
-		spin_unlock(&wib->lock);
-		ret = wib_flush_and_drop_locked(wib, seq, true);
-		if (ret < 0)
-			break;
-	}
-	mutex_unlock(&wib->commit_mutex);
-	if (ret < 0)
-		btrfs_err(wib->fs_info,
-			  "raid56 write-intent log: failed to write the log after recovery: %d",
-			  ret);
-	return ret;
-}
-
-/*
  * Recover every full stripe recorded in the log.  Must run before anything
  * is written to the filesystem (and after the block groups and the
  * extent/csum trees are available).
@@ -1730,6 +1777,7 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 {
 	struct btrfs_wib *wib = fs_info->wib;
 	struct wib_recovery_stats st = { 0 };
+	struct scrub_ctx *sctx;
 	u64 last_start = 0;
 	u64 last_len = 0;
 	int ret;
@@ -1737,10 +1785,10 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 	if (!wib || !wib->nr_pending)
 		return 0;
 
-	/* One workqueue for the whole pass, not one per full stripe. */
-	ret = btrfs_scrub_raid56_recovery_begin(fs_info);
-	if (ret < 0)
-		return ret;
+	/* One scrub context and workqueue for the whole pass, not one each. */
+	sctx = btrfs_scrub_raid56_recovery_begin(fs_info);
+	if (IS_ERR(sctx))
+		return PTR_ERR(sctx);
 
 	for (unsigned int i = 0; i < wib->nr_pending; i++) {
 		const struct btrfs_wib_entry *e = &wib->pending[i];
@@ -1790,7 +1838,7 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 			 */
 			trusted = !wib_pending_has_error(wib, start, len) ||
 				  !log_replay_pending;
-			ret = wib_recover_one(fs_info, start, trusted, log_replay_pending,
+			ret = wib_recover_one(fs_info, sctx, start, trusted, log_replay_pending,
 					      &start, &len, &st);
 			if (ret < 0)
 				goto out;
@@ -1814,9 +1862,9 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 	 * work.  This is done whether or not the log stays enabled: a stale
 	 * valid block would otherwise be replayed at every mount.
 	 */
-	ret = wib_commit_after_recovery(wib, BTRFS_WIB_NR_SLOTS);
+	ret = wib_persist_all_slots(wib, BTRFS_WIB_NR_SLOTS);
 out:
-	btrfs_scrub_raid56_recovery_end(fs_info);
+	btrfs_scrub_raid56_recovery_end(fs_info, sctx);
 	return ret;
 }
 
@@ -1831,6 +1879,7 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 	struct btrfs_wib *wib = fs_info->wib;
 	struct wib_recovery_stats st = { 0 };
 	struct btrfs_wib_entry *snap;
+	struct scrub_ctx *sctx;
 	unsigned int nr = 0;
 	u64 last_start = 0;
 	u64 last_len = 0;
@@ -1851,9 +1900,11 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 	if (nr == 0)
 		goto out;
 
-	ret = btrfs_scrub_raid56_recovery_begin(fs_info);
-	if (ret < 0)
+	sctx = btrfs_scrub_raid56_recovery_begin(fs_info);
+	if (IS_ERR(sctx)) {
+		ret = PTR_ERR(sctx);
 		goto out;
+	}
 
 	for (unsigned int i = 0; i < nr; i++) {
 		const struct btrfs_wib_entry *e = &snap[i];
@@ -1876,7 +1927,7 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 				goto out_end;
 			}
 
-			ret = wib_recover_one(fs_info, logical, true, false, &start, &len, &st);
+			ret = wib_recover_one(fs_info, sctx, logical, true, false, &start, &len, &st);
 			if (ret < 0)
 				goto out_end;
 			if (!len) {
@@ -1894,9 +1945,9 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 	btrfs_info(fs_info,
 	"raid56 write-intent log: recovery after log replay done, %u full stripes scrubbed, %u skipped, %u unrepairable, %u kept recorded",
 		   st.done, st.skipped, st.failed, st.kept);
-	ret = wib_commit_after_recovery(wib, 1);
+	ret = wib_persist_all_slots(wib, 1);
 out_end:
-	btrfs_scrub_raid56_recovery_end(fs_info);
+	btrfs_scrub_raid56_recovery_end(fs_info, sctx);
 out:
 	kvfree(snap);
 	return ret;
