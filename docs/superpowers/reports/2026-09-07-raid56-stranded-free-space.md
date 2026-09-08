@@ -98,6 +98,37 @@ filled unevenly and btrfs made chunks out of whatever devices still had room.
 Narrower chunks strand less by construction, so they flatter the totals
 slightly.
 
+## The cost is btrfs's stripe unit, not the rule
+
+Every figure above was measured at one value of a compile-time constant.
+`BTRFS_STRIPE_LEN` is `#define SZ_64K` in `fs/btrfs/volumes.h`. A vertical
+stripe's `nr_data` members therefore lie 64 KiB apart in logical space, so a
+contiguous run of free space must exceed `(nr_data - 1) * 64 KiB` -- 384 KiB on
+an eight-disk array -- before it can release even one vertical stripe. The
+median data extent in these filesystems is 16 KiB.
+
+Re-gridding the *same extents* onto a finer stripe unit:
+
+| run | 64 KiB | 16 KiB | 8 KiB | 4 KiB |
+|---|---|---|---|---|
+| RAID6 4-disk, nr_data=2 | 7.3% | 2.4% | 1.3% | 0.6% |
+| RAID5 4-disk, nr_data=3 | 17.2% | 5.8% | 3.3% | 1.8% |
+| RAID5 4-disk @92% full | 47.6% | 16.7% | 9.3% | 5.2% |
+| RAID5 8-disk, nr_data=7 | 46.1% | 18.7% | 11.2% | 6.4% |
+
+The 46% that appeared to kill the immutable-stripe family is a property of the
+64 KiB scattered granule, not of the rule. At a 4 KiB granule the worst case in
+this whole study is 6.4%.
+
+Three things must travel with that result. The on-disk format already carries
+`stripe_len` as a per-chunk `__le64` and mkfs writes it, but the kernel never
+reads it back -- `BTRFS_STRIPE_LEN` is a constant everywhere and `tree-checker.c`
+enforces it -- so this is an implementation change, not a mount option. A small
+stripe unit gives up the property that a small read touches one disk, and
+multiplies the number of rbios per byte written. And this models one extent
+layout re-gridded, not a filesystem that actually ran at that granule, where the
+allocator would have behaved differently.
+
 ## What it means
 
 ### On a narrow array at ordinary fullness, the rule is affordable
@@ -190,9 +221,18 @@ sub_stripe_resident_sectors 1680992
 ```
 
 Two thirds of the RAID5 writes this workload issued were sub-stripe writes, and
-they put 1.68 million committed sectors -- 6.4 GiB -- at stake to write 1.06
-million of their own. **1.58 sectors of existing data exposed per sector
-written.** On the four-disk toggle test the ratio was 2.0.
+they disturbed vertical stripes holding at most 1.68 million sectors -- 6.4 GiB
+-- besides the 1.06 million they wrote themselves.
+
+That is an upper bound, not a measurement. `rmw_assemble_write_bios()` marks a
+sector resident purely because the write did not supply it, and raid56.c cannot
+tell a committed sector from a free one, so
+`written + resident == vstripes * nr_data` is an identity. Checking the aged
+images against the extent tree offline puts the genuinely allocated share of
+those resident sectors at 86% on the eight-disk array and 91-94% on the others.
+So the real figure is close to the bound -- about 1.33 sectors of committed data
+exposed per sector written at nr_data=7 -- but the counter alone does not
+establish it.
 
 The free-space measurement says what the immutable-stripe rule costs; the write
 profile says what it buys. Neither is worth much alone.

@@ -516,7 +516,7 @@ struct btrfs_free_space;
  * nothing.  A sub-stripe write recomputes parity over vertical stripes that
  * already hold committed data, and it is the sectors it does *not* write --
  * @partial_resident -- whose redundancy is at stake while it runs.  That
- * number is the size of the exposure, and nothing in btrfs reports it today.
+ * bounds the size of the exposure, and nothing in btrfs reports it today.
  */
 struct btrfs_raid56_write_stats {
 	/* Full-stripe writes into freshly allocated space. */
@@ -529,7 +529,16 @@ struct btrfs_raid56_write_stats {
 	atomic64_t partial_vstripes;
 	/* Data sectors they supplied themselves. */
 	atomic64_t partial_sectors;
-	/* Data sectors in the same vertical stripes that they did not. */
+	/*
+	 * Data sectors in the same vertical stripes that they did not write.
+	 * This is an UPPER BOUND on the committed data at stake, not a
+	 * measurement of it: rmw_assemble_write_bios() classifies a sector as
+	 * resident purely because the write did not supply it, and raid56.c
+	 * cannot tell a committed sector from a free one.  So
+	 * partial_sectors + partial_resident == partial_vstripes * nr_data
+	 * identically.  Measuring aged filesystems offline against the extent
+	 * tree put the genuinely allocated share at 86-94%.
+	 */
 	atomic64_t partial_resident;
 };
 

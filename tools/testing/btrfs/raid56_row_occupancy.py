@@ -194,11 +194,26 @@ def main():
     ap.add_argument("extent_dump", help="output of dump-tree -t extent")
     ap.add_argument("--sectorsize", type=int, default=None,
                     help="override the sector size read from the chunk dump")
+    ap.add_argument("--stripe-len", type=int, default=None,
+                    help="model the array as if the stripe unit were this, "
+                         "instead of the 64KiB the chunk dump records. A "
+                         "vertical stripe's members lie stripe_len apart, so "
+                         "this is what decides whether free space has to be "
+                         "contiguous over nr_data*stripe_len to be usable. At "
+                         "--stripe-len equal to the sector size the members "
+                         "are contiguous.")
     ap.add_argument("--csv", help="also write the per-block-group rows here,"
                     " ordered by how full the block group is")
     args = ap.parse_args()
 
     chunks = parse_chunks(args.chunk_dump, args.sectorsize)
+    if args.stripe_len:
+        for c in chunks:
+            if c.length % (c.nr_data * args.stripe_len):
+                print(f"chunk {c.start}: length not a multiple of the modelled "
+                      f"full stripe, skipping", file=sys.stderr)
+                continue
+            c.stripe_len = args.stripe_len
     if not chunks:
         print("no RAID5/6 data chunks found", file=sys.stderr)
         return 1

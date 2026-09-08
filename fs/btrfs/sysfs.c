@@ -1379,8 +1379,9 @@ BTRFS_ATTR(, raid56_write_intent, btrfs_raid56_write_intent_show);
 /*
  * How the RAID5/6 writes of this filesystem divided between the two cases
  * that matter for the write hole.  See struct btrfs_raid56_write_stats:
- * resident_sectors is the one to look at, the committed data whose
- * redundancy sub-stripe writes put at stake.
+ * resident_sectors is the one to look at -- an upper bound on the committed
+ * data whose redundancy sub-stripe writes put at stake, since the write path
+ * cannot tell a committed sector from a free one.
  */
 static ssize_t btrfs_raid56_write_profile_show(struct kobject *kobj,
 					       struct kobj_attribute *a, char *buf)
