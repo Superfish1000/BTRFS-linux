@@ -391,7 +391,22 @@ class Stripe:
             for d in write_set:
                 st.committed[d] = newval       # the transaction references it
             st.cache = [believed[d] for d in range(st.nr_data)]
-            st.cache_ready = not full          # full stripe writes are not cached
+            # full stripe writes are not cached
+            st.cache_ready = not full
+            if policy["drop_cache_on_fault"] and faults:
+                # rmw_rbio() clears RBIO_CACHE_READY_BIT only when the write
+                # failed outright, so a write accepted *within* the tolerance
+                # still seeds the cache -- with content a device did not take.
+                # The next RMW is then served believed values, succeeds where
+                # it should have found the stripe unreadable, and writes a
+                # parity encoding sectors that are not on disk.
+                #
+                # Dropping it instead makes that RMW read the stale sector,
+                # fail its checksum and reconstruct it from the parity, which
+                # both yields the true value and proves the parity still
+                # usable.  (Without checksums the stale sector is trusted
+                # either way; that is the nodatasum exposure.)
+                st.cache_ready = False
         else:
             # The write was refused.  An in-place write may have destroyed the
             # old content of the sectors it targeted; that is the documented
@@ -485,6 +500,9 @@ def main():
     ap.add_argument("--target-aliasing", action="store_true",
                     help="a failed replace-target copy counts as a failure of "
                          "the stripe it duplicates (upstream)")
+    ap.add_argument("--no-drop-cache-on-fault", action="store_true",
+                    help="let a write accepted within the tolerance still "
+                         "seed the stripe cache")
     ap.add_argument("--no-sticky-derate", action="store_true",
                     help="do not reduce the fault budget of a stripe that "
                          "already carries an error record")
@@ -512,10 +530,12 @@ def main():
 
     if args.policy == "upstream":
         policy = dict(replace_inflation=True, target_aliasing=True,
-                      missing_faults=False, sticky_derate=False)
+                      missing_faults=False, sticky_derate=False,
+                      drop_cache_on_fault=False)
     else:
         policy = dict(replace_inflation=False, target_aliasing=False,
-                      missing_faults=True, sticky_derate=True)
+                      missing_faults=True, sticky_derate=True,
+                      drop_cache_on_fault=True)
     if args.replace_inflation:
         policy["replace_inflation"] = True
     if args.target_aliasing:
@@ -524,6 +544,8 @@ def main():
         policy["missing_faults"] = False
     if args.no_sticky_derate:
         policy["sticky_derate"] = False
+    if args.no_drop_cache_on_fault:
+        policy["drop_cache_on_fault"] = False
 
     n, bad_state, bad = explore(args.data, args.parity, args.depth,
                                 policy, args.cache, args.replacing,
