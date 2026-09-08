@@ -49,10 +49,10 @@ is what copy-on-write perforates stripes with.
 
 | profile | devices | nr_data | aged at | free | stranded | per-block-group range | if placement were random |
 |---|---|---|---|---|---|---|---|
-| RAID6 | 4 | 2 | 80.9% full | 908 MiB | **66 MiB (7.3%)** | 0.8% – 20.1% | 53% – 97.0% |
-| RAID5 | 4 | 3 | 80.7% full | 1.3 GiB | **227 MiB (17.2%)** | 0.3% – 60.4% | 64% – 99.8% |
-| RAID5 | 4 | 3 | 92.5% full | 617 MiB | **294 MiB (47.6%)** | 30.5% – 67.6% | 99.1% – 99.9% |
-| RAID5 | 8 | 7 | 80.7% full | 1.4 GiB | **681 MiB (46.1%)** | 26.2% – 100.0% | 99.7% – 100.0% |
+| RAID6 | 4 | 2 | 80.9% full | 908 MiB | **66 MiB (7.3%)** | 0.8% – 20.1% | 31.7% – 82.6% |
+| RAID5 | 4 | 3 | 80.7% full | 1.3 GiB | **227 MiB (17.2%)** | 0.3% – 60.4% | 49.4% – 98.5% |
+| RAID5 | 4 | 3 | 92.5% full | 617 MiB | **294 MiB (47.6%)** | 30.5% – 67.6% | 95.7% – 99.3% |
+| RAID5 | 8 | 7 | 80.7% full | 1.4 GiB | **681 MiB (46.1%)** | 26.2% – 100.0% | 99.3% – 100.0% |
 
 Two variables move the answer, and they move it about equally far: how full the
 filesystem is kept, and how many data stripes the profile has. A four-disk
@@ -63,13 +63,13 @@ The RAID5 rows at 80.7% full, in full:
 
 ```
      block group profile nr_data       used       free  used%   stranded stranded% if random
-       298844160   RAID5       3  321.5 MiB  292.7 MiB  52.3%   65.7 MiB     22.5%     89.2%
-       942931968   RAID5       3  759.1 MiB  104.9 MiB  87.9%   63.3 MiB     60.4%     99.8%
-      1848901632   RAID5       3  742.5 MiB  121.5 MiB  85.9%   47.5 MiB     39.1%     99.7%
-      2754871296   RAID5       3  731.1 MiB  132.9 MiB  84.6%   27.8 MiB     20.9%     99.6%
-      3660840960   RAID5       3  707.0 MiB  157.0 MiB  81.8%   12.6 MiB      8.0%     99.4%
-      4566810624   RAID5       3  651.7 MiB  212.3 MiB  75.4%    9.0 MiB      4.2%     98.5%
-      5472780288   RAID5       3  119.8 MiB  295.0 MiB  28.9%    1.0 MiB      0.3%     64.0%
+       298844160   RAID5       3  321.5 MiB  292.7 MiB  52.3%   65.7 MiB     22.5%     77.3%
+       942931968   RAID5       3  759.1 MiB  104.9 MiB  87.9%   63.3 MiB     60.4%     98.5%
+      1848901632   RAID5       3  742.5 MiB  121.5 MiB  85.9%   47.5 MiB     39.1%     98.0%
+      2754871296   RAID5       3  731.1 MiB  132.9 MiB  84.6%   27.8 MiB     20.9%     97.6%
+      3660840960   RAID5       3  707.0 MiB  157.0 MiB  81.8%   12.6 MiB      8.0%     96.7%
+      4566810624   RAID5       3  651.7 MiB  212.3 MiB  75.4%    9.0 MiB      4.2%     94.0%
+      5472780288   RAID5       3  119.8 MiB  295.0 MiB  28.9%    1.0 MiB      0.3%     49.4%
 ```
 
 The eight-disk rows, where it goes wrong:
@@ -153,7 +153,7 @@ weakest where it is most wanted. And the mechanism is not subtle: a vertical
 stripe of seven sectors is more than twice as likely to contain a live sector as
 one of three, at any given occupancy. The random-placement column shows the
 ceiling being approached: on every `nr_data 7` block group it is already
-99.7-100%.
+99.3-100%.
 
 So an immutable-stripe allocator is not simply viable or not. It is viable on
 narrow arrays kept at moderate fullness, and it needs help everywhere else. The
@@ -171,7 +171,7 @@ traffic becomes its own cost, and nothing here measures that.
 The last column is what the same fullness would strand if live sectors were
 scattered at random: a vertical stripe of `nr_data` sectors holds live data with
 probability `1 - (1-u)^nr_data`, and every free sector in such a stripe is lost.
-That figure runs from 53% to 100% across these filesystems, and the
+That figure runs from 31.7% to 100% across these filesystems, and the
 measurements run from 0.3% to 100%.
 
 It is a reference point, not a ceiling. The true maximum stranding at occupancy
@@ -180,6 +180,13 @@ that each occupies a stripe of its own -- and that is 100% for most of the rows
 here, which makes it useless as a comparison. Random placement is the useful
 comparison precisely because it is what an allocator that made no effort would
 achieve.
+
+The random figure is `1 - (1-u)^(nr_data-1)`, not `^nr_data`: a *free* sector is
+stranded when any of the **other** `nr_data-1` members of its vertical stripe is
+live, and conditioning on this one being free leaves `nr_data-1` of them. At
+`nr_data = 1` there is no neighbour and nothing can be stranded, which is the
+check that catches the mistake -- an earlier version of this table claimed 93.5%
+for a one-data-stripe block group that measured, correctly, zero.
 
 Almost all of the free space an immutable-stripe allocator would keep is free
 only because `find_free_extent()` already packs live data into clusters instead

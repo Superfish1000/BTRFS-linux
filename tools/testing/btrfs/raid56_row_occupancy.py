@@ -245,12 +245,15 @@ def main():
         # this, so the rows of one filesystem are already a curve.
         usedpct = (100.0 * live / (live + free)) if (live + free) else 0.0
         # What the same fullness would strand if the live sectors were
-        # scattered at random: a vertical stripe of nr_data sectors then
-        # holds live data with probability 1 - (1-u)^nr_data, and every free
-        # sector in it is stranded.  The gap between this and the measured
-        # column is what the allocator's clustering is worth.
+        # scattered at random.  A *free* sector is stranded when any of the
+        # OTHER nr_data-1 members of its vertical stripe is live, so the
+        # exponent is nr_data-1, not nr_data: conditioning on this sector
+        # being free leaves nr_data-1 members to be occupied.  At nr_data=1
+        # there is no neighbour and nothing can ever be stranded.  The gap
+        # between this and the measured column is what the allocator's
+        # clustering is worth.
         u = usedpct / 100.0
-        randpct = 100.0 * (1.0 - (1.0 - u) ** c.nr_data)
+        randpct = 100.0 * (1.0 - (1.0 - u) ** (c.nr_data - 1))
         rows.append((c.start, c.profile, c.nr_data, live * ss, free * ss,
                      usedpct, stranded * ss, pct, randpct))
         print(f"{c.start:>16} {c.profile:>7} {c.nr_data:>7} "
