@@ -523,16 +523,26 @@ static int wib_collect_targets(struct btrfs_fs_info *fs_info,
 		nr = 0;
 		rcu_read_lock();
 		list_for_each_entry_rcu(device, &fs_devices->devices, dev_list) {
+			struct file *bdev_file;
+
 			if (nr == capacity)
 				break;
 			if (!test_bit(BTRFS_DEV_STATE_IN_FS_METADATA, &device->dev_state) ||
 			    !test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) ||
 			    test_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state))
 				continue;
-			if (!device->bdev_file)
+			/*
+			 * Read once: the NULL check and the reference must see
+			 * the same pointer.  btrfs_close_one_device() clears
+			 * this field, and nothing here holds device_list_mutex
+			 * against it, so re-reading it -- or letting the
+			 * compiler do so -- would allow get_file(NULL).
+			 */
+			bdev_file = READ_ONCE(device->bdev_file);
+			if (!bdev_file)
 				continue;
 			slots[nr] = READ_ONCE(device->wib_next_slot) % BTRFS_WIB_NR_SLOTS;
-			files[nr++] = get_file(device->bdev_file);
+			files[nr++] = get_file(bdev_file);
 		}
 		rcu_read_unlock();
 
