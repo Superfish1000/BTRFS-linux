@@ -2051,17 +2051,23 @@ static int should_cancel_scrub(const struct scrub_ctx *sctx)
 {
 	struct btrfs_fs_info *fs_info = sctx->fs_info;
 
-	if (atomic_read(&fs_info->scrub_cancel_req) ||
-	    atomic_read(&sctx->cancel_req))
-		return -ECANCELED;
-
 	/*
 	 * A recovery at mount holds s_umount and must not wait for a
 	 * transaction, so it does not take part in the scrub pause protocol
 	 * below.  It does have to stay killable: it can run for a long time
 	 * on a large log, and a mount that ignores a fatal signal is
-	 * unkillable from userspace.  Aborting is safe -- the on-disk log is
-	 * only rewritten after the whole pass, so the next mount redoes it.
+	 * unkillable from userspace.  Aborting that way is safe -- the on-disk
+	 * log is only rewritten after the whole pass, so the next mount redoes
+	 * it.
+	 *
+	 * It deliberately does not answer scrub_cancel_req.  The user did not
+	 * start this scrub, and cancelling it is not safe the way a signal is:
+	 * the recovery loop treats a per-stripe failure as "keep it recorded"
+	 * and carries on, so a cancel makes every remaining stripe fail, then
+	 * the pass still declares itself done and rewrites the log.  Records
+	 * that no longer fit are dropped with a warning by
+	 * btrfs_wib_add_sticky(), and the filesystem continues read-write with
+	 * stripes whose parity was never regenerated.
 	 */
 	if (sctx->internal) {
 		if (fatal_signal_pending(current))
@@ -2070,6 +2076,10 @@ static int should_cancel_scrub(const struct scrub_ctx *sctx)
 			return -EINTR;
 		return 0;
 	}
+
+	if (atomic_read(&fs_info->scrub_cancel_req) ||
+	    atomic_read(&sctx->cancel_req))
+		return -ECANCELED;
 
 	/*
 	 * The user (e.g. fsfreeze command) or power management (PM)
