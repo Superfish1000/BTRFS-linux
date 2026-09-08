@@ -374,6 +374,20 @@ class Stripe:
                 # btrfs_wib_add_sticky() as an error record and
                 # rbio_account_io_error() counts it on the device.
                 st.recorded = True
+            # The record is deliberately NOT cleared by a fault-free write.
+            # It is tempting: such an RMW reads every sector it does not
+            # write, repairs any that fail their checksum, and recomputes the
+            # parity, so the stripe looks whole again.  But it only repairs
+            # them *in the parity computation* -- rmw_assemble_write_bios()
+            # writes the data sectors this rbio supplies, not the ones it had
+            # to reconstruct, so a sector left stale by an earlier failed
+            # write stays stale on disk and is still carried only by the
+            # parity.  Redundancy is not restored, and clearing the record
+            # here makes the model report "unrecorded loss of redundancy" at
+            # every width from three data stripes up.
+            #
+            # Only something that rewrites the stale sector -- a scrub, or an
+            # RMW taught to write back what it reconstructed -- restores it.
             for d in write_set:
                 st.committed[d] = newval       # the transaction references it
             st.cache = [believed[d] for d in range(st.nr_data)]
