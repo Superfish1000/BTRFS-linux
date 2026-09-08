@@ -59,6 +59,14 @@ for d in /sys/fs/btrfs/*/allocation/data; do
 done
 dmesg | grep -ac "reclaiming chunk" | while read -r n; do log "dmesg reclaiming-chunk lines: $n"; done
 
+# The write-intent log's own counters.  Its on-disk footprint is fixed, but
+# its IO is not: a mark that adds a new region forces a 4KiB FUA write to
+# every device, so the cost is O(devices) x (marks that change the block),
+# and only a real workload says how often that is.
+for f in /sys/fs/btrfs/*/raid56_write_intent; do
+	[ -f $f ] && log "wib: $(tr '\n' ' ' < $f)"
+done
+
 # The aging workload is itself a large sample of sub-stripe writes: record
 # what fraction of the writes had to touch committed data.
 for f in /sys/fs/btrfs/*/raid56_write_profile; do
