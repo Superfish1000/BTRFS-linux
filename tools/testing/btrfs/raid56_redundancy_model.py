@@ -131,7 +131,15 @@ class Stripe:
                 tuple(self.missing),
                 tuple(self.cache) if self.cache is not None else None,
                 tuple(self.parity), self.cache_ready, self.reported,
-                self.recorded, self.spurious, self.trace)
+                self.recorded, self.spurious)
+        # Deliberately not self.trace.  It is the operation history, so
+        # including it makes every state unique, dedup never fires, and the
+        # search re-explores states it has already visited -- which both
+        # inflates "N states examined" into a meaningless number and costs
+        # the time that would have gone into greater depth.  Two states with
+        # identical content behave identically from here on however they were
+        # reached, so keeping the first one's trace is enough to report a
+        # violation.
 
     def tolerated(self):
         return self.nr_parity
