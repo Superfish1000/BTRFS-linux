@@ -20,6 +20,31 @@ pass() { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fails=$((fails+1)); }
 note() { printf '  ....  %s\n' "$1"; }
 
+# --self-check: prove the checking logic actually detects a regression, by
+# doctoring a real sweep and confirming each check flags it.  A suite that has
+# only ever passed is not evidence of anything.
+if [ "${1:-}" = "--self-check" ]; then
+	( cd $REPO/tools/testing/btrfs && ./sweep.sh ) > $LOG/sweep 2>&1
+	sed 's/^--parity 1 --depth 3  *OK.*/--parity 1 --depth 3   VIOLATION (injected)/' \
+		$LOG/sweep > $LOG/sweep.bad1
+	sed 's/^--depth 3 --no-missing-faults.*/--depth 3 --no-missing-faults   OK: injected/' \
+		$LOG/sweep > $LOG/sweep.bad2
+	clean_violations() { grep -E "^--parity" "$1" | grep -v -- "--in-place" |
+		grep -v -- "--nodatasum" | grep -c "VIOLATION"; }
+	reverts_broken() { sed -n '/reverted must break/,$p' "$1" | grep -E "^--depth" |
+		grep -c "VIOLATION"; }
+	reverts_total() { sed -n '/reverted must break/,$p' "$1" | grep -cE "^--depth"; }
+	[ "$(clean_violations $LOG/sweep)" = 0 ] && pass "real sweep: no should-be-clean violations" \
+		|| fail "real sweep already violates -- cannot self-check"
+	[ "$(clean_violations $LOG/sweep.bad1)" -gt 0 ] && pass "detects a should-be-clean config that starts violating" \
+		|| fail "would NOT detect a should-be-clean config violating"
+	[ "$(reverts_broken $LOG/sweep.bad2)" != "$(reverts_total $LOG/sweep.bad2)" ] \
+		&& pass "detects a reverted fix that stops breaking anything" \
+		|| fail "would NOT detect a reverted fix that stops breaking anything"
+	[ $fails -eq 0 ] && { printf '\033[32mSELF-CHECK PASSED\033[0m\n'; exit 0; }
+	printf '\033[31mSELF-CHECK FAILED\033[0m\n'; exit 1
+fi
+
 echo "== build =="
 if make -C $REPO ARCH=um O=$BUILD -j$(nproc) linux > $LOG/build 2>&1; then
 	if grep -qE "^[^ ]*(error|warning):" $LOG/build; then
