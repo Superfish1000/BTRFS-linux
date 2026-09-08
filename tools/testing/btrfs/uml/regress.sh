@@ -99,13 +99,35 @@ grep -aqE "BUG:|KASAN|Oops|WARNING:" $LOG/selftest \
 
 check_scenario() { # <tag> <resultfile> <label>
 	local tag=$1 f=$2 label=$3
-	grep -aqE "BUG:|KASAN|Oops|possible circular|hung task" $f \
-		&& { fail "$label: kernel splat"; return; }
-	# A scenario whose crash injection never armed proves nothing: without
-	# CONFIG_BTRFS_DEBUG the knob is absent, no crash happens, and the run
-	# still ends in a clean mount and a successful read.
-	grep -aq "CRASH_ARM_FAIL" $f \
-		&& { fail "$label: crash injection failed to arm"; return; }
+	local d=$T/umltest/$tag
+
+	# Splats land in the per-boot logs, not in the results file: run3.sh
+	# writes only "boot ... rc=N" there.  Searching $f for "BUG:" can never
+	# match, which is why this used to pass unconditionally.  init-final3.sh
+	# does log KERNEL_SPLAT into the results, so check both.
+	if grep -aqrE "BUG:|KASAN|Oops|possible circular|hung task|INFO: task" $d 2>/dev/null \
+	   || grep -aq "KERNEL_SPLAT" $f; then
+		fail "$label: kernel splat"
+		grep -ahrE "BUG:|KASAN|Oops|hung task" $d 2>/dev/null | head -2
+		return
+	fi
+	# The verdict the scenarios actually emit.  verify_manifest() logs one
+	# "BAD <file> expected <md5> got <md5>" per file that read back wrong and
+	# a "VERIFY total=N bad=M" summary; nothing here looked at either, so a
+	# run could report success while files came back corrupted.
+	if grep -aq "^\[.*\] BAD \|STALE_SECTOR_SILENT_CORRUPTION" $f; then
+		fail "$label: committed data read back wrong"
+		grep -a "BAD \|SILENT_CORRUPTION" $f | head -3
+		return
+	fi
+	local badcount
+	badcount=$(grep -ao "VERIFY total=[0-9]* bad=[0-9]*" $f | grep -o "bad=[0-9]*" |
+		   cut -d= -f2 | awk '{s+=$1} END {print s+0}')
+	[ "${badcount:-0}" != 0 ] && { fail "$label: $badcount file(s) verified wrong"; return; }
+	for m in MKFS_FAIL UMOUNT_FAIL CHECK_FAIL CRASH_ARM_FAIL DM_CREATE_FAIL \
+		 DM_RELOAD_FAIL NOCOW_READ_FAIL REMOUNT_RW_FAIL; do
+		grep -aq "$m" $f && { fail "$label: $m"; return; }
+	done
 	grep -aq "FULL_READ_OK" $f || { fail "$label: committed data did not read back after recovery"; return; }
 	local nrec ndeg nfail
 	nrec=$(grep -ac "boot recover .*rc=0" $f)
