@@ -210,6 +210,53 @@ class Stripe:
             return first_answer
         return UNREADABLE
 
+    def repair(self):
+        """What a scrub of this full stripe does (btrfs_scrub_raid56_full_stripe).
+
+        Verify every committed data sector, rebuild the ones that do not match
+        from the parity and WRITE THEM BACK -- which is the part an RMW does
+        not do -- then recompute every parity from the data now on disk.
+
+        Returns True if the stripe came out consistent and its record can go.
+
+        This models the OPTIMISTIC case for repair-on-fault: the repair runs
+        to completion before anything else touches the stripe, and its own
+        writes all land.  It answers "if repair always wins the race, is the
+        exposure gone?"  If it does not close the loss even here, nothing
+        weaker will.
+        """
+        missing = any(self.missing)
+        ok = True
+        for i in range(self.nr_data):
+            # A sector on a device that is not there cannot be repaired:
+            # there is nowhere to write it back to.  The scrub reports this
+            # as "1, a device of the chunk is missing, its sectors were not
+            # repaired" and the stripe stays recorded for a later mount.
+            if self.missing[i]:
+                ok = False
+                continue
+            if self.committed[i] is None or self.disk[i] == self.committed[i]:
+                continue
+            v = self.read(i)
+            # Without checksums read() hands back the stale sector itself, so
+            # the scrub "verifies" it and would recompute the parity FROM the
+            # stale content -- destroying the good copy that was in the
+            # parity.  That is the nodatasum exposure, and repair makes it
+            # worse rather than better; the model must not hide it.
+            if v is UNREADABLE:
+                ok = False
+                continue
+            self.disk[i] = v
+        # Parity is only rewritten when every sector it would be computed
+        # from could be verified.  With a device missing the scrub repairs
+        # what data stripes it can and writes no parity, because it would
+        # otherwise recompute it from sectors it cannot check.
+        if not missing and ok:
+            self.parity = [tuple(self.disk)] * self.nr_parity
+            self.recorded = False
+            return True
+        return False
+
     def check(self, acked, strict, check_availability):
         """Classify what the last operation left behind.
 
@@ -448,6 +495,13 @@ class Stripe:
             st.cache = [believed[d] for d in range(st.nr_data)]
             # full stripe writes are not cached
             st.cache_ready = not full
+            if policy["repair_on_fault"] and faults:
+                # PROPOSAL, not what the kernel does: a write that completed
+                # with a fault schedules a targeted repair of its full stripe,
+                # instead of leaving it recorded for whenever a scrub next
+                # runs.  Modelled as happening immediately, which is the best
+                # case for it -- see Stripe.repair().
+                st.repair()
             if policy["drop_cache_on_fault"] and faults:
                 # rmw_rbio() clears RBIO_CACHE_READY_BIT only when the write
                 # failed outright, so a write accepted *within* the tolerance
@@ -470,6 +524,8 @@ class Stripe:
             # A failed write is handed to the write-intent log as an error
             # record too, so the stripe is scrubbed at the next mount.
             st.recorded = True
+            if policy["repair_on_fault"]:
+                st.repair()
             for d in write_set:
                 if st.disk[d] != st.committed[d]:
                     st.committed[d] = None
@@ -558,6 +614,14 @@ def main():
     ap.add_argument("--no-drop-cache-on-fault", action="store_true",
                     help="let a write accepted within the tolerance still "
                          "seed the stripe cache")
+    ap.add_argument("--repair-on-fault", action="store_true",
+                    help="a write that completes with a fault repairs its "
+                         "full stripe immediately (rebuild the stale sectors "
+                         "from the parity, write them back, recompute the "
+                         "parity) instead of leaving it recorded until a "
+                         "scrub runs.  A PROPOSAL, not what the kernel does. "
+                         "Modelled as winning every race, which is the best "
+                         "case for it.")
     ap.add_argument("--flat-sticky-derate", action="store_true",
                     help="de-rate a stripe that already carries an error "
                          "record by one.  A PROPOSAL, not what the kernel "
@@ -599,10 +663,12 @@ def main():
     if args.policy == "upstream":
         policy = dict(replace_inflation=True, target_aliasing=True,
                       missing_faults=False, sticky_derate=False,
+                      repair_on_fault=False,
                       drop_cache_on_fault=False)
     else:
         policy = dict(replace_inflation=False, target_aliasing=False,
                       missing_faults=True, sticky_derate=False,
+                      repair_on_fault=False,
                       drop_cache_on_fault=True)
     if args.replace_inflation:
         policy["replace_inflation"] = True
@@ -610,6 +676,8 @@ def main():
         policy["target_aliasing"] = True
     if args.no_missing_faults:
         policy["missing_faults"] = False
+    if args.repair_on_fault:
+        policy["repair_on_fault"] = True
     if args.flat_sticky_derate:
         policy["sticky_derate"] = True
     if args.counted_sticky_derate:

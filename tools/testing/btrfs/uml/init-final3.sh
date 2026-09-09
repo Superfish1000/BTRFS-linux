@@ -146,6 +146,24 @@ dm_heal() {
 	dm_reload d$1 "0 $(blockdev --getsz $d) linear $d 0"
 }
 
+# The 4K blocks of $MNT/nocow that the in-place overwrite targets, at a 64K
+# stride so they land in different vertical stripes and on different devices.
+NOCOW_BLOCKS=32
+NOCOW_STRIDE=16          # in 4K blocks, so 64 KiB apart
+nocow_bad() {
+	# How many of the overwritten blocks do NOT read back as the value the
+	# overwrite was acknowledged to have written.  Zero means the data is
+	# intact by whatever path this mount had to use to get it.
+	local bad=0 i off got
+	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
+		off=$((i * NOCOW_STRIDE))
+		got=$(dd if=$MNT/nocow bs=4096 skip=$off count=1 status=none 2>/dev/null |
+		      tr -d 'B' | wc -c)
+		[ "$got" = 0 ] || bad=$((bad+1))
+	done
+	echo $bad
+}
+
 case "$MODE" in
 prepare)
 	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
@@ -425,6 +443,84 @@ detach)
 	dm_heal $FAIL; log "healed device $FAIL"
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all
+	finish
+	;;
+nocow_stale)
+	# Does the mount-time recovery DESTROY nodatacow data that was still
+	# recoverable before it ran?
+	#
+	# A nodatacow sector has no checksum.  scrub_verify_one_sector() has no
+	# choice but to trust it ("For cases without csum, we have no other
+	# choice but to trust it"), so it clears the sector's error bit, and
+	# scrub_raid56_parity_stripe() then recomputes the parity from it.
+	# When that sector is the one a failed write left STALE, the parity was
+	# the only place the acknowledged content still existed -- and the
+	# recovery overwrites it with a parity computed from the stale content.
+	#
+	# This boot builds that state with a real device write error, not a
+	# crash: the write must be ACKNOWLEDGED (one fault is inside RAID5
+	# tolerance) and the stripe recorded, which is exactly what makes the
+	# next mount scrub it.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	log "nocow layout: $(filefrag -v $MNT/nocow 2>/dev/null | sed -n 4p | tr -s ' ')"
+	stats "before"
+	# Every write to this device now fails; reads still work.  A sub-stripe
+	# write whose data sector lands here takes one fault, which RAID5
+	# tolerates, so the write is acknowledged and the stripe is recorded.
+	dm_error_writes $FAIL; log "write errors on device $FAIL"
+	acked=0; failed=0
+	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
+		if dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		   dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_STRIDE)) count=1 \
+		      conv=notrunc,fsync status=none 2>/dev/null; then
+			acked=$((acked+1))
+		else
+			failed=$((failed+1))
+		fi
+	done
+	sync
+	log "in-place overwrites: $acked acknowledged, $failed refused"
+	stats "after write errors"
+	kmsg "write-intent|raid56" 6
+	# Heal it so the next boots see a complete, healthy array: the point is
+	# what recovery does, not what a broken device does.
+	dm_heal $FAIL; log "healed device $FAIL"
+	sync
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all
+	finish
+	;;
+nocow_probe)
+	# Read the overwritten blocks WITHOUT letting recovery run: read-only,
+	# so btrfs_wib_rw_mount() is skipped.  The host omits the device whose
+	# sectors the failed writes left stale, which forces every one of them
+	# to be reconstructed from the parity -- so this measures what the
+	# parity still holds.
+	do_mount ro,degraded $MNTDEV
+	bad=$(nocow_bad)
+	log "NOCOW_PROBE_${PROBE:-x} bad=$bad of $NOCOW_BLOCKS"
+	echo $bad > $T/umltest/nocow.bad.${PROBE:-x}.$TAG
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+nocow_recover)
+	# A normal read-write mount: this is what runs btrfs_wib_recover() and
+	# scrubs every stripe the log recorded.
+	do_mount $OPTS $MNTDEV
+	stats "after recovery"
+	kmsg "write-intent" 8
+	# Read with every device present too, which is the ordinary nodatasum
+	# exposure (the stale sector is returned as-is) rather than the
+	# question this scenario asks.
+	log "NOCOW_DIRECT bad=$(nocow_bad) of $NOCOW_BLOCKS"
+	umount $MNT || log "UMOUNT_FAIL"
 	finish
 	;;
 flakey)
