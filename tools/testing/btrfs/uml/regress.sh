@@ -287,11 +287,11 @@ check_scenario() { # <tag> <resultfile> <label>
 	#               of the same kernel -- so failing on the count would make
 	#               the suite report a regression at random.
 	local nwrong nreadfail
-	nwrong=$(grep -aE "^\[.*\] ([A-Z_]*_)?BAD " $f | awk '$NF ~ /^[0-9a-f]{32}$/' | wc -l)
-	nreadfail=$(grep -aE "^\[.*\] ([A-Z_]*_)?BAD " $f | awk '$NF !~ /^[0-9a-f]{32}$/' | wc -l)
+	nwrong=$(grep -aE "^\[.*\] ([A-Z_]*_)?BAD " $f | awk '/ got [0-9a-f]{32} / || / got [0-9a-f]{32}$/' | wc -l)
+	nreadfail=$(grep -aE "^\[.*\] ([A-Z_]*_)?BAD " $f | awk '!(/ got [0-9a-f]{32} / || / got [0-9a-f]{32}$/)' | wc -l)
 	if [ "${nwrong:-0}" != 0 ]; then
 		fail "$label: $nwrong file(s) read back complete with different content"
-		grep -aE "([A-Z_]*_)?BAD " $f | awk '$NF ~ /^[0-9a-f]{32}$/' | head -3
+		grep -aE "([A-Z_]*_)?BAD " $f | awk '/ got [0-9a-f]{32} / || / got [0-9a-f]{32}$/' | head -3
 		return
 	fi
 	[ "${nreadfail:-0}" != 0 ] && \

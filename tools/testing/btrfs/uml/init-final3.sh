@@ -65,11 +65,20 @@ do_mount() {
 verify_manifest() {
 	# Every file whose fsync returned before the crash, name + md5.
 	[ -f $T/umltest/manifest.$TAG ] || return 0
-	local total=0 bad=0 f m got
-	while read -r f m; do
+	local total=0 bad=0 f m sz got gotsz
+	while read -r f m sz; do
 		total=$((total+1))
 		got=$(md5sum $f 2>/dev/null | awk '{print $1}')
-		if [ "$got" != "$m" ]; then bad=$((bad+1)); log "$1_BAD $f expected $m got $got"; fi
+		if [ "$got" != "$m" ]; then
+			bad=$((bad+1))
+			# Size as well as hash.  A file that reads back COMPLETE
+			# with different content and a file that reads back
+			# SHORT are different findings, and a hash alone cannot
+			# tell them apart -- md5sum is perfectly happy to hash a
+			# truncated file and print a valid, different digest.
+			gotsz=$(stat -c %s "$f" 2>/dev/null || echo "?")
+			log "$1_BAD $f expected $m got ${got:-READFAIL} size ${gotsz} expected_size ${sz:-?}"
+		fi
 	done < $T/umltest/manifest.$TAG
 	log "$1_MANIFEST total=$total bad=$bad"
 	[ "$bad" = 0 ] || kmsg "csum|error|corrupt" 5
@@ -104,7 +113,8 @@ writers_start() {
 				sync -f $f
 			else
 				dd if=/dev/urandom of=$f bs=4096 count=$sz conv=fsync status=none \
-					&& echo "$f $(md5sum $f | awk '{print $1}')" >> $T/umltest/manifest.$TAG
+					&& echo "$f $(md5sum $f | awk '{print $1}') $((sz * 4096))" \
+						>> $T/umltest/manifest.$TAG
 			fi
 			i=$((i+1))
 		done
