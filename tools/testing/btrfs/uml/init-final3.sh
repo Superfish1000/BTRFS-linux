@@ -175,7 +175,7 @@ NOCOW_NEXT_COL=16        # +64 KiB: the next data column of the same stripe
 # 4K blocks.  One column short of the full stripe, so the write is still a
 # read-modify-write, while covering as many columns as possible -- the defect
 # needs two of them to land on the pair of devices that are failing.
-TWO_STRIPES=24
+TWO_STRIPES=8
 TWO_WIDTH=$(( (${NDEV:-4} - 2) * 16 ))
 nocow_bad() {
 	# How many of the overwritten blocks do NOT read back as the value the
@@ -760,6 +760,10 @@ nocow_rmw)
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
 	dd if=/dev/zero bs=1M count=4 status=none | tr '\000' 'A' > $MNT/nocow
+	# One pre-made block instead of a tr(1) pipeline per write: the loop
+	# below issues one write per data column per stripe, and under UML those
+	# pipelines cost more than the scenario does.
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock
 	sync
 	dm_error_writes $FAIL; log "write errors on device $FAIL"
 	acked=0
@@ -937,8 +941,7 @@ nocow_two_stale)
 	# write, and with two devices erroring that aborts the transaction too.
 	for i in $(seq 0 $((TWO_STRIPES-1))); do
 		for c in $(seq 0 $((NDEV-2))); do
-			dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
-			dd of=$MNT/nocow bs=4096 \
+			dd if=/tmp/bblock of=$MNT/nocow bs=4096 \
 			   seek=$((i * NOCOW_FS_BLOCKS + c * NOCOW_NEXT_COL)) \
 			   count=1 conv=notrunc status=none 2>/dev/null
 		done

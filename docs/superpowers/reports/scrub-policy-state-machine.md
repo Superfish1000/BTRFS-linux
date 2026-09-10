@@ -45,6 +45,11 @@ path modelled on the write side:
 | **stale-budgeted** | 0 / 0 | 0 / 0 | 0 / 0 | 259 / 2718 |
 | stale-rebuild | 0 / 0 | 0 / 0 | 0 / 0 | reference |
 
+With device losses included as well (`--lose`), the state count rises to
+14569 and 67765 and the conclusions do not move: `stale-skip` and
+`stale-budgeted` stay at 0 MISREPAIR and 0 DESTROY, `upstream` stays at 1488
+and 6291 destroyed, and `localise` stays at 147 misrepairs.
+
 ## T1 — RAID6 P/Q localisation: dead, and now measured
 
 The signature is symmetric. "Data column j is stale, both parities fresh" and
