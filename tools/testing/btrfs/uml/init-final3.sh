@@ -1042,6 +1042,20 @@ nocow_persist_scrub)
 	do_mount $OPTS /dev/mapper/d0
 	stats "after recovery"
 	kmsg "write-intent" 6
+	# What a recovery helper would see, before anything repairs it: the
+	# preserved half of the contract, read through the ioctl rather than
+	# inferred from a counter.
+	if [ -x $T/umltest/wibdump ]; then
+		# No block group start passed, so wibdump withholds the
+		# per-stripe verdict rather than grouping columns that are not
+		# in the same stripe.  What is asserted here is the raw record:
+		# how much the kernel can NAME versus how much it cannot.
+		$T/umltest/wibdump $MNT $((NDEV-1)) 1 2>&1 |
+			grep -E 'WIBDUMP|REPAIRABLE|AMBIGUOUS' |
+			while read -r l; do log "wibdump-before: $l"; done
+	else
+		log "WIBDUMP_MISSING"
+	fi
 	btrfs scrub start -B $MNT 2>&1 | while read -r l; do log "scrub: $l"; done
 	stats "after scrub"
 	kmsg "scrub|write-intent" 6
@@ -1051,6 +1065,10 @@ nocow_persist_scrub)
 	sticky_after=$(sed -n 's/.*sticky_blocks \([0-9]*\).*/\1/p' \
 		/sys/fs/btrfs/*/raid56_write_intent 2>/dev/null | head -1)
 	log "NOCOW_STICKY_AFTER_SCRUB $sticky_after"
+	if [ -x $T/umltest/wibdump ]; then
+		$T/umltest/wibdump $MNT $((NDEV-1)) 1 2>&1 | grep -E 'WIBDUMP' |
+			while read -r l; do log "wibdump-after: $l"; done
+	fi
 	echo "${sticky_after:-?}" > $T/umltest/nocow.sticky.$TAG
 	log "NOCOW_DIRECT bad=$(nocow_bad) of $NOCOW_BLOCKS"
 	umount $MNT || log "UMOUNT_FAIL"

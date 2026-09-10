@@ -138,8 +138,8 @@ MODULE_PARM_DESC(raid56_stale_no_persist,
 static_assert(sizeof(struct btrfs_wib_disk_header) == 128);
 static_assert(sizeof(struct btrfs_wib_disk_entry_v1) == 24);
 static_assert(BTRFS_WIB_MAX_ENTRIES_V1 == 165);
-static_assert(sizeof(struct btrfs_wib_disk_entry) == 40);
-static_assert(BTRFS_WIB_MAX_ENTRIES == 99);
+static_assert(sizeof(struct btrfs_wib_disk_entry) == 48);
+static_assert(BTRFS_WIB_MAX_ENTRIES == 82);
 /*
  * @stale is a strict subset of @error, and btrfs_wib_block_valid() enforces
  * that on read.  The two parity bits of a full stripe live in @stale_par at
@@ -218,6 +218,7 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 			e->stale = 0;
 		}
 		e->stale_par = 0;
+		e->gen = 0;
 		return e;
 	}
 	return NULL;
@@ -255,6 +256,7 @@ static struct btrfs_wib_entry *wib_find_or_alloc_entry(struct btrfs_wib *wib,
 			free->stale = 0;
 		}
 		free->stale_par = 0;
+		free->gen = 0;
 	}
 	return free;
 }
@@ -383,6 +385,7 @@ static void wib_write_entry(void *block, u32 i, const struct btrfs_wib_entry *e)
 		de[i].error = cpu_to_le64(e->sticky);
 		de[i].stale = cpu_to_le64(wib_no_persist() ? 0 : e->stale);
 		de[i].stale_par = cpu_to_le64(wib_no_persist() ? 0 : e->stale_par);
+		de[i].gen = cpu_to_le64(e->gen);
 	}
 }
 
@@ -507,6 +510,7 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 			cur.sticky |= be.sticky;
 			cur.stale |= be.stale;
 			cur.stale_par |= be.stale_par;
+			cur.gen = max(cur.gen, be.gen);
 			wib_write_entry(block, j, &cur);
 		}
 	}
@@ -540,6 +544,7 @@ void btrfs_wib_read_entry(const void *block, u32 i, struct btrfs_wib_entry *out)
 		 */
 		out->stale = 0;
 		out->stale_par = 0;
+		out->gen = 0;
 	} else {
 		const struct btrfs_wib_disk_entry *de = block + sizeof(*hdr);
 
@@ -548,6 +553,7 @@ void btrfs_wib_read_entry(const void *block, u32 i, struct btrfs_wib_entry *out)
 		out->sticky = le64_to_cpu(de[i].error);
 		out->stale = le64_to_cpu(de[i].stale);
 		out->stale_par = le64_to_cpu(de[i].stale_par);
+		out->gen = le64_to_cpu(de[i].gen);
 	}
 }
 
@@ -995,6 +1001,7 @@ static void wib_readd_dropped(struct btrfs_wib *wib)
 			continue;
 		}
 		e->sticky |= bits;
+		e->gen = max(e->gen, wib->fs_info->generation);
 		nr_readded += hweight64(bits);
 		/*
 		 * Carry the stale record back with it.  Re-adding these blocks
@@ -1308,6 +1315,7 @@ void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool fa
 		e->bitmap &= ~mask;
 		if (failed) {
 			e->sticky |= mask;
+			e->gen = max(e->gen, fs_info->generation);
 			atomic64_inc(&wib->stat_sticky);
 		}
 		/*
@@ -2056,6 +2064,8 @@ void btrfs_wib_finalize_pending(struct btrfs_wib *wib)
 			 */
 			wib->pending[out - 1].stale |= wib->pending[i].stale;
 			wib->pending[out - 1].stale_par |= wib->pending[i].stale_par;
+			wib->pending[out - 1].gen = max(wib->pending[out - 1].gen,
+							wib->pending[i].gen);
 			continue;
 		}
 		wib->pending[out++] = wib->pending[i];

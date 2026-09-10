@@ -1188,6 +1188,16 @@ struct btrfs_ioctl_raid56_stale_entry {
 	__u64 sticky;
 	__u64 stale;
 	__u64 stale_par;
+	/*
+	 * Newest filesystem generation at which any block of this region
+	 * gained a fault record.  Everything else here can be recovered by
+	 * reading the disks later; this cannot.  A logical address is reused
+	 * once its extent is freed and reallocated, so without it a helper
+	 * cannot tell whether the extent it now finds there is the one that
+	 * was damaged.  An extent newer than this was written after the record
+	 * and the record does not describe it.
+	 */
+	__u64 gen;
 };
 
 struct btrfs_ioctl_raid56_stale_args {

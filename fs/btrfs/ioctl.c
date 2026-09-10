@@ -5639,6 +5639,7 @@ static int btrfs_ioctl_raid56_stale_stripes(struct btrfs_fs_info *fs_info,
 			.sticky = snap[i].sticky,
 			.stale = snap[i].stale,
 			.stale_par = snap[i].stale_par,
+			.gen = snap[i].gen,
 		};
 
 		if (copy_to_user(&uentry[i], &e, sizeof(e))) {

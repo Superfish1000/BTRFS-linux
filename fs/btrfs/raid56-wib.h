@@ -113,6 +113,25 @@ struct btrfs_wib_disk_entry {
 	 * to protect data ends up destroying it.
 	 */
 	__le64 stale_par;
+	/*
+	 * The newest filesystem generation at which any block of this region
+	 * gained a fault record.
+	 *
+	 * Everything else a recovery helper needs can be recovered by reading
+	 * the disks later: the geometry and the column-to-device mapping from
+	 * the chunk tree, the file behind an address from
+	 * BTRFS_IOC_LOGICAL_INO, and both candidate values for a named column
+	 * from the devices themselves.  This cannot.  A logical address is
+	 * reused once its extent is freed and reallocated, so without knowing
+	 * WHEN the damage was recorded a helper cannot tell whether the extent
+	 * it finds there now is the one that was damaged -- and pointing a
+	 * human at the wrong file is worse than pointing them at none.
+	 *
+	 * An upper bound over the region rather than a per-block value, so the
+	 * test it exists for stays conservative: an extent newer than this was
+	 * written after the record and the record does not describe it.
+	 */
+	__le64 gen;
 } __packed;
 
 struct btrfs_wib_disk_header {
@@ -204,6 +223,8 @@ struct btrfs_wib_entry {
 	 * Persisted alongside @stale, for the same reason.
 	 */
 	u64 stale_par;
+	/* See @gen in the on-disk entry. */
+	u64 gen;
 };
 
 struct btrfs_wib {

@@ -34,6 +34,10 @@ PROFILE=raid5:raid1
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
 cp $HERE/init-final3.sh $T/umltest/init-final3.sh
+# The reference reader for BTRFS_IOC_RAID56_STALE_STRIPES.  Built on the host
+# and run from hostfs inside the guest; a missing compiler just means the
+# scenario logs WIBDUMP_MISSING and the record check below is skipped.
+cc -O2 -o $T/umltest/wibdump $HERE/../wibdump.c 2>/dev/null || true
 ulimit -c 0
 
 # The device whose writes fail is also the one omitted for the probe.
@@ -98,6 +102,19 @@ fi
 # Surviving is not the same as repaired.  The record must be RETIRED: nothing
 # else ever clears one, so a stripe still recorded after a scrub is a stripe
 # whose redundancy is never restored.
+# What the ioctl showed a helper before the scrub touched anything.  A record
+# the kernel holds but cannot hand over is not preserved in any useful sense.
+dump=$(grep -h 'wibdump-before: WIBDUMP' $T/umltest/nocow-persist-0/log.nocow_persist_scrub 2>/dev/null | tail -1)
+echo "ioctl before the scrub: ${dump:-<none>}"
+if [ -n "$dump" ]; then
+	known=$(printf %s "$dump" | sed -n 's/.*known=\([0-9]*\).*/\1/p')
+	if [ "${known:-0}" -eq 0 ] 2>/dev/null; then
+		echo "RESULT: FAIL -- the ioctl named no stale block, so the"
+		echo "        preserved half of the contract is not observable"
+		exit 1
+	fi
+fi
+
 fixed_sticky=$(sticky_after 0)
 echo "records still held after the scrub: $fixed_sticky"
 if [ "$fixed_sticky" = "?" ]; then
@@ -109,4 +126,5 @@ if [ "$fixed_sticky" -ne 0 ] 2>/dev/null; then
 	echo "        retired, so the parity of those stripes was never regenerated"
 	exit 1
 fi
-echo "RESULT: PASS -- control destroyed $ctl, persisted destroyed 0, all records retired"
+echo "RESULT: PASS -- control destroyed $ctl, persisted destroyed 0, records"
+echo "        visible through the ioctl beforehand, all retired afterwards"
