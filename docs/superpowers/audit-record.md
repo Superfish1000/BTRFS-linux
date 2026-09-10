@@ -164,3 +164,50 @@ otherwise.
 
 The measurement is worth more than the guard.  "A pauser overlapped the
 recovery 0 times out of 226" is an answer; "it did not hang this time" is not.
+
+## Recovery destroying nodatacow data: what it took to be sure
+
+One defect, four reproductions, and every one of them needed a negative
+control before it meant anything.
+
+  uml/nocow_stale.sh log      the log's mount-time recovery
+  uml/nocow_stale.sh nolog    plain "btrfs scrub", log off -- upstream
+  uml/nocow_stale.sh rmw      an ordinary fault-free write, no scrub at all
+  uml/nocow_stale.sh replay   btrfs_wib_recover_after_replay()
+
+The controlled results, same scenario each time, kernel the only variable:
+
+  log     0 -> 8 of 32 destroyed, fixed: 0
+  nolog   0 -> 8 of 32 destroyed, upstream, unfixed
+  rmw     10 of 32 destroyed, fixed: 0
+  replay  8 of 32 destroyed, fixed: 0
+
+Five scenario bugs surfaced while building those, each of which would have
+produced a green run that proved nothing:
+
+  - the rmw case reported bad=0 for a working fix, a broken fix and a kernel
+    with the check compiled out.  Pass 1's writes are acknowledged, so
+    RBIO_CACHE_READY_BIT stays set and the stripe cache still holds the
+    correct content; pass 2 read the cache rather than the disk.  Touching
+    1201 distinct full stripes -- past RBIO_CACHE_SIZE -- made it discriminate.
+  - the first fix compiled, read correctly and executed zero times: it sat
+    after "if (!rbio->csum_bitmap ...) return", and fill_data_csums() frees
+    that bitmap exactly when nothing in the stripe has a checksum.
+  - the replay prep ended with sysrq-b, which reboots; UML re-ran the same
+    init and the preparation repeated until the host timeout killed it.
+  - PROBE_SUFFIX was unset under set -u, so both probe boots died before
+    mounting.
+  - ro,nologreplay,degraded is refused at option-parsing time, so the probe
+    meant to read the array before any recovery never ran.
+
+And one code path was found unfixed after the fix had been called complete:
+btrfs_wib_recover_after_replay() still passed trusted=true, and it is the
+entry point that handles error records exclusively.  nocow_stale.sh could not
+see it, because it unmounts cleanly and so leaves no tree log for the
+after-replay path to run on.  An adversarial review of the design found it;
+no test did.
+
+The rule that came out of this: a test that has only ever passed is not
+evidence.  Every scenario here now has a recorded control showing the number
+it produces when the fix is absent, and refuses to report a verdict unless it
+can show the code under test actually ran.
