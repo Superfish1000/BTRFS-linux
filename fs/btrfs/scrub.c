@@ -2252,7 +2252,17 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 	if (ret < 0)
 		return ret;
 
-	if (atomic_read(&fs_info->scrub_pause_req))
+	/*
+	 * Not for the write-intent log's recovery.  It is deliberately absent
+	 * from fs_info->scrubs_running (see
+	 * btrfs_scrub_raid56_recovery_begin()), and scrub_blocked_if_needed()
+	 * increments fs_info->scrubs_paused -- so joining the pause protocol
+	 * here makes paused exceed running, and btrfs_scrub_pause() waits for
+	 * the two to be EQUAL.  A transaction commit would then be held off
+	 * until recovery came back out, which is the exact thing keeping
+	 * recovery out of scrubs_running was meant to prevent.
+	 */
+	if (!sctx->internal && atomic_read(&fs_info->scrub_pause_req))
 		scrub_blocked_if_needed(fs_info);
 
 	spin_lock(&bg->lock);
