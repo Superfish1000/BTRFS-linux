@@ -341,14 +341,18 @@ Every mismatching file measured is at exactly its expected size --
 45056/45056, 57344/57344, 28672/28672, 53248/53248, 61440/61440, 32768/32768
 -- so it is not truncation, which was the obvious explanation and is dead.
 
-**Not this series.** It reproduces with `noraid56_write_intent`: 0, 3 and 5
-wrong-data files across three runs with the log off. An earlier reading of
-this called the log implicated on the strength of one run per arm, which was
-wrong -- the counts are nondeterministic in both arms and the distributions
-overlap. It also predates every commit in tonight's work.
+**Not this series.** It reproduces with `noraid56_write_intent`, and more
+often, not less:
 
-What the two arms genuinely differ on is total damage, and there the log helps
-substantially: 8 damaged files with it on against 19 with it off.
+| | wrong data | read failed |
+|---|---|---|
+| log on | 1, 1, 2, 3, 3 | 0, 5, 7, 9, 11 |
+| log off | 0, 3, 5, 7 | 4, 6, 11, 19 |
+
+An earlier reading called the log implicated, on the strength of one run per
+arm that happened to give 3 against 0. Repeating the log-off arm gave 3, 5 and
+7, so that was noise -- and the fuller picture points the other way. It also
+predates every commit in this night's work.
 
 **Reproduce.** `BTRFS_TEST_DIR=... tools/testing/btrfs/uml/dmfail34.sh
 <kernel> <tag> flakey raid5:raid1 rw 4 2`
