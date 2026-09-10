@@ -1795,8 +1795,21 @@ static void verify_bio_data_sectors(struct btrfs_raid_bio *rbio,
 		if (!IS_ALIGNED(offset, fs_info->sectorsize))
 			continue;
 
-		/* No csum for this sector, skip to the next sector. */
+		/*
+		 * No csum for this sector.  That is not the same as the sector
+		 * being good: nodatacow and prealloc data has none at all, and
+		 * a sector a failed write left stale then passes through here
+		 * believed.  The write-intent log records exactly those, which
+		 * is the only signal available for data without checksums --
+		 * treat it as a failed verification, so the sector is rebuilt
+		 * from the parity like any other unreadable one.
+		 */
 		if (!test_bit(total_sector_nr, rbio->csum_bitmap)) {
+			const u64 logical = rbio->bioc->full_stripe_logical +
+				((u64)total_sector_nr << fs_info->sectorsize_bits);
+
+			if (unlikely(btrfs_wib_stale(fs_info, logical)))
+				set_bit(total_sector_nr, rbio->error_bitmap);
 			total_sector_nr++;
 			continue;
 		}
@@ -2841,6 +2854,34 @@ static bool rmw_retry_failed_sectors(struct btrfs_raid_bio *rbio)
 	return true;
 }
 
+/*
+ * Tell the write-intent log which data stripes of this full stripe the write
+ * failed to reach, so that the read path stops believing them.  Only data
+ * stripes: a parity that was not written carries no logical address, and the
+ * stripe stays recorded for the scrub either way.
+ */
+static void rmw_record_stale_data(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
+{
+	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
+
+	for (int stripe = 0; stripe < rbio->nr_data; stripe++) {
+		const int first = stripe * rbio->stripe_nsectors;
+
+		/*
+		 * Any failed sector condemns the whole data stripe: the log's
+		 * granularity is one BTRFS_STRIPE_LEN and being coarse here
+		 * only costs a reconstruction that was not needed.
+		 */
+		if (find_next_bit(rbio->error_bitmap, first + rbio->stripe_nsectors,
+				  first) >= first + rbio->stripe_nsectors)
+			continue;
+		btrfs_wib_mark_stale(fs_info,
+				     full_stripe_start +
+				     btrfs_stripe_nr_to_offset(stripe),
+				     BTRFS_STRIPE_LEN);
+	}
+}
+
 static void rmw_rbio(struct btrfs_raid_bio *rbio)
 {
 	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
@@ -2994,9 +3035,24 @@ out:
 	 * inconsistent on that device even without a crash; it stays logged
 	 * so that the parity is regenerated at the next mount.
 	 */
-	if (logged)
-		btrfs_wib_done(fs_info, full_stripe_start, full_stripe_len,
-			       ret < 0 || !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors));
+	if (logged) {
+		const bool failed = ret < 0 ||
+			!bitmap_empty(rbio->error_bitmap, rbio->nr_sectors);
+
+		btrfs_wib_done(fs_info, full_stripe_start, full_stripe_len, failed);
+		/*
+		 * Say WHICH data this write did not get onto the disk, not just
+		 * that something went wrong.  A data stripe whose write failed
+		 * holds its old content while the parity holds what the caller
+		 * was told is there; the read path has to know that, or the
+		 * next RMW of this full stripe will read the stale sector,
+		 * believe it for want of a checksum, and fold it into the
+		 * parity.  One log block is one BTRFS_STRIPE_LEN, so a data
+		 * stripe is exactly one block of the recorded range.
+		 */
+		if (failed)
+			rmw_record_stale_data(rbio, full_stripe_start);
+	}
 	else if (ret >= 0 && !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors))
 		/*
 		 * A full stripe write that a device did not take (within the

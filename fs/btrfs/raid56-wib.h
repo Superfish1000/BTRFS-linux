@@ -104,6 +104,21 @@ struct btrfs_wib_entry {
 	 * by eviction when the log is full.
 	 */
 	u64 sticky;
+	/*
+	 * Blocks whose data a failed write left stale on disk: the value that
+	 * was acknowledged survives only in the parity.  A checksum would say
+	 * the same thing about the sector, and for nodatacow data this is the
+	 * only thing that can: without it the next read-modify-write of the
+	 * same full stripe reads the stale sector, believes it, and computes a
+	 * parity from it -- destroying the copy that still had the
+	 * acknowledged content.  See btrfs_wib_stale() and
+	 * verify_bio_data_sectors().
+	 *
+	 * A subset of @sticky.  Not persisted: it lives for the mount that
+	 * saw the failure, which is where the read path needs it.  Across a
+	 * mount the stripe is still recorded by @sticky and scrubbed.
+	 */
+	u64 stale;
 };
 
 struct btrfs_wib {
@@ -216,6 +231,8 @@ int btrfs_wib_request_enable(struct btrfs_fs_info *fs_info, bool automatic);
 
 int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed);
+void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical);
 void btrfs_wib_commit_prepare(struct btrfs_fs_info *fs_info);
 int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed);
 

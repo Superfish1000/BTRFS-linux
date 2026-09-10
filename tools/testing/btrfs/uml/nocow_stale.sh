@@ -25,8 +25,9 @@ KERNEL=${1:?usage: nocow_stale.sh <kernel> [ndev] [fail-device] [log|nolog]}
 NDEV=${2:-4}
 FAIL=${3:-1}
 # "log"    the write-intent log's mount-time recovery does the scrubbing
-# "nolog"  the log is off (noraid56_write_intent) and a plain "btrfs scrub"
-#          does it, which isolates the question to upstream code
+# "nolog"  a plain "btrfs scrub" does it, with the log off
+# "rmw"    nothing scrubs at all: an ordinary FAULT-FREE write to another
+#          column of the same full stripe is what destroys the data
 WHO=${4:-log}
 TAG=nocow-stale-$WHO
 PROFILE=raid5:raid1
@@ -56,6 +57,23 @@ boot() {	# mode omit mntdev [extra-env]
 # The device whose writes fail is also the one omitted for the probes, so the
 # stale sectors it holds must be reconstructed from the parity.
 MNTPROBE=/dev/ubda; [ "$FAIL" = "0" ] && MNTPROBE=/dev/ubdb
+
+if [ "$WHO" = rmw ]; then
+	# One boot does the whole thing: failed write, heal, then a clean write
+	# to the neighbouring column of the same full stripe.
+	boot nocow_rmw none /dev/ubda
+	boot nocow_rmw_probe "$FAIL" $MNTPROBE
+	bad=$(cat $T/umltest/nocow.rmw.$TAG 2>/dev/null || echo "?")
+	echo "==== $TAG ===="
+	cat $T/umltest/results.$TAG
+	echo
+	echo "pass-1 blocks unrecoverable from the parity after a clean write to"
+	echo "the neighbouring column, device $FAIL omitted: $bad"
+	[ "$bad" = "?" ] && { echo "RESULT: INCONCLUSIVE"; exit 2; }
+	[ "$bad" -gt 0 ] 2>/dev/null \
+		&& { echo "RESULT: REPRODUCED -- a fault-free write destroyed $bad block(s)"; exit 1; } \
+		|| { echo "RESULT: NOT REPRODUCED -- the fault-free write left them recoverable"; exit 0; }
+fi
 
 PROBE_SUFFIX=before
 if [ "$WHO" = nolog ]; then

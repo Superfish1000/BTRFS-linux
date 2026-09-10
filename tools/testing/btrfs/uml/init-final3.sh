@@ -150,6 +150,9 @@ dm_heal() {
 # stride so they land in different vertical stripes and on different devices.
 NOCOW_BLOCKS=32
 NOCOW_STRIDE=16          # in 4K blocks, so 64 KiB apart
+# One RAID5 full stripe on a 4-device array is 3 x BTRFS_STRIPE_LEN = 192 KiB.
+NOCOW_FS_BLOCKS=48       # 4K blocks per full stripe
+NOCOW_NEXT_COL=16        # +64 KiB: the next data column of the same stripe
 nocow_bad() {
 	# How many of the overwritten blocks do NOT read back as the value the
 	# overwrite was acknowledged to have written.  Zero means the data is
@@ -496,6 +499,73 @@ nocow_stale)
 	sync
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all
+	finish
+	;;
+nocow_rmw)
+	# Does an ordinary FAULT-FREE write destroy data a previous failed
+	# write left recoverable?
+	#
+	# To compute a new parity, a sub-stripe write must read the data
+	# stripes it is not writing.  A nodatacow sector has no checksum, so a
+	# sector left stale by an earlier failed write is believed, and the
+	# parity -- which held the acknowledged value -- is recomputed from it.
+	# No crash, no second device failure, no scrub: the very next write to
+	# the same full stripe is enough.
+	#
+	# Pass 1 writes column 0 of each full stripe while a device fails
+	# writes.  The device is then healed, and pass 2 writes column 1 of the
+	# SAME full stripes with every write succeeding.  Reading pass 1's
+	# blocks with the failed device omitted says whether the parity still
+	# has them.
+	#
+	# A RAID5 full stripe here is 3 x 64K, so +64K is the next column.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
+	dd if=/dev/zero bs=1M count=4 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	dm_error_writes $FAIL; log "write errors on device $FAIL"
+	acked=0
+	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_FS_BLOCKS)) count=1 \
+		   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
+	done
+	sync
+	log "pass1 (device failing): $acked of $NOCOW_BLOCKS acknowledged"
+	stats "after pass1"
+	# Healthy again: pass 2 takes no faults at all.
+	dm_heal $FAIL; log "healed device $FAIL"
+	clean=0
+	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' |
+		dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_FS_BLOCKS + NOCOW_NEXT_COL)) count=1 \
+		   conv=notrunc,fsync status=none 2>/dev/null && clean=$((clean+1))
+	done
+	sync
+	log "pass2 (healthy, same full stripes): $clean of $NOCOW_BLOCKS acknowledged"
+	stats "after pass2"
+	kmsg "raid56|write-intent" 6
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all
+	finish
+	;;
+nocow_rmw_probe)
+	# Read pass 1's blocks with the failing device omitted, so every one of
+	# them must come from the parity.
+	do_mount ro,degraded $MNTDEV
+	bad=0
+	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
+		got=$(dd if=$MNT/nocow bs=4096 skip=$((i * NOCOW_FS_BLOCKS)) count=1 \
+		      status=none 2>/dev/null | tr -d 'B' | wc -c)
+		[ "$got" = 0 ] || bad=$((bad+1))
+	done
+	log "NOCOW_RMW bad=$bad of $NOCOW_BLOCKS"
+	echo $bad > $T/umltest/nocow.rmw.$TAG
+	umount $MNT || log "UMOUNT_FAIL"
 	finish
 	;;
 nocow_scrub)

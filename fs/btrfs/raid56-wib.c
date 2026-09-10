@@ -187,6 +187,7 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 				      (unsigned int)hweight64(e->sticky), e->bytenr);
 		atomic64_inc(&wib->stat_sticky_evicted);
 		e->sticky = 0;
+		e->stale = 0;
 		return e;
 	}
 	return NULL;
@@ -219,6 +220,7 @@ static struct btrfs_wib_entry *wib_find_or_alloc_entry(struct btrfs_wib *wib,
 	if (free) {
 		free->bytenr = bytenr;
 		free->sticky = 0;
+		free->stale = 0;
 	}
 	return free;
 }
@@ -1078,6 +1080,14 @@ void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool fa
 		if (failed) {
 			e->sticky |= mask;
 			atomic64_inc(&wib->stat_sticky);
+		} else {
+			/*
+			 * Every write of this RMW landed, so whatever these
+			 * blocks held before, the disk now has what was
+			 * acknowledged.  Leaving them marked stale would send
+			 * later reads to reconstruct a sector that is correct.
+			 */
+			e->stale &= ~mask;
 		}
 		if (!e->bitmap)
 			freed = true;
@@ -1113,6 +1123,74 @@ void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 }
 
 /* [@logical, @logical + @len) was fully recovered, forget its error record. */
+/*
+ * Record that the data of [@logical, @logical + @len) is stale on disk: a
+ * write of it was acknowledged but the device did not take it, so what was
+ * acknowledged survives only in the parity.
+ *
+ * The read path must treat these blocks the way it treats a sector that fails
+ * its checksum -- reconstruct rather than believe.  For nodatacow data there
+ * is no checksum to fail, so without this the next read-modify-write of the
+ * same full stripe reads the stale sector, trusts it, and computes a parity
+ * from it, which destroys the only remaining copy of the acknowledged value.
+ */
+void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	u64 end;
+
+	if (!wib)
+		return;
+
+	end = round_up(logical + len, BTRFS_WIB_BLOCK_SIZE);
+	logical = round_down(logical, BTRFS_WIB_BLOCK_SIZE);
+	len = end - logical;
+
+	spin_lock(&wib->lock);
+	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
+		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+		u64 mask;
+
+		if (!e)
+			continue;
+		mask = btrfs_wib_range_mask(cur, logical, len);
+		/*
+		 * Only where the stripe is already recorded.  A block that is
+		 * not sticky has nothing carrying its value, so calling it
+		 * stale would send the read path to a parity that describes
+		 * exactly the sector it is being told to distrust.
+		 */
+		e->stale |= mask & e->sticky;
+	}
+	spin_unlock(&wib->lock);
+}
+
+/*
+ * Is the data of the block containing @logical known to be stale on disk?
+ *
+ * Answers the question a checksum answers, for data that has none.  A false
+ * negative is the behaviour without this record at all; a false positive
+ * costs a reconstruction that was not needed.
+ */
+bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const u64 cur = wib_entry_bytenr(logical);
+	struct btrfs_wib_entry *e;
+	bool stale = false;
+
+	if (!wib)
+		return false;
+
+	spin_lock(&wib->lock);
+	e = wib_find_entry(wib, cur);
+	if (e)
+		stale = e->stale &
+			btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE);
+	spin_unlock(&wib->lock);
+	return stale;
+}
+
 void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
 	struct btrfs_wib *wib = fs_info->wib;
@@ -1129,6 +1207,7 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		if (!e)
 			continue;
 		e->sticky &= ~btrfs_wib_range_mask(cur, logical, len);
+		e->stale &= ~btrfs_wib_range_mask(cur, logical, len);
 		if (!wib_entry_used(e))
 			freed = true;
 	}
