@@ -149,6 +149,23 @@ if [ $rig != 1 ]; then
 	exit 1
 fi
 
+echo "== scrub pause protocol =="
+# Exhaustive over interleavings, so this answers what a timing-based test
+# cannot: the two attempts at provoking the wedge by hand both completed, and
+# proved nothing either way.
+( cd $REPO/tools/testing/btrfs && python3 scrub_pause_model.py --pausers 1 --recovery 1 --quiet ) > $LOG/pause1 2>&1
+grep -q "DEADLOCK" $LOG/pause1 \
+	&& note "a recovery in the pause protocol deadlocks with a single commit (why the guard exists)" \
+	|| fail "the unguarded recovery no longer deadlocks -- has the protocol changed?"
+( cd $REPO/tools/testing/btrfs && python3 scrub_pause_model.py --pausers 2 --scrubs 1 --recovery 1 --guard --quiet ) > $LOG/pause2 2>&1
+grep -q "no deadlock" $LOG/pause2 \
+	&& pass "guarded recovery is deadlock-free in every interleaving" \
+	|| { fail "the guarded recovery can deadlock"; cat $LOG/pause2; }
+( cd $REPO/tools/testing/btrfs && python3 scrub_pause_model.py --pausers 2 --scrubs 1 --recovery 0 --quiet ) > $LOG/pause3 2>&1
+grep -q "no deadlock" $LOG/pause3 \
+	&& pass "the protocol itself is sound without a recovery in it" \
+	|| { fail "upstream's own pause protocol deadlocks -- check the model"; cat $LOG/pause3; }
+
 echo "== in-kernel self tests =="
 cp -a $HERE/selftest.sh $T/umltest/ 2>/dev/null
 timeout 900 $K mem=1G rootfstype=hostfs rootflags=/ rw \
