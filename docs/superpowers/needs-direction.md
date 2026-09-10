@@ -314,3 +314,46 @@ asked for over silently substituting different behaviour; or a warning plus the
 forced copy-on-write, which keeps those scripts working while quietly changing
 what they get.
 
+---
+
+## 11. A crash on a failing device leaves files reading back complete and wrong
+
+**What.** The `flakey` scenario -- background writers, one device failing
+every write, then a crash, then probes with one device omitted -- reports two
+classes of damaged file, and `regress.sh` now separates them:
+
+- **read failed** (4 to 19 per run): the read errors and `md5sum` prints
+  nothing. This is item 1 of this document: the log records stripe addresses,
+  not content, so a stripe whose data is gone cannot be rebuilt, and the
+  kernel says so.
+- **wrong data** (0 to 5 per run): the read SUCCEEDS and returns a file of
+  exactly the right length whose content differs from what was fsync'd. No
+  checksum error is raised.
+
+**Why the second one should not be possible.** The writers use plain `dd`, so
+the data is checksummed. Metadata is `raid1`, so the checksum tree is not
+touched by the RAID5 degradation. Each file is created exactly once, so there
+is no earlier version to roll back to. On those three facts a wrong
+reconstruction has to fail its checksum and the read has to error. It does
+not, so one of the three is false, and which one is not yet established.
+
+Every mismatching file measured is at exactly its expected size --
+45056/45056, 57344/57344, 28672/28672, 53248/53248, 61440/61440, 32768/32768
+-- so it is not truncation, which was the obvious explanation and is dead.
+
+**Not this series.** It reproduces with `noraid56_write_intent`: 0, 3 and 5
+wrong-data files across three runs with the log off. An earlier reading of
+this called the log implicated on the strength of one run per arm, which was
+wrong -- the counts are nondeterministic in both arms and the distributions
+overlap. It also predates every commit in tonight's work.
+
+What the two arms genuinely differ on is total damage, and there the log helps
+substantially: 8 damaged files with it on against 19 with it off.
+
+**Reproduce.** `BTRFS_TEST_DIR=... tools/testing/btrfs/uml/dmfail34.sh
+<kernel> <tag> flakey raid5:raid1 rw 4 2`
+
+**The choice.** Whether to chase this now -- it is an upstream-shaped bug in
+the crash path rather than part of the write-hole work -- or record it and
+carry on with the series.
+
