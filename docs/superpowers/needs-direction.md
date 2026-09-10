@@ -230,3 +230,87 @@ repairs it) but does not close it: devices that die before that scrub runs are
 enough.
 
 ---
+
+---
+
+## 7. Persisting the stale record costs log capacity
+
+**What.** The scrub fix works off the log's `stale` record -- which data column
+holds content a failed write left on disk. That record lives only in memory, so
+across a mount only `sticky` survives, and `sticky` says a write failed without
+saying which side of the stripe is wrong. Until it is persisted, the scrub
+protection is per-mount only: the first `btrfs scrub` after a reboot can still
+destroy the parity copy.
+
+**The change.** `struct btrfs_wib_disk_entry` grows from 24 to 32 bytes: one
+more `__le64` carrying `stale`, with parity staleness packed into the same
+bitmap (the block at the full stripe's start encodes parity 0, the next block
+parity 1 -- `nr_data` is at least 2, so those bits always belong to the stripe
+they describe).
+
+**The cost.** Entries per 4KiB slot drop from 165 to 124, so one slot tracks
+496MiB of dirty address space instead of 660MiB. Eviction gets more likely on
+an array that is failing a lot of writes, and an evicted record means that
+stripe relies on the next scrub rather than the next mount.
+
+**The choice.** Take the 25% capacity cut; or leave the record per-mount and
+accept that the protection resets at every boot; or spend a second `__le64` on
+a separate parity bitmap for clarity, at 99 entries instead of 124.
+
+---
+
+## 8. Scrub: skip the stripe, or rebuild it
+
+**What.** `scrub_raid56_parity_stripe()` now declines to regenerate the parity
+when the log records a data column of that full stripe stale. Sound, and small:
+one early return. The state-machine model scores it 0 on every axis.
+
+But it does not repair. The stronger policy -- rebuild the stale column *from*
+the parity, write it back, then regenerate -- is also clean and leaves far
+fewer stripes without redundancy: 259 against 973 on RAID5, 2718 against 9705
+on RAID6.
+
+**Why it is not done.** It needs a write-back path scrub does not have at that
+point. The machinery exists: marking the stale sectors in the scrub stripe's
+error bitmap after `scrub_verify_one_stripe()` would make the existing repair
+loop reconstruct them through mirror 2 and write them back. It has to go in
+`scrub_stripe_read_repair_worker()`, which only knows its own data column, so
+it needs a chunk-map lookup to find the full stripe.
+
+**The choice.** Ship the skip and leave 3.5x more stripes unrepaired, or build
+the write-back path.
+
+---
+
+## 9. Debug knobs that turn protections off
+
+**What.** Two `CONFIG_BTRFS_DEBUG`-only module parameters were added:
+
+- `raid56_allow_nodatacow` -- turns off both the `chattr +C` refusal and the
+  forced copy-on-write fallback.
+- `raid56_stale_read_legacy` -- restores the read-path behaviour that ignores
+  the rebuild budget.
+
+Both exist because the reproductions cannot otherwise reach the states they
+demonstrate: refusing `chattr +C` removes the only way to *build* the
+nodatacow-on-RAID5/6 state, and a negative control needs the defect back.
+
+**The choice.** Whether shipping switches that restore known defects, even in
+debug builds, is acceptable. The alternative is a second kernel build per
+control, which is what made negative controls expensive enough to skip -- and
+skipping them is how five claims got made and withdrawn in this series.
+
+---
+
+## 10. `chattr +C` on RAID5/6 now fails
+
+**What.** `check_fsflags_compatible()` returns `-EPERM` for `FS_NOCOW_FL` when
+the RAID56 incompat bit is set, matching the existing zoned precedent. Anything
+that scripts `chattr +C` on a RAID5/6 array -- VM image directories, database
+data directories, `systemd-nspawn` machine trees -- starts failing.
+
+**The choice.** Refusal, which is what the zoned case does and what the user
+asked for over silently substituting different behaviour; or a warning plus the
+forced copy-on-write, which keeps those scripts working while quietly changing
+what they get.
+
