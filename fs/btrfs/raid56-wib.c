@@ -1087,16 +1087,15 @@ void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool fa
 		if (failed) {
 			e->sticky |= mask;
 			atomic64_inc(&wib->stat_sticky);
-		} else if (e->stale & mask) {
-			/*
-			 * Every write of this RMW landed, so whatever these
-			 * blocks held before, the disk now has what was
-			 * acknowledged.  Leaving them marked stale would send
-			 * later reads to reconstruct a sector that is correct.
-			 */
-			atomic_sub(hweight64(e->stale & mask), &wib->nr_stale);
-			e->stale &= ~mask;
 		}
+		/*
+		 * Deliberately NOT clearing e->stale here.  @len is the whole
+		 * full stripe, but an RMW writes only the data stripes it was
+		 * given -- so clearing across the range would turn the alarm
+		 * off for columns this write never touched and which are still
+		 * stale on disk.  rmw_update_stale_data() clears exactly the
+		 * columns whose writes landed.
+		 */
 		if (!e->bitmap)
 			freed = true;
 	}
@@ -1187,6 +1186,35 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 bool btrfs_wib_any_stale(const struct btrfs_fs_info *fs_info)
 {
 	return fs_info->wib && atomic_read(&fs_info->wib->nr_stale) != 0;
+}
+
+/*
+ * The data of [@logical, @logical + @len) has been written and landed, so it
+ * is no longer stale.  Separate from btrfs_wib_done() because that is told
+ * about the whole full stripe while only some of its columns were written.
+ */
+void btrfs_wib_clear_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const u64 end = logical + len;
+
+	if (!wib || !atomic_read(&wib->nr_stale))
+		return;
+
+	spin_lock(&wib->lock);
+	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
+		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+		u64 gone;
+
+		if (!e)
+			continue;
+		gone = e->stale & btrfs_wib_range_mask(cur, logical, len);
+		if (gone) {
+			atomic_sub(hweight64(gone), &wib->nr_stale);
+			e->stale &= ~gone;
+		}
+	}
+	spin_unlock(&wib->lock);
 }
 
 bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
@@ -2108,7 +2136,24 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 				goto out_end;
 			}
 
-			ret = wib_recover_one(fs_info, sctx, logical, true, false, &start, &len, &st);
+			/*
+			 * Never trusted.  Every stripe this loop visits is
+			 * here because it carries an ERROR record -- the loop
+			 * above selects on e->sticky -- so a data sector of it
+			 * may be stale while the parity holds what was
+			 * acknowledged.  Passing true regenerates the parity
+			 * from sectors the scrub cannot verify, which for
+			 * nodatacow data overwrites the only copy of the
+			 * acknowledged value: exactly what btrfs_wib_recover()
+			 * stopped doing, re-opened here.
+			 *
+			 * The extent tree being complete after the replay is
+			 * what @trusted was meant to convey, but it is the same
+			 * flag that governs regenerating parity over
+			 * unverifiable sectors, and for error records that is
+			 * not safe.
+			 */
+			ret = wib_recover_one(fs_info, sctx, logical, false, false, &start, &len, &st);
 			if (ret < 0)
 				goto out_end;
 			if (!len) {

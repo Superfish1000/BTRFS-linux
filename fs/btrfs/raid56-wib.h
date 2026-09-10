@@ -253,6 +253,7 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed);
 void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical);
+void btrfs_wib_clear_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 bool btrfs_wib_any_stale(const struct btrfs_fs_info *fs_info);
 void btrfs_wib_commit_prepare(struct btrfs_fs_info *fs_info);
 int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed);

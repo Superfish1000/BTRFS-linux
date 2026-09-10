@@ -2871,25 +2871,43 @@ static bool rmw_retry_failed_sectors(struct btrfs_raid_bio *rbio)
  * stripes: a parity that was not written carries no logical address, and the
  * stripe stays recorded for the scrub either way.
  */
-static void rmw_record_stale_data(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
+static void rmw_update_stale_data(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
 {
 	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
 
 	for (int stripe = 0; stripe < rbio->nr_data; stripe++) {
 		const int first = stripe * rbio->stripe_nsectors;
+		const int end = first + rbio->stripe_nsectors;
+		const u64 logical = full_stripe_start +
+				    btrfs_stripe_nr_to_offset(stripe);
+		bool supplied = false;
+
+		/*
+		 * Only the data stripes this rbio actually wrote have anything
+		 * to say.  One it merely read to compute the parity is
+		 * unchanged on disk, so neither marking it stale nor clearing
+		 * a mark it already carries would be true -- and clearing it
+		 * would turn the alarm off while the sector is still stale,
+		 * which is worse than never having set it.
+		 */
+		for (int sectornr = 0; sectornr < rbio->stripe_nsectors; sectornr++) {
+			if (sector_paddrs_in_rbio(rbio, stripe, sectornr, 1)) {
+				supplied = true;
+				break;
+			}
+		}
+		if (!supplied)
+			continue;
 
 		/*
 		 * Any failed sector condemns the whole data stripe: the log's
 		 * granularity is one BTRFS_STRIPE_LEN and being coarse here
 		 * only costs a reconstruction that was not needed.
 		 */
-		if (find_next_bit(rbio->error_bitmap, first + rbio->stripe_nsectors,
-				  first) >= first + rbio->stripe_nsectors)
-			continue;
-		btrfs_wib_mark_stale(fs_info,
-				     full_stripe_start +
-				     btrfs_stripe_nr_to_offset(stripe),
-				     BTRFS_STRIPE_LEN);
+		if (find_next_bit(rbio->error_bitmap, end, first) >= end)
+			btrfs_wib_clear_stale(fs_info, logical, BTRFS_STRIPE_LEN);
+		else
+			btrfs_wib_mark_stale(fs_info, logical, BTRFS_STRIPE_LEN);
 	}
 }
 
@@ -3052,17 +3070,20 @@ out:
 
 		btrfs_wib_done(fs_info, full_stripe_start, full_stripe_len, failed);
 		/*
-		 * Say WHICH data this write did not get onto the disk, not just
-		 * that something went wrong.  A data stripe whose write failed
-		 * holds its old content while the parity holds what the caller
-		 * was told is there; the read path has to know that, or the
-		 * next RMW of this full stripe will read the stale sector,
-		 * believe it for want of a checksum, and fold it into the
-		 * parity.  One log block is one BTRFS_STRIPE_LEN, so a data
+		 * Say WHICH data this write did and did not get onto the disk,
+		 * not just that something went wrong.  A data stripe whose
+		 * write failed holds its old content while the parity holds
+		 * what the caller was told is there; the read path has to know
+		 * that, or the next RMW of this full stripe will read the stale
+		 * sector, believe it for want of a checksum, and fold it into
+		 * the parity.  One log block is one BTRFS_STRIPE_LEN, so a data
 		 * stripe is exactly one block of the recorded range.
+		 *
+		 * Unconditionally, not only when something failed: a write that
+		 * lands on a column previously recorded stale is what makes it
+		 * current again.
 		 */
-		if (failed)
-			rmw_record_stale_data(rbio, full_stripe_start);
+		rmw_update_stale_data(rbio, full_stripe_start);
 	}
 	else if (ret >= 0 && !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors))
 		/*
