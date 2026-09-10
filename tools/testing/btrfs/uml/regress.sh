@@ -153,8 +153,21 @@ echo "== in-kernel self tests =="
 cp -a $HERE/selftest.sh $T/umltest/ 2>/dev/null
 timeout 900 $K mem=1G rootfstype=hostfs rootflags=/ rw \
 	init=$T/umltest/selftest.sh quiet con=null con0=fd:0,fd:1 > $LOG/selftest 2>&1
-grep -aq "raid56 write-intent log tests" $LOG/selftest \
-	&& pass "write-intent log self tests ran" || fail "write-intent log self tests did not run"
+# Two separate questions.  The banner is pr_info from the START of the run, so
+# it is still there when a test then fails -- greping only for it reported a
+# pass for a failing self test.  A failure is test_err(), i.e. pr_err in the
+# form "BTRFS: selftest: <file>:<line> <message>".
+if grep -aq "raid56 write-intent log tests" $LOG/selftest; then
+	pass "write-intent log self tests ran"
+else
+	fail "write-intent log self tests did not run"
+fi
+if grep -aqE "BTRFS: selftest: [^ ]+:[0-9]+ " $LOG/selftest; then
+	fail "a self test failed"
+	grep -aE "BTRFS: selftest: [^ ]+:[0-9]+ " $LOG/selftest | head -5
+else
+	pass "no self test reported a failure"
+fi
 grep -aqE "BUG:|KASAN|Oops|WARNING:" $LOG/selftest \
 	&& { fail "kernel splat during self tests"; grep -aE "BUG:|KASAN|Oops|WARNING:" $LOG/selftest | head -3; } \
 	|| pass "no kernel splat"
@@ -173,18 +186,28 @@ check_scenario() { # <tag> <resultfile> <label>
 		grep -ahrE "BUG:|KASAN|Oops|hung task" $d 2>/dev/null | head -2
 		return
 	fi
-	# The verdict the scenarios actually emit.  verify_manifest() logs one
-	# "BAD <file> expected <md5> got <md5>" per file that read back wrong and
-	# a "VERIFY total=N bad=M" summary; nothing here looked at either, so a
-	# run could report success while files came back corrupted.
-	if grep -aq "^\[.*\] BAD \|STALE_SECTOR_SILENT_CORRUPTION" $f; then
+	# The verdict the scenarios actually emit.  verify_manifest() prefixes
+	# both lines with the caller's label, so they read
+	#     [recover]  FULL_MANIFEST total=48 bad=0
+	#     [degraded] DEGRADED_BAD <file> expected <md5> got <md5>
+	# An earlier version of this greped for "] BAD " and "VERIFY total=",
+	# neither of which any scenario emits, so both corruption checks were
+	# dead and a run could report success with files reading back wrong.
+	# Match the prefix, not a guess at it.
+	if grep -aqE "^\[.*\] ([A-Z_]*_)?BAD |STALE_SECTOR_SILENT_CORRUPTION" $f; then
 		fail "$label: committed data read back wrong"
-		grep -a "BAD \|SILENT_CORRUPTION" $f | head -3
+		grep -aE "([A-Z_]*_)?BAD |SILENT_CORRUPTION" $f | head -3
 		return
 	fi
-	local badcount
-	badcount=$(grep -ao "VERIFY total=[0-9]* bad=[0-9]*" $f | grep -o "bad=[0-9]*" |
+	local badcount nmanifest
+	badcount=$(grep -aoE "MANIFEST total=[0-9]+ bad=[0-9]+" $f | grep -o "bad=[0-9]*" |
 		   cut -d= -f2 | awk '{s+=$1} END {print s+0}')
+	# Only the scenarios that run background writers build a manifest, so
+	# its absence is not a failure -- but it does mean the only content
+	# check this scenario made is verify_old() on a single file, which is
+	# worth saying rather than leaving to be inferred from a silent zero.
+	nmanifest=$(grep -ac "MANIFEST total=" $f)
+	[ "${nmanifest:-0}" != 0 ] || note "$label: no manifest (content checked by verify_old only)"
 	[ "${badcount:-0}" != 0 ] && { fail "$label: $badcount file(s) verified wrong"; return; }
 	for m in MKFS_FAIL UMOUNT_FAIL CHECK_FAIL CRASH_ARM_FAIL DM_CREATE_FAIL \
 		 DM_RELOAD_FAIL NOCOW_READ_FAIL REMOUNT_RW_FAIL; do
