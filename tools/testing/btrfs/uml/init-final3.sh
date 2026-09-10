@@ -501,6 +501,28 @@ nocow_stale)
 	dmsetup remove_all
 	finish
 	;;
+pausehang_prep)
+	# Leave a filesystem with recorded stripes and unmount it, so the next
+	# boot's btrfs_wib_load() puts them in wib->pending -- which is the only
+	# thing btrfs_wib_recover() iterates.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	dd if=/dev/urandom of=$MNT/base bs=1M count=8 conv=fsync status=none
+	sync
+	dm_error_writes $FAIL; log "write errors on device $FAIL"
+	for i in $(seq 0 39); do
+		dd if=/dev/urandom of=$MNT/base bs=4096 count=1 seek=$((i * 48)) \
+		   conv=notrunc,fsync status=none 2>/dev/null
+	done
+	sync
+	dm_heal $FAIL
+	stats "recorded"
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
 pausehang)
 	# Can the write-intent log's recovery wedge against the scrub pause
 	# protocol?
@@ -510,59 +532,37 @@ pausehang)
 	#
 	# The recovery is deliberately absent from scrubs_running, but
 	# scrub_raid56_parity_stripe() calls scrub_blocked_if_needed(), which
-	# increments scrubs_paused.  While the recovery sits there, paused is 1
-	# and running is 0, so a commit calling btrfs_scrub_pause() waits for
-	# 1 == 0, and the recovery waits for pause_req to reach 0 -- which that
-	# same commit is holding above zero.  Neither moves.
+	# increments scrubs_paused.  While the recovery sits there paused is 1
+	# and running is 0, so a commit waits for 1 == 0 while the recovery
+	# waits for pause_req to reach 0 -- which that commit is holding above
+	# zero.
 	#
-	# Build a long recovery (raid56_recovery_delay_ms) on a filesystem with
-	# many recorded stripes, remount it read-write with commits landing
-	# every second, and see whether the remount ever returns.
-	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
-	dm_scan
-	do_mount $OPTS,commit=1 /dev/mapper/d0
-	dd if=/dev/urandom of=$MNT/base bs=1M count=8 conv=fsync status=none
-	sync
-	# Failed sub-stripe writes leave stripes recorded, which is the work the
-	# recovery will have to do at the next read-write mount.
-	dm_error_writes $FAIL; log "write errors on device $FAIL"
-	for i in $(seq 0 39); do
-		dd if=/dev/urandom of=$MNT/base bs=4096 count=1 seek=$((i * 48)) \
-		   conv=notrunc,fsync status=none 2>/dev/null
-	done
-	sync
-	dm_heal $FAIL
-	stats "recorded"
-	mount -o remount,ro $MNT || log "REMOUNT_RO_FAIL"
-	log "remounted read-only"
-	# Keep something dirtying the filesystem so the transaction kthread has
-	# a transaction to commit while the recovery runs.
-	( while [ ! -f $T/umltest/stop.$TAG ]; do
-		dd if=/dev/urandom of=$MNT/spin bs=4096 count=1 conv=fsync \
-		   status=none 2>/dev/null
-		sync 2>/dev/null
-	  done ) &
-	SPIN=$!
+	# Mount READ-ONLY, so btrfs_wib_load() fills wib->pending and
+	# btrfs_wib_rw_mount() is deferred; the remount below is then the thing
+	# that actually runs the recovery.  Mounting read-write first would
+	# consume wib->pending at mount time and leave the remount nothing to
+	# do, which is what an earlier version of this scenario did.
+	do_mount ro $MNTDEV
+	stats "mounted ro"
+	pend=$(grep -o "pending_recovery_regions [0-9]*" /sys/fs/btrfs/*/raid56_write_intent 2>/dev/null | awk '{print $2}' | head -1)
+	log "pending regions before remount: ${pend:-unknown}"
+	[ "${pend:-0}" = 0 ] && log "NOTHING_TO_RECOVER"
 	echo ${DELAY:-40} > /sys/module/btrfs/parameters/raid56_recovery_delay_ms \
 		2>/dev/null || log "DELAY_ARM_FAIL"
 	log "recovery delay armed: $(cat /sys/module/btrfs/parameters/raid56_recovery_delay_ms 2>/dev/null)"
-	watchdog 90
+	watchdog 150
 	log "REMOUNT_RW_START"
-	if timeout 120 mount -o remount,rw $MNT; then
+	if timeout 180 mount -o remount,rw,commit=1 $MNT; then
 		log "REMOUNT_RW_DONE"
 	else
 		log "REMOUNT_RW_STUCK rc=$?"
 		echo w > /proc/sysrq-trigger 2>/dev/null
-		sleep 2
+		sleep 3
 	fi
-	touch $T/umltest/stop.$TAG; kill $SPIN 2>/dev/null; wait 2>/dev/null
 	echo 0 > /sys/module/btrfs/parameters/raid56_recovery_delay_ms 2>/dev/null
 	stats "after remount"
 	kmsg "blocked for more|scrub|write-intent" 8
-	rm -f $T/umltest/stop.$TAG
-	umount $MNT 2>/dev/null || log "UMOUNT_FAIL"
-	dmsetup remove_all 2>/dev/null
+	umount $MNT 2>/dev/null
 	finish
 	;;
 nocow_rmw)

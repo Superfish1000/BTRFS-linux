@@ -24,17 +24,28 @@ rm -rf $D; mkdir -p $D; rm -f $T/umltest/results.$TAG $T/umltest/stop.$TAG
 for i in $(seq 0 $((NDEV-1))); do truncate -s 1G $D/disk$i.img; done
 ulimit -c 0
 ubds=""; for d in $(seq 0 $((NDEV-1))); do ubds="$ubds ubd$d=$D/disk$d.img"; done
-timeout 900 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
-	init=$T/umltest/init-final3.sh $ubds quiet con=null con0=fd:0,fd:1 \
-	BTRFS_TEST_DIR=$T MODE=pausehang OPTS=rw PROFILE=raid5:raid1 TAG=$TAG \
-	MNTDEV=/dev/ubda NDEV=$NDEV FAIL=$FAIL DELAY=$DELAY > $D/log 2>&1
-echo "boot rc=$?" >> $T/umltest/results.$TAG
+boot() {
+	timeout 900 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
+		init=$T/umltest/init-final3.sh $ubds quiet con=null con0=fd:0,fd:1 \
+		BTRFS_TEST_DIR=$T MODE=$1 OPTS=rw PROFILE=raid5:raid1 TAG=$TAG \
+		MNTDEV=/dev/ubda NDEV=$NDEV FAIL=$FAIL DELAY=$DELAY > $D/log.$1 2>&1
+	echo "boot $1 rc=$?" >> $T/umltest/results.$TAG
+}
+# Two boots: the first leaves recorded stripes on disk, the second mounts
+# read-only so the remount is what runs the recovery.
+boot pausehang_prep
+boot pausehang
 echo "==== $TAG ===="
 cat $T/umltest/results.$TAG
 echo
-if grep -q "REMOUNT_RW_STUCK" $T/umltest/results.$TAG; then
+# A remount that returned having recovered nothing says nothing about the
+# wedge: the window never opened.  That is inconclusive, not a pass.
+if grep -q "NOTHING_TO_RECOVER" $T/umltest/results.$TAG; then
+	echo "RESULT: INCONCLUSIVE -- no stripes were pending, the recovery never ran"
+	exit 2
+elif grep -q "REMOUNT_RW_STUCK" $T/umltest/results.$TAG; then
 	echo "RESULT: WEDGED -- the read-write remount never returned"
-	grep -a "blocked for more\|scrub\|D    " $D/log | head -12
+	grep -a "blocked for more\|scrub\|D    " $D/log.pausehang | head -12
 	exit 1
 elif grep -q "REMOUNT_RW_DONE" $T/umltest/results.$TAG; then
 	echo "RESULT: COMPLETED -- no wedge"; exit 0
