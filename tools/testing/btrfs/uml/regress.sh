@@ -166,6 +166,47 @@ grep -q "no deadlock" $LOG/pause3 \
 	&& pass "the protocol itself is sound without a recovery in it" \
 	|| { fail "upstream's own pause protocol deadlocks -- check the model"; cat $LOG/pause3; }
 
+echo "== scrub policy on unchecksummed stripes =="
+# The upstream policy MUST still destroy committed data here: that is the
+# defect the whole series exists for, measured under UML at 8 of 32 blocks.
+# A model that stops reproducing it has stopped modelling anything.
+( cd $REPO/tools/testing/btrfs && python3 scrub_policy_model.py \
+	--data 3 --parity 1 --depth 2 --policy upstream --self-check ) > $LOG/scrubpol1 2>&1
+grep -qE "^  DESTROY    [1-9]" $LOG/scrubpol1 \
+	&& note "regenerating parity over an unverifiable sector still destroys committed data" \
+	|| { fail "the model no longer reproduces the defect it was built for"; tail -5 $LOG/scrubpol1; }
+
+# What the kernel now does, on both sides.  Both must be clean on every axis.
+for pol in stale-skip stale-budgeted; do
+	for par in 1 2; do
+		( cd $REPO/tools/testing/btrfs && python3 scrub_policy_model.py \
+			--data 3 --parity $par --depth 2 --policy $pol --persist-stale ) \
+			> $LOG/scrubpol.$pol.$par 2>&1
+		if grep -qE "^  (MISREPAIR|DESTROY)  *[1-9]" $LOG/scrubpol.$pol.$par; then
+			fail "scrub policy $pol destroys or misrepairs at parity $par"
+			grep -A 3 -E "^  (MISREPAIR|DESTROY)" $LOG/scrubpol.$pol.$par | head -8
+		else
+			pass "scrub policy $pol is clean at parity $par"
+		fi
+	done
+done
+
+# The read path.  "stale-any" is the version that shipped and must still be
+# shown to regress, or the budgeted rule is being credited for nothing.
+( cd $REPO/tools/testing/btrfs && python3 scrub_policy_model.py \
+	--data 3 --parity 1 --depth 2 --all-readers ) > $LOG/readers 2>&1
+# Only the table rows: the counterexample heading below the table starts
+# with the same policy name, and its third field is a word, not a count.
+awk '$3 !~ /^[0-9]+$/         { next }
+     $1 == "stale-any"        { print "any", $3 }
+     $1 == "stale-budgeted"   { print "bud", $3 }' $LOG/readers > $LOG/readers.n
+grep -q "^any [1-9]" $LOG/readers.n \
+	&& note "acting on the stale record without a budget still regresses reads" \
+	|| fail "the unbudgeted reader no longer regresses -- the control is dead"
+grep -q "^bud 0$" $LOG/readers.n \
+	&& pass "the budgeted reader never returns a value that was not committed" \
+	|| { fail "the budgeted reader regresses"; cat $LOG/readers; }
+
 echo "== in-kernel self tests =="
 cp -a $HERE/selftest.sh $T/umltest/ 2>/dev/null
 timeout 900 $K mem=1G rootfstype=hostfs rootflags=/ rw \
