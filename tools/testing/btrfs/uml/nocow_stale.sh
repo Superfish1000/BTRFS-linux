@@ -21,10 +21,14 @@
 # parity never held it.
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
-KERNEL=${1:?usage: nocow_stale.sh <kernel> [ndev] [fail-device]}
+KERNEL=${1:?usage: nocow_stale.sh <kernel> [ndev] [fail-device] [log|nolog]}
 NDEV=${2:-4}
 FAIL=${3:-1}
-TAG=nocow-stale
+# "log"    the write-intent log's mount-time recovery does the scrubbing
+# "nolog"  the log is off (noraid56_write_intent) and a plain "btrfs scrub"
+#          does it, which isolates the question to upstream code
+WHO=${4:-log}
+TAG=nocow-stale-$WHO
 PROFILE=raid5:raid1
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
@@ -54,10 +58,18 @@ boot() {	# mode omit mntdev [extra-env]
 MNTPROBE=/dev/ubda; [ "$FAIL" = "0" ] && MNTPROBE=/dev/ubdb
 
 PROBE_SUFFIX=before
-boot nocow_stale none /dev/ubda
+if [ "$WHO" = nolog ]; then
+	boot nocow_stale none /dev/ubda NOLOG=1
+else
+	boot nocow_stale none /dev/ubda
+fi
 boot nocow_probe "$FAIL" $MNTPROBE PROBE=before
 PROBE_SUFFIX=after
-boot nocow_recover none /dev/ubda
+if [ "$WHO" = nolog ]; then
+	boot nocow_scrub none /dev/ubda
+else
+	boot nocow_recover none /dev/ubda
+fi
 boot nocow_probe "$FAIL" $MNTPROBE PROBE=after
 
 before=$(cat $T/umltest/nocow.bad.before.$TAG 2>/dev/null || echo "?")
@@ -65,6 +77,7 @@ after=$(cat $T/umltest/nocow.bad.after.$TAG 2>/dev/null || echo "?")
 echo "==== $TAG ===="
 cat $T/umltest/results.$TAG
 echo
+echo "who scrubbed: $WHO"
 echo "blocks unrecoverable from the parity, device $FAIL omitted:"
 echo "  before recovery: $before"
 echo "  after  recovery: $after"

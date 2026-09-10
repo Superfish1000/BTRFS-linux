@@ -464,7 +464,8 @@ nocow_stale)
 	dm_setup
 	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
-	do_mount $OPTS /dev/mapper/d0
+	do_mount "$OPTS${NOLOG:+,noraid56_write_intent}" /dev/mapper/d0
+	log "log state: $(cat /sys/fs/btrfs/*/raid56_write_intent 2>/dev/null | tr '\n' ' ')"
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
 	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
@@ -495,6 +496,20 @@ nocow_stale)
 	sync
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all
+	finish
+	;;
+nocow_scrub)
+	# The same question asked of plain "btrfs scrub", with the write-intent
+	# log switched off entirely (noraid56_write_intent), so nothing in this
+	# series is involved.  scrub_stripe() passes regen_parity=true
+	# unconditionally, and scrub_verify_one_sector() is upstream code, so
+	# the expectation is that upstream scrub destroys the parity copy just
+	# as the recovery does.
+	do_mount $OPTS,noraid56_write_intent $MNTDEV
+	log "log state: $(cat /sys/fs/btrfs/*/raid56_write_intent 2>/dev/null | tr '\n' ' ')"
+	btrfs scrub start -B $MNT 2>&1 | while read -r l; do log "scrub: $l"; done
+	log "NOCOW_DIRECT bad=$(nocow_bad) of $NOCOW_BLOCKS"
+	umount $MNT || log "UMOUNT_FAIL"
 	finish
 	;;
 nocow_probe)
