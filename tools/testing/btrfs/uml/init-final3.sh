@@ -561,6 +561,9 @@ pausehang)
 	fi
 	echo 0 > /sys/module/btrfs/parameters/raid56_recovery_delay_ms 2>/dev/null
 	stats "after remount"
+	log "pause samples: $(dmesg | grep -c "recovery delay: pause_req")"
+	log "samples with a pauser: $(dmesg | grep "recovery delay: pause_req" | grep -vc "pause_req 0")"
+	dmesg | grep "recovery delay: pause_req" | tail -4 | while read -r l; do log "sample: $l"; done
 	kmsg "blocked for more|scrub|write-intent" 8
 	umount $MNT 2>/dev/null
 	finish

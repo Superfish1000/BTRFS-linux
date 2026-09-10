@@ -1851,8 +1851,24 @@ static int wib_recover_one(struct btrfs_fs_info *fs_info, struct scrub_ctx *sctx
 		return ret;
 
 #ifdef CONFIG_BTRFS_DEBUG
-	if (unlikely(READ_ONCE(btrfs_raid56_recovery_delay_ms) > 0))
-		msleep(READ_ONCE(btrfs_raid56_recovery_delay_ms));
+	if (unlikely(READ_ONCE(btrfs_raid56_recovery_delay_ms) > 0)) {
+		const int ms = READ_ONCE(btrfs_raid56_recovery_delay_ms);
+		int i;
+
+		/*
+		 * Sample the pause protocol while lingering, so a test can see
+		 * whether a pauser ever overlaps the recovery at all rather
+		 * than inferring it from whether something hung.
+		 */
+		for (i = 0; i < ms; i += 100) {
+			btrfs_info(fs_info,
+	"raid56 recovery delay: pause_req %d paused %d running %d",
+				   atomic_read(&fs_info->scrub_pause_req),
+				   atomic_read(&fs_info->scrubs_paused),
+				   atomic_read(&fs_info->scrubs_running));
+			msleep(100);
+		}
+	}
 #endif
 	ret = btrfs_scrub_raid56_full_stripe(fs_info, sctx, *start, trusted);
 	if (ret == -ENOENT) {
