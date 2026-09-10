@@ -387,5 +387,7 @@ int btrfs_wib_try_mark(struct btrfs_wib *wib, u64 logical, u64 len);
 bool btrfs_wib_can_mark(struct btrfs_wib *wib, u64 logical, u64 len);
 void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+int btrfs_wib_snapshot(struct btrfs_fs_info *fs_info, u64 from,
+		       struct btrfs_wib_entry *out);
 
 #endif

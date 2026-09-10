@@ -198,6 +198,13 @@ class Stripe:
 # of the acknowledged value before any scrub gets a chance to.
 LEGACY_READ = False
 
+# The refuted refinement, kept as a control: record the outcome only for a
+# write the caller was told succeeded.  It sounds like the careful choice and
+# is the opposite -- see policy_prove_or_preserve() and the comment in
+# rmw_rbio().  Default False, i.e. the kernel's behaviour: record what the
+# devices did, and judge proof later.
+ONLY_CLAIM_ON_ACKED = False
+
 
 def rmw_effective_disk(s):
     """What the read phase of an RMW hands to the parity computation.
@@ -270,16 +277,26 @@ def rmw(st, cols, val, fail, require_parity):
         pass
 
     if fail:
-        # The log records the blocks of the write, and separately which of
-        # them a failed DATA write left stale.
+        # The log records the blocks of the write.  This much is true however
+        # the write ended: something touched this stripe and went wrong.
         s.sticky = s.sticky | frozenset(cols)
-        s.stale = s.stale | frozenset(i for i in cols if i in fail)
-        s.stale_par = s.stale_par | frozenset(
-            k for k in range(s.nr_parity) if s.nr_data + k in fail)
-    # A data write that lands clears any stale record for that column.
-    s.stale = s.stale - frozenset(i for i in cols if i not in fail)
-    s.stale_par = s.stale_par - frozenset(
-        k for k in range(s.nr_parity) if s.nr_data + k not in fail)
+    if acked or not ONLY_CLAIM_ON_ACKED:
+        # And separately, WHICH member each write left stale.  These fields
+        # state what the DEVICES did; whether that amounts to proof is judged
+        # later by the repair policy.  Recording only acknowledged writes
+        # sounds more careful and is the opposite: a refused write whose
+        # parity landed leaves that parity describing a vector nobody
+        # committed, and unless the record says so the budget believes the
+        # parity is usable and rebuilds live data out of it.  Set
+        # --only-claim-on-acked and the misrepairs appear.
+        if fail:
+            s.stale = s.stale | frozenset(i for i in cols if i in fail)
+            s.stale_par = s.stale_par | frozenset(
+                k for k in range(s.nr_parity) if s.nr_data + k in fail)
+        # A data write that lands clears any stale record for that column.
+        s.stale = s.stale - frozenset(i for i in cols if i not in fail)
+        s.stale_par = s.stale_par - frozenset(
+            k for k in range(s.nr_parity) if s.nr_data + k not in fail)
     s.trace = s.trace + (("rmw", tuple(cols), val, tuple(sorted(fail)),
                           "ack" if acked else "EIO"),)
     return s
@@ -418,6 +435,43 @@ def policy_stale_rebuild(s):
     return _stale_rebuild(s, avoid_stale_par=True)
 
 
+def policy_prove_or_preserve(s):
+    """What the kernel does now: repair what can be proved, preserve what
+    cannot, never guess.
+
+      - a column whose content carries its own proof (a checksum, or a metadata
+        tree block) is left to the ordinary scrub path and never blocked;
+      - a column the log NAMES -- recorded stale, which only an acknowledged
+        write whose own data write failed can do -- is rebuilt from the parity
+        and written back, and then the record is retired;
+      - if the named columns outnumber the parities still usable, nothing is
+        touched at all and the record is kept.
+
+    The model has no notion of per-sector checksums, so this stands in for the
+    unchecksummed case, which is the only one where the record decides
+    anything.
+    """
+    if not _rebuild_missing_data(s):
+        return {"abort"}
+    holes, good_par = stale_budget(s)
+    if not holes:
+        # Nothing named.  Ordinary scrub, and the record has done its job.
+        if _regen(s):
+            return {"regen", "retired"}
+        return set()
+    if len(holes) > len(good_par) or any(s.missing[d] for d in holes):
+        s.reported = True
+        return {"preserved"}
+    k = good_par[0]
+    for d in holes:
+        s.disk[d] = s.par[k][d]
+    tags = {"rebuilt"}
+    if _regen(s):
+        tags.add("regen")
+        tags.add("retired")
+    return tags
+
+
 def policy_stale_skip(s):
     """The smallest change to scrub that is still sound: if the log records
     any data column of this full stripe stale, leave the parity alone and keep
@@ -538,13 +592,14 @@ POLICIES = {
     "stale-rebuild-naive": policy_stale_rebuild_naive,
     "stale-budgeted": policy_stale_budgeted,
     "stale-skip": policy_stale_skip,
+    "prove-or-preserve": policy_prove_or_preserve,
     "localise": policy_localise,
     "localise-derate": policy_localise_derate,
 }
 
 # Policies that need the stale record to have survived the mount boundary.
 NEEDS_PERSIST = {"stale-rebuild", "stale-rebuild-naive", "stale-budgeted",
-                 "stale-skip"}
+                 "stale-skip", "prove-or-preserve"}
 # Policies that only mean anything with two parities.
 NEEDS_RAID6 = {"localise", "localise-derate"}
 
@@ -831,6 +886,9 @@ def main():
     ap.add_argument("--replacing", type=int, default=None,
                     help="device index under replace")
     ap.add_argument("--max-report", type=int, default=3)
+    ap.add_argument("--only-claim-on-acked", action="store_true",
+                    help="record the outcome only for an acknowledged write "
+                         "(a refuted refinement, kept as a control)")
     ap.add_argument("--legacy-read", action="store_true",
                     help="the read phase of an RMW ignores the stale record, "
                          "as stock upstream does")
@@ -846,9 +904,10 @@ def main():
     ap.add_argument("--self-check", action="store_true",
                     help="fail unless the upstream policy reproduces DESTROY")
     args = ap.parse_args()
-    global CONSERVATIVE_PARITY, LEGACY_READ
+    global CONSERVATIVE_PARITY, LEGACY_READ, ONLY_CLAIM_ON_ACKED
     CONSERVATIVE_PARITY = args.conservative_parity
     LEGACY_READ = args.legacy_read
+    ONLY_CLAIM_ON_ACKED = args.only_claim_on_acked
 
     if args.all_readers:
         return run_all_readers(args)

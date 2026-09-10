@@ -1045,6 +1045,13 @@ nocow_persist_scrub)
 	btrfs scrub start -B $MNT 2>&1 | while read -r l; do log "scrub: $l"; done
 	stats "after scrub"
 	kmsg "scrub|write-intent" 6
+	# Did the scrub REPAIR, or merely decline to make things worse?  A
+	# record that survives the scrub is a stripe whose redundancy was never
+	# restored, and it will never be restored: nothing else retires one.
+	sticky_after=$(sed -n 's/.*sticky_blocks \([0-9]*\).*/\1/p' \
+		/sys/fs/btrfs/*/raid56_write_intent 2>/dev/null | head -1)
+	log "NOCOW_STICKY_AFTER_SCRUB $sticky_after"
+	echo "${sticky_after:-?}" > $T/umltest/nocow.sticky.$TAG
 	log "NOCOW_DIRECT bad=$(nocow_bad) of $NOCOW_BLOCKS"
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all 2>/dev/null

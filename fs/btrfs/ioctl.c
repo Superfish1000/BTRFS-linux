@@ -5585,6 +5585,86 @@ out_unlock:
 	return ret;
 }
 
+/*
+ * Report what the RAID5/6 write-intent log knows, so that a recovery helper
+ * can work on what the kernel would not repair.
+ *
+ * The kernel repairs a stripe only where it can prove the repair and leaves
+ * the rest exactly as it found it.  That is deliberate -- a rebuild that runs
+ * out of equations does not fail loudly for data without a checksum, it
+ * returns a value nothing ever committed -- but it means something has to
+ * carry the rest forward.  This does: the records, uninterpreted, so a tool
+ * can map them to files with BTRFS_IOC_LOGICAL_INO and offer candidates for a
+ * human or a format-aware check to choose between, without writing anything.
+ *
+ * CAP_SYS_ADMIN: the addresses here describe where other tenants' data lives.
+ */
+static int btrfs_ioctl_raid56_stale_stripes(struct btrfs_fs_info *fs_info,
+					    void __user *argp)
+{
+	struct btrfs_ioctl_raid56_stale_args args;
+	struct btrfs_ioctl_raid56_stale_entry __user *uentry;
+	struct btrfs_wib_entry *snap;
+	u64 max_entries;
+	int nr, copied = 0;
+	int ret = 0;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (copy_from_user(&args, argp, sizeof(args)))
+		return -EFAULT;
+	if (args.flags || args.reserved)
+		return -EINVAL;
+	if (!fs_info->wib)
+		return -EOPNOTSUPP;
+
+	max_entries = div_u64(args.buf_size, sizeof(*uentry));
+	if (!max_entries)
+		return -ENOBUFS;
+
+	snap = kvcalloc(BTRFS_WIB_NR_ENTRIES, sizeof(*snap), GFP_KERNEL);
+	if (!snap)
+		return -ENOMEM;
+
+	nr = btrfs_wib_snapshot(fs_info, args.bytenr, snap);
+	if (nr > max_entries)
+		nr = max_entries;
+
+	uentry = (struct btrfs_ioctl_raid56_stale_entry __user *)
+		 (argp + offsetof(struct btrfs_ioctl_raid56_stale_args, buf));
+	for (int i = 0; i < nr; i++) {
+		const struct btrfs_ioctl_raid56_stale_entry e = {
+			.bytenr = snap[i].bytenr,
+			.bitmap = snap[i].bitmap,
+			.sticky = snap[i].sticky,
+			.stale = snap[i].stale,
+			.stale_par = snap[i].stale_par,
+		};
+
+		if (copy_to_user(&uentry[i], &e, sizeof(e))) {
+			ret = -EFAULT;
+			goto out;
+		}
+		copied++;
+	}
+	args.nr_entries = copied;
+	args.buf_size = (u64)copied * sizeof(*uentry);
+	/*
+	 * Where to resume.  One past the last region reported, so a caller
+	 * with a small buffer can walk the whole table; the log is live, so
+	 * what it sees is a series of snapshots rather than one consistent
+	 * view, which is why a helper should act on what it is given rather
+	 * than assume it can come back for it.
+	 */
+	if (copied)
+		args.bytenr = snap[copied - 1].bytenr + BTRFS_WIB_ENTRY_SIZE;
+	if (copy_to_user(argp, &args, sizeof(args)))
+		ret = -EFAULT;
+out:
+	kvfree(snap);
+	return ret;
+}
+
 long btrfs_ioctl(struct file *file, unsigned int
 		cmd, unsigned long arg)
 {
@@ -5748,6 +5828,8 @@ long btrfs_ioctl(struct file *file, unsigned int
 		return btrfs_ioctl_shutdown(fs_info, arg);
 	case BTRFS_IOC_GET_CSUMS:
 		return btrfs_ioctl_get_csums(file, argp);
+	case BTRFS_IOC_RAID56_STALE_STRIPES:
+		return btrfs_ioctl_raid56_stale_stripes(fs_info, argp);
 	}
 
 	return -ENOTTY;

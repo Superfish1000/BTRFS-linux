@@ -1143,6 +1143,68 @@ struct btrfs_ioctl_get_csums_args {
 	__u8 buf[];
 };
 
+/*
+ * One region of the RAID5/6 write-intent log, exported so that a recovery
+ * helper can see what the kernel knows and what it does not.
+ *
+ * The kernel repairs a stripe only when it can prove the repair, and preserves
+ * the rest rather than guessing.  This is the preserved half: enough to map an
+ * affected stripe back to files (BTRFS_IOC_LOGICAL_INO, BTRFS_IOC_INO_PATHS)
+ * and to compute the candidate reconstructions from the devices, without the
+ * helper writing anything until a human or a format-aware check has chosen.
+ *
+ * The four bitmaps are the kernel's own record, uninterpreted.  Bit i of each
+ * covers [bytenr + i * 64KiB, + 64KiB), which is one data column of one full
+ * stripe.  What they mean is the whole point of the interface:
+ *
+ *   @stale     is the KNOWN half.  Bit i is set only where a write supplied
+ *              that data column and that column's own write failed, so the
+ *              value the caller was told was stored survives in the parity and
+ *              not on the disk.  It names a member.
+ *   @sticky    is the UNKNOWN half.  Bit i says a write touching that block
+ *              went wrong without saying which member; @stale is a subset of
+ *              it, so (sticky & ~stale) is exactly "something happened here
+ *              and nothing can say what".
+ *   @stale_par bit i: a parity of the full stripe that STARTS at block i does
+ *              not describe the data on disk, so it is not usable as a source.
+ *              Parity p of that stripe is bit i + p.
+ *   @bitmap    a write to that block was in flight when the log was last
+ *              written, i.e. the filesystem crashed in the middle of it.
+ *
+ * The kernel repairs a full stripe when the columns it cannot believe -- those
+ * in @stale, plus any on a device that is missing -- are no more numerous than
+ * the parities it can still use -- those present and not named in @stale_par.
+ * A helper can apply the same test; anything failing it is what was left for a
+ * human to decide.
+ *
+ * Records are lost when the log fills and an entry is evicted, so a helper
+ * should take what it needs when it sees it rather than assume it can come
+ * back later.
+ */
+struct btrfs_ioctl_raid56_stale_entry {
+	/* 4MiB-aligned base of the region these bitmaps describe. */
+	__u64 bytenr;
+	__u64 bitmap;
+	__u64 sticky;
+	__u64 stale;
+	__u64 stale_par;
+};
+
+struct btrfs_ioctl_raid56_stale_args {
+	/* In/out: report regions at or after this address; updated to resume. */
+	__u64 bytenr;
+	/* In/out: buffer capacity in bytes / bytes written. */
+	__u64 buf_size;
+	/* In: flags, must be 0 for now. */
+	__u64 flags;
+	/* Out: regions written to buf. */
+	__u32 nr_entries;
+	/* Padding, must be 0. */
+	__u32 reserved;
+	/* Out: entries of type btrfs_ioctl_raid56_stale_entry. */
+	__u8 buf[];
+};
+
 /* Flags for IOC_SHUTDOWN, must match XFS_FSOP_GOING_FLAGS_* flags. */
 #define BTRFS_SHUTDOWN_FLAGS_DEFAULT			0x0
 #define BTRFS_SHUTDOWN_FLAGS_LOGFLUSH			0x1
@@ -1271,6 +1333,8 @@ struct btrfs_ioctl_get_csums_args {
 					struct btrfs_ioctl_subvol_wait)
 #define BTRFS_IOC_GET_CSUMS _IOWR(BTRFS_IOCTL_MAGIC, 66, \
 				  struct btrfs_ioctl_get_csums_args)
+#define BTRFS_IOC_RAID56_STALE_STRIPES _IOWR(BTRFS_IOCTL_MAGIC, 67, \
+					     struct btrfs_ioctl_raid56_stale_args)
 
 /* Shutdown ioctl should follow XFS's interfaces, thus not using btrfs magic. */
 #define BTRFS_IOC_SHUTDOWN	_IOR('X', 125, __u32)

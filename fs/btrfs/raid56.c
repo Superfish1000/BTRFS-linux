@@ -1866,8 +1866,24 @@ static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
 
 		if (!(add & BIT(i)))
 			continue;
-		for (int nr = 0; nr < rbio->stripe_nsectors; nr++)
+		for (int nr = 0; nr < rbio->stripe_nsectors; nr++) {
+			/*
+			 * Leave a sector that has a checksum to its checksum.
+			 * That is the stronger evidence and it is about to be
+			 * checked a few lines below: if the sector really is
+			 * stale it fails and gets rebuilt anyway, and if it
+			 * passes then the record is a false positive and
+			 * overriding a verified sector with a reconstruction
+			 * would be a guess.  This record exists for the
+			 * sectors that have nothing else -- see
+			 * rmw_update_stale_data(), which sets it for any
+			 * failed sub-stripe write and not only for those.
+			 */
+			if (i < rbio->nr_data && rbio->csum_bitmap &&
+			    test_bit(first + nr, rbio->csum_bitmap))
+				continue;
 			set_bit(first + nr, rbio->error_bitmap);
+		}
 	}
 }
 
@@ -3228,9 +3244,32 @@ out:
 		 * the parity.  One log block is one BTRFS_STRIPE_LEN, so a data
 		 * stripe is exactly one block of the recorded range.
 		 *
-		 * Unconditionally, not only when something failed: a write that
-		 * lands on a column previously recorded stale is what makes it
-		 * current again.
+		 * Unconditionally, and in particular whether or not the write
+		 * as a whole was acknowledged.  It is tempting to record this
+		 * only for a write the caller was told succeeded -- a refused
+		 * write acknowledged nothing, so calling a column stale there
+		 * looks like claiming proof we do not have.  That is the wrong
+		 * layer.  These fields state what the DEVICES did; whether that
+		 * amounts to proof is judged later, by the repair policy, which
+		 * rebuilds a named column only when the columns it cannot
+		 * believe are no more numerous than the parities it can still
+		 * use.
+		 *
+		 * Recording only acknowledged writes breaks that judgement in
+		 * both directions, and the model says so
+		 * (tools/testing/btrfs/scrub_policy_model.py --policy
+		 * prove-or-preserve --only-claim-on-acked): 480 misrepairs and
+		 * 297 destroyed stripes at RAID5 depth 3, against none for
+		 * recording unconditionally.  A refused write whose parity
+		 * landed leaves that parity describing a vector nobody
+		 * committed, and unless the record says so the budget believes
+		 * the parity is a usable source and rebuilds live data out of
+		 * it.
+		 *
+		 * The clearing half matters just as much: a write that lands on
+		 * a column previously recorded stale is what makes it current
+		 * again, and skipping that for a refused write leaves a stale
+		 * mark on the one column that is now right.
 		 */
 		rmw_update_stale_data(rbio, full_stripe_start);
 		rmw_update_stale_parity(rbio, full_stripe_start);

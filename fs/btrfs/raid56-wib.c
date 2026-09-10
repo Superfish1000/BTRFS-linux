@@ -1562,6 +1562,46 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	return stale;
 }
 
+static int wib_pending_cmp(const void *a, const void *b);
+
+/*
+ * Copy the regions the log holds a fault record for into @out, lowest address
+ * first, skipping anything below @from.  @out must have room for
+ * BTRFS_WIB_NR_ENTRIES.  Returns how many were written.
+ *
+ * Only regions with a fault record are reported.  An entry that merely has
+ * writes in flight is an ordinary write happening right now, and on a healthy
+ * array that is nearly the whole table; a tool looking for damage would have
+ * to filter it out again, and would have to do so on a snapshot that is
+ * already stale.  What crashed mid-write is not lost by this: the next mount
+ * recovers those stripes and keeps a fault record for any it could not finish.
+ */
+int btrfs_wib_snapshot(struct btrfs_fs_info *fs_info, u64 from,
+		       struct btrfs_wib_entry *out)
+{
+	unsigned long flags;
+	struct btrfs_wib *wib = fs_info->wib;
+	int nr = 0;
+
+	if (!wib)
+		return 0;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
+		const struct btrfs_wib_entry *e = &wib->entries[i];
+
+		if (!wib_entry_used(e) || !e->sticky)
+			continue;
+		if (e->bytenr < from)
+			continue;
+		out[nr++] = *e;
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+
+	sort(out, nr, sizeof(*out), wib_pending_cmp, NULL);
+	return nr;
+}
+
 void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
 	unsigned long flags;

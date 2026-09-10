@@ -67,6 +67,8 @@ arm() {	# nopersist -> echoes "<bad>"
 	cat $T/umltest/nocow.bad.after.$tag 2>/dev/null || echo "?"
 }
 
+sticky_after() { cat $T/umltest/nocow.sticky.nocow-persist-$1 2>/dev/null || echo "?"; }
+
 echo "== with the record persisted =="
 fixed=$(arm 0)
 grep -hE 'overwrites:|scrub:|NOCOW_DIRECT|scrub_skipped_stale' \
@@ -92,4 +94,19 @@ if [ "$fixed" -gt 0 ] 2>/dev/null; then
 	echo "RESULT: FAIL -- the scrub still destroyed $fixed block(s)"
 	exit 1
 fi
-echo "RESULT: PASS -- control destroyed $ctl, persisted destroyed 0"
+
+# Surviving is not the same as repaired.  The record must be RETIRED: nothing
+# else ever clears one, so a stripe still recorded after a scrub is a stripe
+# whose redundancy is never restored.
+fixed_sticky=$(sticky_after 0)
+echo "records still held after the scrub: $fixed_sticky"
+if [ "$fixed_sticky" = "?" ]; then
+	echo "RESULT: INCONCLUSIVE -- the scrub boot did not report its record count"
+	exit 2
+fi
+if [ "$fixed_sticky" -ne 0 ] 2>/dev/null; then
+	echo "RESULT: FAIL -- the data survived but $fixed_sticky record(s) were not"
+	echo "        retired, so the parity of those stripes was never regenerated"
+	exit 1
+fi
+echo "RESULT: PASS -- control destroyed $ctl, persisted destroyed 0, all records retired"

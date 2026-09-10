@@ -180,6 +180,20 @@ struct scrub_stripe {
 	 */
 	u8 *csums;
 
+	/*
+	 * The write-intent log knows this data column's last write did not
+	 * reach the disk, and the sectors that carry no checksum of their own
+	 * have nothing else that could say so.  Rebuild those from the parity
+	 * rather than believing them: set after verification in
+	 * scrub_stripe_read_repair_worker(), because scrub_verify_one_sector()
+	 * clears the error bit of an unchecksummed sector before that
+	 * ("we have no other choice but to trust it").
+	 *
+	 * Only set where the rebuild is PROVABLE -- see
+	 * scrub_raid56_parity_stripe(), which decides per full stripe.
+	 */
+	bool wib_rebuild;
+
 	struct work_struct work;
 };
 
@@ -1204,6 +1218,43 @@ static void scrub_write_sectors(struct scrub_ctx *sctx, struct scrub_stripe *str
  * Writeback for dev-replace does not happen here, it needs extra
  * synchronization for zoned devices.
  */
+/*
+ * Mark the sectors of a data column that the write-intent log proved stale and
+ * that nothing else can check.
+ *
+ * Runs after scrub_verify_one_stripe(), which is the whole point: for a sector
+ * without a checksum that function clears the error bit rather than leaving it
+ * set, because on its own it has nothing to verify against.  The log does.
+ *
+ * A sector holding metadata is left alone even without a data checksum: a tree
+ * block carries its own header and generation, scrub_verify_one_metadata()
+ * checks them, and that is the stronger evidence.  Likewise a sector that has a
+ * checksum -- if it is really stale the checksum has already failed and the
+ * repair below rebuilds it anyway.
+ *
+ * What is left is exactly the case this record exists for.
+ */
+static void scrub_mark_wib_stale_sectors(struct scrub_stripe *stripe)
+{
+	const unsigned long has_extent = scrub_bitmap_read_has_extent(stripe);
+	const unsigned long is_metadata = scrub_bitmap_read_is_metadata(stripe);
+	int sector_nr;
+	int nr_marked = 0;
+
+	for_each_set_bit(sector_nr, &has_extent, stripe->nr_sectors) {
+		if (test_bit(sector_nr, &is_metadata))
+			continue;
+		if (stripe->sectors[sector_nr].csum)
+			continue;
+		scrub_bitmap_set_bit_error(stripe, sector_nr);
+		nr_marked++;
+	}
+	if (nr_marked)
+		btrfs_warn_rl(stripe->bg->fs_info,
+"scrub: rebuilding %d sector(s) at %llu from the parity: the write-intent log records their last write as not having reached the disk, and without a checksum nothing else can tell",
+			      nr_marked, stripe->logical);
+}
+
 static void scrub_stripe_read_repair_worker(struct work_struct *work)
 {
 	struct scrub_stripe *stripe = container_of(work, struct scrub_stripe, work);
@@ -1221,6 +1272,8 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
 
 	wait_scrub_stripe_io(stripe);
 	scrub_verify_one_stripe(stripe, scrub_bitmap_read_has_extent(stripe));
+	if (unlikely(stripe->wib_rebuild))
+		scrub_mark_wib_stale_sectors(stripe);
 	/* Save the initial failed bitmap for later repair and report usage. */
 	errors.init_error_bitmap = scrub_bitmap_read_error(stripe);
 	errors.nr_io_errors = scrub_bitmap_weight_io_error(stripe);
@@ -1818,6 +1871,7 @@ static void scrub_reset_stripe(struct scrub_stripe *stripe)
 	stripe->nr_meta_extents = 0;
 	stripe->nr_data_extents = 0;
 	stripe->state = 0;
+	stripe->wib_rebuild = false;
 
 	for (int i = 0; i < stripe->nr_sectors; i++) {
 		stripe->sectors[i].csum = NULL;
@@ -2232,6 +2286,112 @@ out:
  * the parity is recomputed from every sector of a vertical stripe that
  * holds an extent, including sectors this scrub could not verify.
  */
+/*
+ * What the write-intent log lets this scrub do about one full stripe.
+ *
+ * Repair what can be proved, preserve what cannot, never guess.  The record
+ * distinguishes the two by construction: @stale is set only where the rbio
+ * supplied that data column and that column's own write failed, so it names a
+ * member.  @sticky without @stale says a write went wrong somewhere in the
+ * stripe without saying where, and there is nothing to act on in that.
+ */
+enum scrub_wib_plan {
+	/* Nothing recorded, or nothing recorded that needs our help. */
+	SCRUB_WIB_NONE,
+	/* Named members, and enough good parity to rebuild them. */
+	SCRUB_WIB_PROVEN,
+	/* Named members, but not enough left to rebuild them without guessing. */
+	SCRUB_WIB_AMBIGUOUS,
+};
+
+/*
+ * Does this data column hold anything only the log can vouch for?
+ *
+ * A sector with a data checksum, or a metadata sector with its tree-block
+ * header and generation, carries its own proof and the ordinary scrub path
+ * verifies and repairs it.  Blocking that would be the opposite of helping.
+ */
+static bool scrub_stripe_has_unverifiable(struct scrub_stripe *stripe)
+{
+	const unsigned long has_extent = scrub_bitmap_read_has_extent(stripe);
+	const unsigned long is_metadata = scrub_bitmap_read_is_metadata(stripe);
+	int sector_nr;
+
+	for_each_set_bit(sector_nr, &has_extent, stripe->nr_sectors) {
+		if (test_bit(sector_nr, &is_metadata))
+			continue;
+		if (!stripe->sectors[sector_nr].csum)
+			return true;
+	}
+	return false;
+}
+
+static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
+						 struct btrfs_chunk_map *map,
+						 u64 full_stripe_start,
+						 int data_stripes,
+						 u32 *holes_out)
+{
+	struct btrfs_fs_info *fs_info = sctx->fs_info;
+	const int nr_parity = map->num_stripes - data_stripes;
+	struct btrfs_wib_stripe_state st;
+	u32 holes = 0;
+	int nr_good_par = 0;
+
+
+	*holes_out = 0;
+	if (likely(!btrfs_wib_any_stale(fs_info)))
+		return SCRUB_WIB_NONE;
+	if (data_stripes > 32 || nr_parity > 2)
+		return SCRUB_WIB_NONE;
+	if (!btrfs_wib_stripe_state(fs_info, full_stripe_start, data_stripes,
+				    nr_parity, &st))
+		return SCRUB_WIB_NONE;
+
+	/*
+	 * Columns that cannot be believed: recorded stale with something in
+	 * them that has no proof of its own, or on a device that is not there.
+	 */
+	for (int i = 0; i < data_stripes; i++) {
+		struct scrub_stripe *stripe = &sctx->raid56_data_stripes[i];
+
+		if (!stripe->dev || !stripe->dev->bdev) {
+			holes |= BIT(i);
+			continue;
+		}
+		if (!(st.stale_cols & BIT_ULL(i)))
+			continue;
+		if (scrub_stripe_has_unverifiable(stripe))
+			holes |= BIT(i);
+	}
+	if (!holes)
+		return SCRUB_WIB_NONE;
+
+	/* Parities that can still be used as a source. */
+	for (int p = 0; p < nr_parity; p++) {
+		const struct btrfs_device *dev = map->stripes[data_stripes + p].dev;
+
+		if (dev && dev->bdev && !(st.bad_parity & BIT(p)))
+			nr_good_par++;
+	}
+
+	*holes_out = holes;
+	/*
+	 * More unknowns than equations: the reconstruction is not determined,
+	 * and without a checksum a rebuild that runs out of equations does not
+	 * fail loudly, it returns a value nothing ever committed.  Leave every
+	 * byte of the stripe alone, keep the record, and let a recovery tool
+	 * that can involve a human decide.
+	 */
+	if (hweight32(holes) > nr_good_par)
+		return SCRUB_WIB_AMBIGUOUS;
+
+	for (int i = 0; i < data_stripes; i++)
+		if (holes & BIT(i))
+			sctx->raid56_data_stripes[i].wib_rebuild = true;
+	return SCRUB_WIB_PROVEN;
+}
+
 static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 				      struct btrfs_device *scrub_dev,
 				      struct btrfs_block_group *bg,
@@ -2244,7 +2404,10 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 	struct scrub_stripe *stripe;
 	bool all_empty = true;
 	const int data_stripes = nr_data_stripes(map);
+	const u64 fstripe_len = btrfs_stripe_nr_to_offset(data_stripes);
 	unsigned long extent_bitmap = 0;
+	enum scrub_wib_plan plan;
+	u32 wib_holes = 0;
 	int ret;
 
 	ASSERT(sctx->raid56_data_stripes);
@@ -2316,6 +2479,15 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 		}
 	}
 
+	/*
+	 * Decide now what the write-intent log lets us do here, while the
+	 * extent and checksum information is in hand and before any read is
+	 * submitted: a column we can prove stale has to be flagged before its
+	 * repair worker runs.
+	 */
+	plan = scrub_raid56_plan_wib(sctx, map, full_stripe_start, data_stripes,
+				     &wib_holes);
+
 	/* Check if all data stripes are empty. */
 	for (int i = 0; i < data_stripes; i++) {
 		stripe = &sctx->raid56_data_stripes[i];
@@ -2376,45 +2548,41 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 		return 0;
 
 	/*
-	 * The write-intent log may know that a data column of this full stripe
-	 * holds content a failed write left stale, so that what was
-	 * acknowledged survives only in the parity.  A nodatacow sector has no
-	 * checksum, scrub_verify_one_sector() has no choice but to trust it,
-	 * and recomputing the parity from it below would throw away the last
-	 * copy -- which is exactly the defect this whole series is about,
-	 * measured at 8 of 32 acknowledged blocks lost with scrub reporting no
-	 * errors at all.
-	 *
-	 * Leave the parity alone and leave the stripe recorded.  A stripe
-	 * whose redundancy is not restored is worse than one that is; it is
-	 * very much better than one whose data is gone.
-	 *
-	 * Model: tools/testing/btrfs/scrub_policy_model.py --all.  Skipping is
-	 * clean on every axis the model checks, where regenerating destroys
-	 * committed data in 1488 of 8386 RAID5 states and 6291 of 41791 RAID6
-	 * states.  Rebuilding the stale column FROM the parity first and then
-	 * regenerating is clean too and leaves far fewer stripes unrepaired
-	 * (259 against 973 on RAID5, 2718 against 9705 on RAID6); it needs a
-	 * write-back path scrub does not have here yet.
+	 * Genuinely ambiguous: the log names members it cannot vouch for and
+	 * there is not enough good parity left to rebuild them.  Recomputing
+	 * the parity here would destroy the only surviving copy of what was
+	 * acknowledged, and rebuilding the data would invent a value nothing
+	 * ever committed.  Do neither.  Leave every byte as it is, keep the
+	 * record, and say so loudly enough that a recovery tool -- and a human
+	 * -- can pick it up; btrfs_wib_stripe_state() still describes exactly
+	 * which members are named and which are merely suspect.
 	 */
-	if (unlikely(btrfs_wib_any_stale(fs_info))) {
-		struct btrfs_wib_stripe_state st;
-
-		if (btrfs_wib_stripe_state(fs_info, full_stripe_start, data_stripes,
-					   map->num_stripes - data_stripes, &st) &&
-		    st.stale_cols) {
-			atomic64_inc(&fs_info->wib->stat_scrub_skipped_stale);
-			btrfs_warn_rl(fs_info,
-"scrub: full stripe %llu has %u data stripe(s) whose last write did not reach the disk; leaving its parity alone, because for data without a checksum that parity is the only copy of what was acknowledged",
-				      full_stripe_start,
-				      (unsigned int)hweight64(st.stale_cols));
-			return 0;
-		}
+	if (plan == SCRUB_WIB_AMBIGUOUS) {
+		atomic64_inc(&fs_info->wib->stat_scrub_skipped_stale);
+		btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu left untouched: %u data stripe(s) whose last write did not reach the disk cannot be rebuilt from the parity that is left, and without a checksum there is nothing to decide it with -- keeping the record rather than guessing",
+			      full_stripe_start, hweight32(wib_holes));
+		return 0;
 	}
 
 	/* Now we can check and regenerate the P/Q stripe. */
-	return scrub_raid56_cached_parity(sctx, scrub_dev, map, full_stripe_start,
-					  &extent_bitmap);
+	ret = scrub_raid56_cached_parity(sctx, scrub_dev, map, full_stripe_start,
+					 &extent_bitmap);
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * Everything that could be checked was checked, everything that had to
+	 * be rebuilt was rebuilt and written back, and the parity now describes
+	 * the data on disk.  The record has done its job, so retire it.
+	 *
+	 * Not while read-only: scrub_stripe_read_repair_worker() skips the
+	 * write-back then, so the sectors this claims to have repaired are
+	 * still stale on the disk and the record is the only thing that knows.
+	 */
+	if (!sctx->readonly)
+		btrfs_wib_clear_sticky(fs_info, full_stripe_start, fstripe_len);
+	return 0;
 }
 
 /*
