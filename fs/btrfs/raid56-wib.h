@@ -57,6 +57,18 @@ struct btrfs_fs_info;
 #define BTRFS_WIB_ENTRY_SHIFT		(BTRFS_WIB_BLOCK_SHIFT + 6)
 #define BTRFS_WIB_ENTRY_SIZE		(1ULL << BTRFS_WIB_ENTRY_SHIFT)
 
+/*
+ * Format 1: no stale record.  Written by earlier versions of this feature,
+ * read here so that upgrading does not throw a log away -- ignoring one
+ * leaves the stripes it covers unrecovered, which is the whole thing the
+ * feature exists to prevent.  Never written.
+ */
+struct btrfs_wib_disk_entry_v1 {
+	__le64 bytenr;
+	__le64 bitmap;
+	__le64 error;
+} __packed;
+
 struct btrfs_wib_disk_entry {
 	/* BTRFS_WIB_ENTRY_SIZE aligned logical address. */
 	__le64 bytenr;
@@ -69,6 +81,38 @@ struct btrfs_wib_disk_entry {
 	 * sectors (see btrfs_wib_recover()).
 	 */
 	__le64 error;
+	/*
+	 * Bit i set: the DATA of that block on disk is not what was
+	 * acknowledged -- the acknowledged value survives only in the parity.
+	 * A strict subset of @error.
+	 *
+	 * @error says a write went wrong; it does not say which SIDE of the
+	 * stripe is wrong, and the two need opposite repairs.  If the data is
+	 * stale, recomputing the parity from it destroys the last copy of what
+	 * was acknowledged; if only the parity is stale, recomputing it from
+	 * the data is exactly the right repair.  For nodatacow data there is
+	 * no checksum to tell them apart, so this record is the only thing
+	 * that can.
+	 *
+	 * Persisted because the protection is worth nothing otherwise: an
+	 * exhaustive model of the scrub decision
+	 * (tools/testing/btrfs/scrub_policy_model.py) scores the scrub fix at
+	 * 0 stripes destroyed with this record available and 1488 of 8386
+	 * RAID5 states destroyed without it, which is upstream's own score.
+	 */
+	__le64 stale;
+	/*
+	 * Bit (b + p), where b is the block at a full stripe's start: parity p
+	 * of that stripe does not describe the data on disk.  nr_data is at
+	 * least 2 for every RAID5/6 chunk, so those bits always belong to the
+	 * stripe they describe and never to the next one.
+	 *
+	 * Needed alongside @stale rather than folded into it: rebuilding a
+	 * stale data column out of a parity that is itself stale returns a
+	 * value that was never committed anywhere, which is how a record meant
+	 * to protect data ends up destroying it.
+	 */
+	__le64 stale_par;
 } __packed;
 
 struct btrfs_wib_disk_header {
@@ -89,6 +133,18 @@ struct btrfs_wib_disk_header {
 #define BTRFS_WIB_MAX_ENTRIES						\
 	((BTRFS_WIB_SLOT_SIZE - sizeof(struct btrfs_wib_disk_header)) /	\
 	 sizeof(struct btrfs_wib_disk_entry))
+#define BTRFS_WIB_MAX_ENTRIES_V1					\
+	((BTRFS_WIB_SLOT_SIZE - sizeof(struct btrfs_wib_disk_header)) /	\
+	 sizeof(struct btrfs_wib_disk_entry_v1))
+
+/*
+ * Header flags.  btrfs_wib_block_valid() rejects a block carrying any bit not
+ * listed here: an unknown bit means a format this kernel cannot read, and
+ * guessing at one could scrub the wrong stripes or silently skip the right
+ * ones.
+ */
+#define BTRFS_WIB_FLAG_STALE		(1ULL << 0)
+#define BTRFS_WIB_FLAGS_SUPPORTED	BTRFS_WIB_FLAG_STALE
 
 /* In-memory entry, mirrors the on-disk one. */
 struct btrfs_wib_entry {
@@ -305,8 +361,11 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed);
 u64 btrfs_wib_range_mask(u64 bytenr, u64 logical, u64 len);
 int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const void *base);
 bool btrfs_wib_block_valid(const struct btrfs_fs_info *fs_info, const void *block);
+/* Decode entry @i of an on-disk block, whichever format it is in. */
+void btrfs_wib_read_entry(const void *block, u32 i, struct btrfs_wib_entry *out);
 bool btrfs_wib_block_drops(const void *old, const void *new);
-int btrfs_wib_add_pending(struct btrfs_wib *wib, u64 bytenr, u64 bitmap, u64 error);
+int btrfs_wib_add_pending(struct btrfs_wib *wib,
+			  const struct btrfs_wib_entry *src);
 void btrfs_wib_finalize_pending(struct btrfs_wib *wib);
 int btrfs_wib_try_mark(struct btrfs_wib *wib, u64 logical, u64 len);
 bool btrfs_wib_can_mark(struct btrfs_wib *wib, u64 logical, u64 len);

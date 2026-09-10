@@ -1000,6 +1000,56 @@ nocow_scrub)
 	umount $MNT || log "UMOUNT_FAIL"
 	finish
 	;;
+nocow_persist_prep)
+	# Build the state, then unmount CLEANLY, so everything the next mount
+	# knows comes off the disk.  That is the whole point: the stale record
+	# used to live only in memory, so it did not survive this boundary and
+	# the scrub after the next mount had nothing to consult.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
+	[ "${NOPERSIST:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_stale_no_persist \
+			2>/dev/null || log "NOPERSIST_ARM_FAIL"
+		log "stale record will NOT be persisted (control)"
+	}
+	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	dm_error_writes $FAIL; log "write errors on device $FAIL"
+	acked=0
+	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_STRIDE)) count=1 \
+		   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
+	done
+	sync
+	log "in-place overwrites: $acked of $NOCOW_BLOCKS acknowledged"
+	dm_heal $FAIL; log "healed device $FAIL"
+	stats "after write errors"
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
+nocow_persist_scrub)
+	# A fresh mount, then a plain user scrub.  Mount-time recovery runs
+	# first and leaves the stripe recorded; the question is whether the
+	# scrub that follows still knows which SIDE of the stripe is wrong.
+	dm_setup; dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	stats "after recovery"
+	kmsg "write-intent" 6
+	btrfs scrub start -B $MNT 2>&1 | while read -r l; do log "scrub: $l"; done
+	stats "after scrub"
+	kmsg "scrub|write-intent" 6
+	log "NOCOW_DIRECT bad=$(nocow_bad) of $NOCOW_BLOCKS"
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
 nocow_probe)
 	# Read the overwritten blocks WITHOUT letting recovery run: read-only,
 	# so btrfs_wib_rw_mount() is skipped.  The host omits the device whose

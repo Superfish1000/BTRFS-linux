@@ -393,11 +393,60 @@ static int test_torn_block(struct btrfs_fs_info *fs_info)
 	 * the checks exist.
 	 */
 	btrfs_wib_build_block(wib, block, 43, NULL);
-	hdr->flags = cpu_to_le64(1);
+	/*
+	 * An UNKNOWN flag, i.e. one bit above everything this kernel defines.
+	 * Not simply bit 0: that is BTRFS_WIB_FLAG_STALE now, and a test that
+	 * sets a flag which has since been defined stops testing anything
+	 * while still passing.
+	 */
+	hdr->flags = cpu_to_le64(BTRFS_WIB_FLAGS_SUPPORTED | (1ULL << 63));
 	restamp(fs_info, block);
 	if (btrfs_wib_block_valid(fs_info, block)) {
 		test_err("block with an unknown flag accepted");
 		goto out;
+	}
+
+	/*
+	 * The format-1 layout, which this kernel must still READ: entries are
+	 * 24 bytes with no stale record, and the flag says so by its absence.
+	 */
+	btrfs_wib_build_block(wib, block, 45, NULL);
+	{
+		const u32 nr = le32_to_cpu(hdr->nr_entries);
+		struct btrfs_wib_disk_entry_v1 *v1 = block + sizeof(*hdr);
+		struct btrfs_wib_disk_entry saved[8];
+
+		if (nr > ARRAY_SIZE(saved)) {
+			test_err("self test needs <= %zu entries, block has %u",
+				 ARRAY_SIZE(saved), nr);
+			goto out;
+		}
+		memcpy(saved, block + sizeof(*hdr), nr * sizeof(saved[0]));
+		memset(block + sizeof(*hdr), 0,
+		       BTRFS_WIB_SLOT_SIZE - sizeof(*hdr));
+		for (u32 i = 0; i < nr; i++) {
+			v1[i].bytenr = saved[i].bytenr;
+			v1[i].bitmap = saved[i].bitmap;
+			v1[i].error = saved[i].error;
+		}
+		hdr->flags = 0;
+		restamp(fs_info, block);
+		if (!btrfs_wib_block_valid(fs_info, block)) {
+			test_err("a format-1 block was rejected");
+			goto out;
+		}
+		for (u32 i = 0; i < nr; i++) {
+			struct btrfs_wib_entry e;
+
+			btrfs_wib_read_entry(block, i, &e);
+			if (e.bytenr != le64_to_cpu(saved[i].bytenr) ||
+			    e.bitmap != le64_to_cpu(saved[i].bitmap) ||
+			    e.sticky != le64_to_cpu(saved[i].error) ||
+			    e.stale != 0 || e.stale_par != 0) {
+				test_err("format-1 entry %u read back wrong", i);
+				goto out;
+			}
+		}
 	}
 
 	btrfs_wib_build_block(wib, block, 44, NULL);
@@ -443,11 +492,16 @@ static int test_pending_merge(struct btrfs_fs_info *fs_info)
 	int ret;
 
 	/* Simulate the union of the newest slots of several devices. */
-	ret = btrfs_wib_add_pending(wib, 8 * BTRFS_WIB_ENTRY_SIZE, 0x00f0, 0);
-	ret |= btrfs_wib_add_pending(wib, 2 * BTRFS_WIB_ENTRY_SIZE, 0x0001, 0);
-	ret |= btrfs_wib_add_pending(wib, 8 * BTRFS_WIB_ENTRY_SIZE, 0x0f00, 0x0010);
-	ret |= btrfs_wib_add_pending(wib, 2 * BTRFS_WIB_ENTRY_SIZE, 0x0000, 0);
-	ret |= btrfs_wib_add_pending(wib, 5 * BTRFS_WIB_ENTRY_SIZE, 0x0000, 0x8000);
+	ret = btrfs_wib_add_pending(wib, &(struct btrfs_wib_entry){
+		.bytenr = 8 * BTRFS_WIB_ENTRY_SIZE, .bitmap = 0x00f0, .sticky = 0 });
+	ret |= btrfs_wib_add_pending(wib, &(struct btrfs_wib_entry){
+		.bytenr = 2 * BTRFS_WIB_ENTRY_SIZE, .bitmap = 0x0001, .sticky = 0 });
+	ret |= btrfs_wib_add_pending(wib, &(struct btrfs_wib_entry){
+		.bytenr = 8 * BTRFS_WIB_ENTRY_SIZE, .bitmap = 0x0f00, .sticky = 0x0010 });
+	ret |= btrfs_wib_add_pending(wib, &(struct btrfs_wib_entry){
+		.bytenr = 2 * BTRFS_WIB_ENTRY_SIZE, .bitmap = 0x0000, .sticky = 0 });
+	ret |= btrfs_wib_add_pending(wib, &(struct btrfs_wib_entry){
+		.bytenr = 5 * BTRFS_WIB_ENTRY_SIZE, .bitmap = 0x0000, .sticky = 0x8000 });
 	if (ret) {
 		test_err("add_pending failed");
 		return -EINVAL;

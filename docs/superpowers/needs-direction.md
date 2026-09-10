@@ -248,14 +248,48 @@ bitmap (the block at the full stripe's start encodes parity 0, the next block
 parity 1 -- `nr_data` is at least 2, so those bits always belong to the stripe
 they describe).
 
-**The cost.** Entries per 4KiB slot drop from 165 to 124, so one slot tracks
-496MiB of dirty address space instead of 660MiB. Eviction gets more likely on
-an array that is failing a lot of writes, and an evicted record means that
-stripe relies on the next scrub rather than the next mount.
+**The cost, measured -- and it is not the one this entry originally named.**
+The obvious reading is "less dirty address space tracked", which sounds
+harmless. The real cost is on the write path.
 
-**The choice.** Take the 25% capacity cut; or leave the record per-mount and
-accept that the protection resets at every boot; or spend a second `__le64` on
-a separate parity bitmap for clarity, at 99 entries instead of 124.
+The on-disk block is not the in-flight set: `btrfs_wib_build_block()` unions
+the live table with `wib->last`, so the block is the running union of every
+region marked since the last drop, and drops happen only at transaction commit
+(30s by default). When that union no longer fits, `wib_write_block_locked()`
+returns `-ENOSPC` and `wib_commit_locked()` falls back to
+`wib_flush_and_drop_locked()` -- a `REQ_PREFLUSH` to **every writable device**
+plus a FUA block write, up to three times, **with the marking RMW blocked on
+it** inside `btrfs_wib_mark()`.
+
+That overflow fires once per `BTRFS_WIB_MAX_ENTRIES` distinct new 4MiB
+regions. So the entry size sets the rate of inline device-wide cache flushes
+on the write path:
+
+| entry | entries/slot | tracked | flush rate |
+|---|---|---|---|
+| 24B, today (no stale) | 165 | 660 MiB | 1.00x |
+| 32B (+stale) | 124 | 496 MiB | 1.33x |
+| 40B (+stale, +stale_par) -- **what is implemented** | 99 | 396 MiB | 1.67x |
+
+The in-memory table is a fixed array sized by the same constant
+(`entries[BTRFS_WIB_MAX_ENTRIES]`), so it cannot be tuned independently. More
+slots do not help: the two slots are alternating generations of the same
+block. A bigger slot has 512KiB of physical headroom but is blocked by
+single-page buffers and single-page bios.
+
+**The remedy, designed but not built.** `stale` is zero almost always -- the
+design says so itself, which is why `btrfs_wib_stale()` has a lock-free
+`nr_stale == 0` fast path. So encode it out of the common case: keep the
+24-byte entry, and append a sparse extension array of `{__le32 index, __le64
+stale, __le64 stale_par}` (20 bytes) after it, with the count in the header.
+With no stale records that is 165 entries and **no regression at all**; with
+every entry stale it is 90, slightly worse than the flat 99, which is the
+right way round -- the pathological case pays and the normal case does not.
+
+**The choice.** Ship the flat 40-byte entry and its 1.67x flush rate; or build
+the sparse encoding first; or leave the record per-mount and accept that the
+protection resets at every boot -- which the model prices at 1488 of 8386
+RAID5 states destroyed, i.e. the whole fix.
 
 ---
 

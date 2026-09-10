@@ -119,9 +119,34 @@
 #include "accessors.h"
 #include "zoned.h"
 
+#ifdef CONFIG_BTRFS_DEBUG
+/*
+ * Write the stale record as zero, i.e. behave exactly as the format did
+ * before it carried one.  The negative control for the cross-mount
+ * reproduction: same kernel, one flag, so a pass with the record persisted
+ * means something.  See tools/testing/btrfs/uml/nocow_persist.sh.
+ */
+static bool stale_no_persist;
+module_param_named(raid56_stale_no_persist, stale_no_persist, bool, 0644);
+MODULE_PARM_DESC(raid56_stale_no_persist,
+		 "Do not persist the stale record, as the format did before it had one (testing only: restores a known defect)");
+#define wib_no_persist()	READ_ONCE(stale_no_persist)
+#else
+#define wib_no_persist()	false
+#endif
+
 static_assert(sizeof(struct btrfs_wib_disk_header) == 128);
-static_assert(sizeof(struct btrfs_wib_disk_entry) == 24);
-static_assert(BTRFS_WIB_MAX_ENTRIES == 165);
+static_assert(sizeof(struct btrfs_wib_disk_entry_v1) == 24);
+static_assert(BTRFS_WIB_MAX_ENTRIES_V1 == 165);
+static_assert(sizeof(struct btrfs_wib_disk_entry) == 40);
+static_assert(BTRFS_WIB_MAX_ENTRIES == 99);
+/*
+ * @stale is a strict subset of @error, and btrfs_wib_block_valid() enforces
+ * that on read.  The two parity bits of a full stripe live in @stale_par at
+ * the block of the stripe's start and the one after it, which is why nr_data
+ * being at least 2 for every RAID5/6 chunk matters.
+ */
+static_assert(BTRFS_WIB_BLOCK_SHIFT == BTRFS_STRIPE_LEN_SHIFT);
 static_assert(BTRFS_WIB_OFFSET + BTRFS_WIB_NR_SLOTS * BTRFS_WIB_SLOT_SIZE <=
 	      BTRFS_DEVICE_RANGE_RESERVED);
 static_assert(BTRFS_SUPER_INFO_OFFSET + BTRFS_SUPER_INFO_SIZE <= BTRFS_WIB_OFFSET);
@@ -350,6 +375,8 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 		de[nr].bytenr = cpu_to_le64(e->bytenr);
 		de[nr].bitmap = cpu_to_le64(e->bitmap);
 		de[nr].error = cpu_to_le64(e->sticky);
+		de[nr].stale = cpu_to_le64(wib_no_persist() ? 0 : e->stale);
+		de[nr].stale_par = cpu_to_le64(wib_no_persist() ? 0 : e->stale_par);
 		nr++;
 	}
 	spin_unlock_irqrestore(&wib->lock, flags);
@@ -384,6 +411,8 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 			}
 			de[j].bitmap |= be[i].bitmap;
 			de[j].error |= be[i].error;
+			de[j].stale |= be[i].stale;
+			de[j].stale_par |= be[i].stale_par;
 		}
 	}
 
@@ -392,15 +421,64 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 	hdr->seq = cpu_to_le64(seq);
 	hdr->nr_entries = cpu_to_le32(nr);
 	hdr->block_shift = cpu_to_le32(BTRFS_WIB_BLOCK_SHIFT);
+	hdr->flags = cpu_to_le64(BTRFS_WIB_FLAG_STALE);
 	btrfs_csum(fs_info->csum_type, block + BTRFS_CSUM_SIZE,
 		   BTRFS_WIB_SLOT_SIZE - BTRFS_CSUM_SIZE, hdr->csum);
 	return 0;
 }
 
+/*
+ * Two on-disk entry layouts exist: format 1 without the stale record, and the
+ * current one with it.  The header's BTRFS_WIB_FLAG_STALE says which, and
+ * these two are the only places the difference is allowed to matter -- every
+ * other caller works on blocks this kernel built, which are always current.
+ */
+static bool wib_block_is_v1(const void *block)
+{
+	const struct btrfs_wib_disk_header *hdr = block;
+
+	return !(le64_to_cpu(hdr->flags) & BTRFS_WIB_FLAG_STALE);
+}
+
+static u32 wib_block_max_entries(const void *block)
+{
+	return wib_block_is_v1(block) ? BTRFS_WIB_MAX_ENTRIES_V1 :
+					BTRFS_WIB_MAX_ENTRIES;
+}
+
+/* Read entry @i of @block into @out, whichever layout the block is in. */
+void btrfs_wib_read_entry(const void *block, u32 i, struct btrfs_wib_entry *out)
+{
+	const struct btrfs_wib_disk_header *hdr = block;
+
+	if (wib_block_is_v1(block)) {
+		const struct btrfs_wib_disk_entry_v1 *de = block + sizeof(*hdr);
+
+		out->bytenr = le64_to_cpu(de[i].bytenr);
+		out->bitmap = le64_to_cpu(de[i].bitmap);
+		out->sticky = le64_to_cpu(de[i].error);
+		/*
+		 * Format 1 did not record which side of the stripe was wrong.
+		 * Zero is the honest answer and the safe one: it means the
+		 * scrub treats the stripe as merely suspect, which is what the
+		 * kernel that wrote this block intended.
+		 */
+		out->stale = 0;
+		out->stale_par = 0;
+	} else {
+		const struct btrfs_wib_disk_entry *de = block + sizeof(*hdr);
+
+		out->bytenr = le64_to_cpu(de[i].bytenr);
+		out->bitmap = le64_to_cpu(de[i].bitmap);
+		out->sticky = le64_to_cpu(de[i].error);
+		out->stale = le64_to_cpu(de[i].stale);
+		out->stale_par = le64_to_cpu(de[i].stale_par);
+	}
+}
+
 bool btrfs_wib_block_valid(const struct btrfs_fs_info *fs_info, const void *block)
 {
 	const struct btrfs_wib_disk_header *hdr = block;
-	const struct btrfs_wib_disk_entry *de;
 	u8 csum[BTRFS_CSUM_SIZE];
 
 	if (le64_to_cpu(hdr->magic) != BTRFS_WIB_MAGIC)
@@ -415,10 +493,12 @@ bool btrfs_wib_block_valid(const struct btrfs_fs_info *fs_info, const void *bloc
 		return false;
 	if (le32_to_cpu(hdr->block_shift) != BTRFS_WIB_BLOCK_SHIFT)
 		return false;
-	if (le32_to_cpu(hdr->nr_entries) > BTRFS_WIB_MAX_ENTRIES)
+	if (le64_to_cpu(hdr->flags) & ~BTRFS_WIB_FLAGS_SUPPORTED)
+		return false;
+	if (le32_to_cpu(hdr->nr_entries) > wib_block_max_entries(block))
 		return false;
 	/*
-	 * Nothing sets these yet, and btrfs_wib_build_block() zeroes the whole
+	 * Nothing sets these, and btrfs_wib_build_block() zeroes the whole
 	 * slot, so a block that has them set was written by something this
 	 * kernel does not understand.  Reject it rather than guess: ignoring a
 	 * log leaves the stripes it covers unrecovered, which is exactly the
@@ -426,10 +506,11 @@ bool btrfs_wib_block_valid(const struct btrfs_fs_info *fs_info, const void *bloc
 	 * the wrong stripes or silently skip the right ones.  The feature is
 	 * compat_ro, so an older kernel will not have written this block --
 	 * only a newer one with a format change will, which is the case this
-	 * guards.  block_shift above is checked for the same reason.
+	 * guards.  block_shift above, and the flags check, are for the same
+	 * reason; flags is where a KNOWN format change announces itself, and
+	 * BTRFS_WIB_FLAG_STALE is one, so that one is read rather than
+	 * refused.
 	 */
-	if (hdr->flags != 0)
-		return false;
 	for (int i = 0; i < ARRAY_SIZE(hdr->reserved); i++)
 		if (hdr->reserved[i] != 0)
 			return false;
@@ -448,14 +529,23 @@ bool btrfs_wib_block_valid(const struct btrfs_fs_info *fs_info, const void *bloc
 	 * than the one recorded, so recovery would scrub somewhere else and
 	 * leave the real stripe alone.
 	 */
-	de = block + sizeof(*hdr);
 	for (u32 i = 0; i < le32_to_cpu(hdr->nr_entries); i++) {
-		const u64 bytenr = le64_to_cpu(de[i].bytenr);
+		struct btrfs_wib_entry e;
 
-		if (!IS_ALIGNED(bytenr, BTRFS_WIB_ENTRY_SIZE))
+		btrfs_wib_read_entry(block, i, &e);
+		if (!IS_ALIGNED(e.bytenr, BTRFS_WIB_ENTRY_SIZE))
 			return false;
 		/* An entry ending past the end of the address space. */
-		if (bytenr > U64_MAX - BTRFS_WIB_ENTRY_SIZE)
+		if (e.bytenr > U64_MAX - BTRFS_WIB_ENTRY_SIZE)
+			return false;
+		/*
+		 * @stale says the data of a block is not what was
+		 * acknowledged, which is a statement about a block the log is
+		 * already recording; outside @error it describes nothing, and
+		 * acting on it would send a read to a parity that describes
+		 * exactly the sector it is being told to distrust.
+		 */
+		if (e.stale & ~e.sticky)
 			return false;
 	}
 	return true;
@@ -802,6 +892,27 @@ static void wib_readd_dropped(struct btrfs_wib *wib)
 		}
 		e->sticky |= bits;
 		nr_readded += hweight64(bits);
+		/*
+		 * Carry the stale record back with it.  Re-adding these blocks
+		 * as plain sticky would say "something went wrong here" while
+		 * dropping "and it was the DATA that is wrong" -- and a scrub
+		 * that sees only the first recomputes the parity from the
+		 * stale sector, which is the exact loss this record exists to
+		 * prevent.  A device failing to confirm a flush is no reason
+		 * to forget which side of the stripe was bad.
+		 */
+		{
+			struct btrfs_wib_entry old;
+			u64 add;
+
+			btrfs_wib_read_entry(wib->last, i, &old);
+			/* Keep the invariant that @stale is a subset of @sticky. */
+			add = (old.stale & e->sticky) & ~e->stale;
+			e->stale |= add;
+			e->stale_par |= old.stale_par;
+			if (add)
+				atomic_add(hweight64(add), &wib->nr_stale);
+		}
 	}
 	spin_unlock_irqrestore(&wib->lock, flags);
 
@@ -1373,6 +1484,14 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 				   &wib->nr_stale);
 			e->stale &= ~btrfs_wib_range_mask(cur, logical, len);
 		}
+		/*
+		 * The stripe is consistent again, so its parity describes the
+		 * data.  Left set, this bit would be persisted and would then
+		 * make a later rebuild refuse a parity that is in fact fine --
+		 * conservative rather than dangerous, but wrong, and it does
+		 * not clear itself.
+		 */
+		e->stale_par &= ~btrfs_wib_range_mask(cur, logical, len);
 		if (!wib_entry_used(e))
 			freed = true;
 	}
@@ -1736,9 +1855,10 @@ void btrfs_wib_free(struct btrfs_fs_info *fs_info)
 }
 
 /* Append a region to the pending recovery list (merged later). */
-int btrfs_wib_add_pending(struct btrfs_wib *wib, u64 bytenr, u64 bitmap, u64 error)
+int btrfs_wib_add_pending(struct btrfs_wib *wib,
+			  const struct btrfs_wib_entry *src)
 {
-	if (!bitmap && !error)
+	if (!src->bitmap && !src->sticky)
 		return 0;
 	if (wib->nr_pending == wib->max_pending) {
 		unsigned int new_max = wib->max_pending ? wib->max_pending * 2 : 256;
@@ -1753,9 +1873,7 @@ int btrfs_wib_add_pending(struct btrfs_wib *wib, u64 bytenr, u64 bitmap, u64 err
 		wib->pending = p;
 		wib->max_pending = new_max;
 	}
-	wib->pending[wib->nr_pending].bytenr = bytenr;
-	wib->pending[wib->nr_pending].bitmap = bitmap;
-	wib->pending[wib->nr_pending].sticky = error;
+	wib->pending[wib->nr_pending] = *src;
 	wib->nr_pending++;
 	return 0;
 }
@@ -1784,6 +1902,19 @@ void btrfs_wib_finalize_pending(struct btrfs_wib *wib)
 		if (out && wib->pending[out - 1].bytenr == wib->pending[i].bytenr) {
 			wib->pending[out - 1].bitmap |= wib->pending[i].bitmap;
 			wib->pending[out - 1].sticky |= wib->pending[i].sticky;
+			/*
+			 * The stale record has to be unioned here like the
+			 * others.  A region can be named by more than one
+			 * device's newest block, and a device that took a
+			 * write error is exactly the one whose block is most
+					 * likely to carry the stale bits -- if the merge
+			 * kept only whichever entry happened to sort first,
+			 * the distinction between "the data is wrong" and
+			 * "something went wrong" would be lost precisely when
+			 * it matters.
+			 */
+			wib->pending[out - 1].stale |= wib->pending[i].stale;
+			wib->pending[out - 1].stale_par |= wib->pending[i].stale_par;
 			continue;
 		}
 		wib->pending[out++] = wib->pending[i];
@@ -1843,7 +1974,6 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 	mutex_lock(&fs_devices->device_list_mutex);
 	list_for_each_entry(device, &fs_devices->devices, dev_list) {
 		const struct btrfs_wib_disk_header *hdr = buf;
-		const struct btrfs_wib_disk_entry *de = buf + sizeof(*hdr);
 		u64 dev_seq = 0;
 		int dev_slot = -1;
 		u32 nr;
@@ -1891,9 +2021,10 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 		}
 		nr = le32_to_cpu(hdr->nr_entries);
 		for (u32 i = 0; i < nr; i++) {
-			ret = btrfs_wib_add_pending(wib, le64_to_cpu(de[i].bytenr),
-						    le64_to_cpu(de[i].bitmap),
-						    le64_to_cpu(de[i].error));
+			struct btrfs_wib_entry e;
+
+			btrfs_wib_read_entry(buf, i, &e);
+			ret = btrfs_wib_add_pending(wib, &e);
 			if (ret < 0)
 				goto out;
 		}
@@ -1936,6 +2067,46 @@ static bool wib_pending_has_error(struct btrfs_wib *wib, u64 start, u64 len)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * Put back the stale record the recovered log carried for a stripe that stays
+ * recorded.
+ *
+ * btrfs_wib_add_sticky() restores "something went wrong here"; this restores
+ * WHICH SIDE went wrong, which is the part a later scrub needs and the part
+ * that used to be lost at every mount.  Without it, persisting the record on
+ * disk would buy nothing: the bits would be read off the device and then
+ * dropped on the floor before anything could consult them.
+ *
+ * Call after btrfs_wib_add_sticky() for the same range -- btrfs_wib_mark_stale()
+ * only marks blocks the live table already records, on purpose.
+ */
+static void wib_readd_stale(struct btrfs_fs_info *fs_info, u64 start, u64 len)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+
+	for (unsigned int i = 0; i < wib->nr_pending; i++) {
+		const struct btrfs_wib_entry *e = &wib->pending[i];
+		const u64 mask = btrfs_wib_range_mask(e->bytenr, start, len);
+		u64 stale = e->stale & mask;
+
+		while (stale) {
+			const unsigned int bit = __ffs64(stale);
+
+			stale &= ~BIT_ULL(bit);
+			btrfs_wib_mark_stale(fs_info,
+					     e->bytenr + ((u64)bit << BTRFS_WIB_BLOCK_SHIFT),
+					     BTRFS_WIB_BLOCK_SIZE);
+		}
+		for (int p = 0; p < 2; p++) {
+			const u64 logical = start + ((u64)p << BTRFS_WIB_BLOCK_SHIFT);
+
+			if (e->stale_par & btrfs_wib_range_mask(e->bytenr, logical,
+								BTRFS_WIB_BLOCK_SIZE))
+				btrfs_wib_update_stale_parity(fs_info, start, p, true);
+		}
+	}
 }
 
 struct wib_recovery_stats {
@@ -2162,8 +2333,10 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 					      &start, &len, &st);
 			if (ret < 0)
 				goto out;
-			if (ret == 1)
+			if (ret == 1) {
 				btrfs_wib_add_sticky(fs_info, start, len);
+				wib_readd_stale(fs_info, start, len);
+			}
 		}
 	}
 
