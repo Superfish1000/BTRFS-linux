@@ -501,6 +501,59 @@ nocow_stale)
 	dmsetup remove_all
 	finish
 	;;
+pausehang_log_prep)
+	# Leave BOTH a dirty tree log and recorded stripes, then die without
+	# unmounting.  The next mount then runs btrfs_wib_recover_after_replay(),
+	# which is the one recovery path that runs after the transaction kthread
+	# has been started -- the only place a commit can overlap it.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	dd if=/dev/urandom of=$MNT/base bs=1M count=8 conv=fsync status=none
+	sync
+	dm_error_writes $FAIL; log "write errors on device $FAIL"
+	for i in $(seq 0 39); do
+		dd if=/dev/urandom of=$MNT/base bs=4096 count=1 seek=$((i * 48)) \
+		   conv=notrunc,fsync status=none 2>/dev/null
+	done
+	# fsync without sync: the data is referenced only by the tree log, so
+	# the next mount has a log to replay before it can finish recovering.
+	for i in $(seq 0 7); do
+		dd if=/dev/urandom of=$MNT/logged$i bs=64K count=1 conv=fsync \
+		   status=none 2>/dev/null
+	done
+	stats "recorded with a dirty log"
+	log "PREP_DONE"
+	# No umount: leave the log dirty.
+	echo b > /proc/sysrq-trigger
+	sleep 60
+	;;
+pausehang_log)
+	# Mount normally.  btrfs_wib_recover_after_replay() runs from
+	# open_ctree() AFTER cleaner_kthread and transaction_kthread have
+	# started and after the tree log has been replayed, so unlike
+	# btrfs_remount_rw() a commit really can land while it is running.
+	echo ${DELAY:-6000} > /sys/module/btrfs/parameters/raid56_recovery_delay_ms \
+		2>/dev/null || log "DELAY_ARM_FAIL"
+	log "recovery delay armed: $(cat /sys/module/btrfs/parameters/raid56_recovery_delay_ms 2>/dev/null)"
+	watchdog 200
+	log "MOUNT_START"
+	if timeout 240 mount -o rw,commit=1 $MNTDEV $MNT; then
+		log "MOUNT_DONE"
+	else
+		log "MOUNT_STUCK rc=$?"
+		echo w > /proc/sysrq-trigger 2>/dev/null; sleep 3
+	fi
+	echo 0 > /sys/module/btrfs/parameters/raid56_recovery_delay_ms 2>/dev/null
+	log "pause samples: $(dmesg | grep -c "recovery delay: pause_req")"
+	log "samples with a pauser: $(dmesg | grep "recovery delay: pause_req" | grep -vc "pause_req 0")"
+	dmesg | grep "recovery delay: pause_req" | grep -v "pause_req 0" | tail -4 | while read -r l; do log "PAUSER: $l"; done
+	stats "after mount"
+	kmsg "blocked for more|replay|write-intent" 8
+	umount $MNT 2>/dev/null
+	finish
+	;;
 pausehang_prep)
 	# Leave a filesystem with recorded stripes and unmount it, so the next
 	# boot's btrfs_wib_load() puts them in wib->pending -- which is the only

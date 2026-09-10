@@ -33,8 +33,14 @@ boot() {
 }
 # Two boots: the first leaves recorded stripes on disk, the second mounts
 # read-only so the remount is what runs the recovery.
-boot pausehang_prep
-boot pausehang
+if [ "${VIA:-remount}" = log ]; then
+	# The recovery that runs after the transaction kthread is up.
+	boot pausehang_log_prep
+	boot pausehang_log
+else
+	boot pausehang_prep
+	boot pausehang
+fi
 echo "==== $TAG ===="
 cat $T/umltest/results.$TAG
 echo
@@ -43,11 +49,11 @@ echo
 if grep -q "NOTHING_TO_RECOVER" $T/umltest/results.$TAG; then
 	echo "RESULT: INCONCLUSIVE -- no stripes were pending, the recovery never ran"
 	exit 2
-elif grep -q "REMOUNT_RW_STUCK" $T/umltest/results.$TAG; then
+elif grep -qE "REMOUNT_RW_STUCK|MOUNT_STUCK" $T/umltest/results.$TAG; then
 	echo "RESULT: WEDGED -- the read-write remount never returned"
 	grep -a "blocked for more\|scrub\|D    " $D/log.pausehang | head -12
 	exit 1
-elif grep -q "REMOUNT_RW_DONE" $T/umltest/results.$TAG; then
+elif grep -qE "REMOUNT_RW_DONE|MOUNT_DONE" $T/umltest/results.$TAG; then
 	echo "RESULT: COMPLETED -- no wedge"; exit 0
 else
 	echo "RESULT: INCONCLUSIVE -- the remount was never reached"; exit 2
