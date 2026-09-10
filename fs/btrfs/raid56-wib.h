@@ -119,6 +119,25 @@ struct btrfs_wib_entry {
 	 * mount the stripe is still recorded by @sticky and scrubbed.
 	 */
 	u64 stale;
+	/*
+	 * Which PARITY of a full stripe a failed write left not describing the
+	 * data.  Bit (b + p), where b is the block of the full stripe's start,
+	 * means parity p of that stripe is stale.  nr_parity is at most 2 and
+	 * nr_data at least 2, so those bits always belong to the stripe they
+	 * describe and never to the next one; a stripe straddling two entries
+	 * is handled by addressing them logically, like every other block.
+	 *
+	 * A stale parity is not a copy of anything.  Rebuilding a data column
+	 * from one hands back a value that was never committed anywhere, which
+	 * is how a record meant to protect data ends up destroying it -- see
+	 * the counterexamples in tools/testing/btrfs/scrub_policy_model.py.
+	 * Kept in its own field rather than folded into @stale so that the two
+	 * questions stay separable: which side of the stripe is wrong is the
+	 * whole decision.
+	 *
+	 * Not persisted either, for the same reason @stale is not.
+	 */
+	u64 stale_par;
 };
 
 struct btrfs_wib {
@@ -234,6 +253,12 @@ struct btrfs_wib {
 	atomic64_t stat_sticky;
 	atomic64_t stat_sticky_evicted;
 	atomic64_t stat_commit_errors;
+	/*
+	 * Full stripes a scrub declined to regenerate the parity of, because
+	 * the log records one of their data columns stale and the parity is
+	 * the only place the acknowledged content still exists.
+	 */
+	atomic64_t stat_scrub_skipped_stale;
 };
 
 int btrfs_wib_alloc(struct btrfs_fs_info *fs_info);
@@ -255,6 +280,24 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical);
 void btrfs_wib_clear_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 bool btrfs_wib_any_stale(const struct btrfs_fs_info *fs_info);
+
+/*
+ * What the log knows about one full stripe, as the read and scrub paths need
+ * it: which data columns cannot be believed, and which parities cannot be
+ * used to replace them.
+ */
+struct btrfs_wib_stripe_state {
+	/* Bit i: data column i of the full stripe is recorded stale. */
+	u64 stale_cols;
+	/* Bit p: parity p of the full stripe is recorded stale. */
+	u32 bad_parity;
+};
+
+bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
+			    int nr_data, int nr_parity,
+			    struct btrfs_wib_stripe_state *st);
+void btrfs_wib_update_stale_parity(struct btrfs_fs_info *fs_info,
+				   u64 full_stripe_start, int parity, bool stale);
 void btrfs_wib_commit_prepare(struct btrfs_fs_info *fs_info);
 int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed);
 

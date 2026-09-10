@@ -475,6 +475,7 @@ static int test_pending_merge(struct btrfs_fs_info *fs_info)
 
 static int test_log_full(struct btrfs_fs_info *fs_info)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 straddling = 50 * BTRFS_WIB_ENTRY_SIZE + 63 * BTRFS_WIB_BLOCK_SIZE;
 	int ret;
@@ -490,18 +491,18 @@ static int test_log_full(struct btrfs_fs_info *fs_info)
 	}
 
 	/* A region already present still fits. */
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	ret = btrfs_wib_try_mark(wib, 100 * BTRFS_WIB_ENTRY_SIZE + SZ_1M, BTRFS_WIB_BLOCK_SIZE);
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	if (ret) {
 		test_err("mark of a present region failed on a full log: %d", ret);
 		return -EINVAL;
 	}
 
 	/* A new region must be refused, not silently dropped. */
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	ret = btrfs_wib_try_mark(wib, 0, BTRFS_WIB_BLOCK_SIZE);
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	if (ret != -ENOSPC || btrfs_wib_can_mark(wib, 0, BTRFS_WIB_BLOCK_SIZE)) {
 		test_err("full log accepted a new region: %d", ret);
 		return -EINVAL;
@@ -523,9 +524,9 @@ static int test_log_full(struct btrfs_fs_info *fs_info)
 		test_err("straddling stripe accepted with a single free entry");
 		return -EINVAL;
 	}
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	ret = btrfs_wib_try_mark(wib, straddling, 2 * BTRFS_WIB_BLOCK_SIZE);
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	if (ret != -ENOSPC) {
 		test_err("straddling stripe marked with a single free entry: %d", ret);
 		return -EINVAL;

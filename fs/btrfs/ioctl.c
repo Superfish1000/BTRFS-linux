@@ -266,7 +266,8 @@ static int check_fsflags_compatible(const struct btrfs_fs_info *fs_info,
 	 * leaves them believing they have it.  An error says what is actually
 	 * on offer.
 	 */
-	if (btrfs_fs_incompat(fs_info, RAID56) && (flags & FS_NOCOW_FL))
+	if (btrfs_fs_incompat(fs_info, RAID56) && (flags & FS_NOCOW_FL) &&
+	    !btrfs_raid56_allow_nodatacow())
 		return -EPERM;
 
 	return 0;

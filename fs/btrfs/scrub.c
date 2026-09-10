@@ -23,6 +23,7 @@
 #include "file-item.h"
 #include "scrub.h"
 #include "raid-stripe-tree.h"
+#include "raid56-wib.h"
 
 /*
  * This is only the first step towards a full-features scrub. It reads all
@@ -2373,6 +2374,43 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 
 	if (!regen_parity)
 		return 0;
+
+	/*
+	 * The write-intent log may know that a data column of this full stripe
+	 * holds content a failed write left stale, so that what was
+	 * acknowledged survives only in the parity.  A nodatacow sector has no
+	 * checksum, scrub_verify_one_sector() has no choice but to trust it,
+	 * and recomputing the parity from it below would throw away the last
+	 * copy -- which is exactly the defect this whole series is about,
+	 * measured at 8 of 32 acknowledged blocks lost with scrub reporting no
+	 * errors at all.
+	 *
+	 * Leave the parity alone and leave the stripe recorded.  A stripe
+	 * whose redundancy is not restored is worse than one that is; it is
+	 * very much better than one whose data is gone.
+	 *
+	 * Model: tools/testing/btrfs/scrub_policy_model.py --all.  Skipping is
+	 * clean on every axis the model checks, where regenerating destroys
+	 * committed data in 1488 of 8386 RAID5 states and 6291 of 41791 RAID6
+	 * states.  Rebuilding the stale column FROM the parity first and then
+	 * regenerating is clean too and leaves far fewer stripes unrepaired
+	 * (259 against 973 on RAID5, 2718 against 9705 on RAID6); it needs a
+	 * write-back path scrub does not have here yet.
+	 */
+	if (unlikely(btrfs_wib_any_stale(fs_info))) {
+		struct btrfs_wib_stripe_state st;
+
+		if (btrfs_wib_stripe_state(fs_info, full_stripe_start, data_stripes,
+					   map->num_stripes - data_stripes, &st) &&
+		    st.stale_cols) {
+			atomic64_inc(&fs_info->wib->stat_scrub_skipped_stale);
+			btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu has %u data stripe(s) whose last write did not reach the disk; leaving its parity alone, because for data without a checksum that parity is the only copy of what was acknowledged",
+				      full_stripe_start,
+				      (unsigned int)hweight64(st.stale_cols));
+			return 0;
+		}
+	}
 
 	/* Now we can check and regenerate the P/Q stripe. */
 	return scrub_raid56_cached_parity(sctx, scrub_dev, map, full_stripe_start,

@@ -1910,7 +1910,8 @@ static int can_nocow_file_extent(struct btrfs_path *path,
 	 * amplification back on these profiles.  raid56_forced_cow counts it
 	 * so it can be seen rather than guessed at.
 	 */
-	if (btrfs_logical_is_raid56(root->fs_info, io_start)) {
+	if (btrfs_logical_is_raid56(root->fs_info, io_start) &&
+	    !btrfs_raid56_allow_nodatacow()) {
 		atomic64_inc(&root->fs_info->raid56_write_stats.forced_cow);
 		btrfs_warn_rl(root->fs_info,
 "inode %llu is NODATACOW but its extent at %llu is in a RAID5/6 block group; copying instead of overwriting in place, because an in-place write there cannot be verified",

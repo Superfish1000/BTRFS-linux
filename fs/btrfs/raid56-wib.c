@@ -192,6 +192,7 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 			atomic_sub(hweight64(e->stale), &wib->nr_stale);
 			e->stale = 0;
 		}
+		e->stale_par = 0;
 		return e;
 	}
 	return NULL;
@@ -228,6 +229,7 @@ static struct btrfs_wib_entry *wib_find_or_alloc_entry(struct btrfs_wib *wib,
 			atomic_sub(hweight64(free->stale), &wib->nr_stale);
 			free->stale = 0;
 		}
+		free->stale_par = 0;
 	}
 	return free;
 }
@@ -264,12 +266,13 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 /* True if btrfs_wib_try_mark() for the same range would succeed. */
 bool btrfs_wib_can_mark(struct btrfs_wib *wib, u64 logical, u64 len)
 {
+	unsigned long flags;
 	unsigned int needed;
 	unsigned int avail;
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	wib_count_entries_locked(wib, logical, len, &needed, &avail);
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	return needed <= avail;
 }
 
@@ -324,6 +327,7 @@ int btrfs_wib_try_mark(struct btrfs_wib *wib, u64 logical, u64 len)
  */
 int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const void *base)
 {
+	unsigned long flags;
 	struct btrfs_fs_info *fs_info = wib->fs_info;
 	struct btrfs_wib_disk_header *hdr = block;
 	struct btrfs_wib_disk_entry *de = block + sizeof(*hdr);
@@ -337,7 +341,7 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 	ASSERT(block != base);
 	memset(block, 0, BTRFS_WIB_SLOT_SIZE);
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	for (int i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
 		const struct btrfs_wib_entry *e = &wib->entries[i];
 
@@ -348,7 +352,7 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 		de[nr].error = cpu_to_le64(e->sticky);
 		nr++;
 	}
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 
 	if (base) {
 		const struct btrfs_wib_disk_header *bh = base;
@@ -767,6 +771,7 @@ static int wib_write_all_devices(struct btrfs_wib *wib, int *nr_errors_ret)
  */
 static void wib_readd_dropped(struct btrfs_wib *wib)
 {
+	unsigned long flags;
 	const struct btrfs_wib_disk_header *oh = wib->last;
 	const struct btrfs_wib_disk_entry *oe = wib->last + sizeof(*oh);
 	const u32 onr = le32_to_cpu(oh->nr_entries);
@@ -778,7 +783,7 @@ static void wib_readd_dropped(struct btrfs_wib *wib)
 	if (le64_to_cpu(oh->magic) != BTRFS_WIB_MAGIC)
 		return;
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	for (u32 i = 0; i < onr; i++) {
 		const u64 bytenr = le64_to_cpu(oe[i].bytenr);
 		u64 bits = wib_disk_entry_bits(&oe[i]);
@@ -798,7 +803,7 @@ static void wib_readd_dropped(struct btrfs_wib *wib)
 		e->sticky |= bits;
 		nr_readded += hweight64(bits);
 	}
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 
 	if (nr_readded)
 		atomic64_add(nr_readded, &wib->stat_sticky);
@@ -822,6 +827,7 @@ static void wib_readd_dropped(struct btrfs_wib *wib)
 static int wib_write_block_locked(struct btrfs_wib *wib, u64 seq, const void *base,
 				  bool force)
 {
+	unsigned long flags;
 	struct btrfs_wib_disk_header *hdr = wib->block;
 	struct btrfs_wib_disk_header *last = wib->last;
 	int nr_errors;
@@ -857,9 +863,9 @@ static int wib_write_block_locked(struct btrfs_wib *wib, u64 seq, const void *ba
 		return ret;
 	atomic64_inc(&wib->stat_commits);
 done:
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	wib->seq = seq;
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	wake_up_all(&wib->wait);
 	return 0;
 }
@@ -929,14 +935,15 @@ static int wib_flush_and_drop_locked(struct btrfs_wib *wib, u64 seq, bool force)
  */
 static int wib_commit_locked(struct btrfs_wib *wib, bool force)
 {
+	unsigned long flags;
 	u64 seq;
 	int ret;
 
 	lockdep_assert_held(&wib->commit_mutex);
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	seq = ++wib->snap_seq;
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 
 	/*
 	 * A transaction commit is between its snapshot and its barriers (or
@@ -965,15 +972,16 @@ static int wib_commit_locked(struct btrfs_wib *wib, bool force)
  */
 static int wib_commit_wait(struct btrfs_wib *wib, u64 want)
 {
+	unsigned long flags;
 	int ret = 0;
 
 	mutex_lock(&wib->commit_mutex);
 	while (true) {
 		u64 seq;
 
-		spin_lock(&wib->lock);
+		spin_lock_irqsave(&wib->lock, flags);
 		seq = wib->seq;
-		spin_unlock(&wib->lock);
+		spin_unlock_irqrestore(&wib->lock, flags);
 		if (seq >= want)
 			break;
 		ret = wib_commit_locked(wib, false);
@@ -995,6 +1003,7 @@ static int wib_commit_wait(struct btrfs_wib *wib, u64 want)
  */
 int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	bool enabled;
 	u64 want;
@@ -1010,7 +1019,7 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	len -= logical;
 
 	while (true) {
-		spin_lock(&wib->lock);
+		spin_lock_irqsave(&wib->lock, flags);
 		ret = btrfs_wib_try_mark(wib, logical, len);
 		if (ret == 0) {
 			/*
@@ -1019,10 +1028,10 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 			 */
 			want = wib->snap_seq + 1;
 			enabled = wib->enabled;
-			spin_unlock(&wib->lock);
+			spin_unlock_irqrestore(&wib->lock, flags);
 			break;
 		}
-		spin_unlock(&wib->lock);
+		spin_unlock_irqrestore(&wib->lock, flags);
 
 		/*
 		 * Log full.  Entries are freed when in-flight RMWs finish.
@@ -1064,6 +1073,7 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
  */
 void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	u64 end;
 	bool freed = false;
@@ -1075,7 +1085,7 @@ void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool fa
 	logical = round_down(logical, BTRFS_WIB_BLOCK_SIZE);
 	len = end - logical;
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
 		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
 		u64 mask;
@@ -1099,7 +1109,7 @@ void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool fa
 		if (!e->bitmap)
 			freed = true;
 	}
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	if (freed)
 		wake_up_all(&wib->wait);
 }
@@ -1111,15 +1121,16 @@ void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool fa
  */
 void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	int ret;
 
 	if (!wib)
 		return;
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	ret = btrfs_wib_try_mark(wib, logical, len);
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	if (ret < 0) {
 		btrfs_warn(fs_info,
 	"raid56 write-intent log full, cannot keep full stripe at %llu for the next mount, run scrub once all devices are present",
@@ -1143,6 +1154,7 @@ void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
  */
 void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	u64 end;
 
@@ -1153,7 +1165,7 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	logical = round_down(logical, BTRFS_WIB_BLOCK_SIZE);
 	len = end - logical;
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
 		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
 		u64 mask, add;
@@ -1172,7 +1184,7 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		if (add)
 			atomic_add(hweight64(add), &wib->nr_stale);
 	}
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 }
 
 /*
@@ -1195,13 +1207,14 @@ bool btrfs_wib_any_stale(const struct btrfs_fs_info *fs_info)
  */
 void btrfs_wib_clear_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 end = logical + len;
 
 	if (!wib || !atomic_read(&wib->nr_stale))
 		return;
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
 		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
 		u64 gone;
@@ -1214,11 +1227,101 @@ void btrfs_wib_clear_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 			e->stale &= ~gone;
 		}
 	}
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
+}
+
+/*
+ * Record whether parity @parity of the full stripe at @full_stripe_start
+ * describes the data on disk.  Called for every parity of every logged
+ * read-modify-write, so that a parity whose write landed clears a record an
+ * earlier failure left behind.
+ */
+void btrfs_wib_update_stale_parity(struct btrfs_fs_info *fs_info,
+				   u64 full_stripe_start, int parity, bool stale)
+{
+	unsigned long flags;
+	struct btrfs_wib *wib = fs_info->wib;
+	const u64 logical = full_stripe_start +
+			    ((u64)parity << BTRFS_WIB_BLOCK_SHIFT);
+	const u64 cur = wib_entry_bytenr(logical);
+	struct btrfs_wib_entry *e;
+	u64 mask;
+
+	if (!wib)
+		return;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	e = wib_find_entry(wib, cur);
+	if (e) {
+		mask = btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE);
+		if (stale)
+			e->stale_par |= mask;
+		else
+			e->stale_par &= ~mask;
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+}
+
+/*
+ * Gather what the log knows about one full stripe.
+ *
+ * Returns false when there is nothing recorded for it, which is the answer in
+ * all but a vanishing fraction of calls and is reached without the lock.
+ *
+ * The caller must not act on @st without checking that the columns it cannot
+ * believe fit within the parities it can still use.  Reconstructing more
+ * columns than there are equations does not fail loudly for data without a
+ * checksum: it returns a value nothing ever committed, which is worse than
+ * the stale sector it was trying to avoid.
+ */
+bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
+			    int nr_data, int nr_parity,
+			    struct btrfs_wib_stripe_state *st)
+{
+	unsigned long flags;
+	struct btrfs_wib *wib = fs_info->wib;
+
+	st->stale_cols = 0;
+	st->bad_parity = 0;
+
+	if (!wib)
+		return false;
+	/*
+	 * nr_data above 64 cannot be expressed in one entry's bitmap.  No
+	 * such chunk exists today; if one ever does, saying "nothing is
+	 * recorded" is the behaviour without this record at all.
+	 */
+	if (nr_data > 64 || nr_parity > 2)
+		return false;
+	if (likely(!atomic_read(&wib->nr_stale))) {
+		atomic64_inc(&wib->stat_stale_fast);
+		return false;
+	}
+	atomic64_inc(&wib->stat_stale_slow);
+
+	spin_lock_irqsave(&wib->lock, flags);
+	for (int i = 0; i < nr_data; i++) {
+		const u64 logical = full_stripe_start +
+				    ((u64)i << BTRFS_WIB_BLOCK_SHIFT);
+		const u64 cur = wib_entry_bytenr(logical);
+		const struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+		u64 mask;
+
+		if (!e)
+			continue;
+		mask = btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE);
+		if (e->stale & mask)
+			st->stale_cols |= BIT_ULL(i);
+		if (i < nr_parity && (e->stale_par & mask))
+			st->bad_parity |= BIT(i);
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+	return st->stale_cols || st->bad_parity;
 }
 
 bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 cur = wib_entry_bytenr(logical);
 	struct btrfs_wib_entry *e;
@@ -1238,17 +1341,18 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	}
 	atomic64_inc(&wib->stat_stale_slow);
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	e = wib_find_entry(wib, cur);
 	if (e)
 		stale = e->stale &
 			btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE);
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	return stale;
 }
 
 void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 end = logical + len;
 	bool freed = false;
@@ -1256,7 +1360,7 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	if (!wib)
 		return;
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
 		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
 
@@ -1272,7 +1376,7 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		if (!wib_entry_used(e))
 			freed = true;
 	}
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	if (freed)
 		wake_up_all(&wib->wait);
 }
@@ -1304,15 +1408,16 @@ void btrfs_wib_commit_prepare(struct btrfs_fs_info *fs_info)
  */
 static int wib_persist_all_slots(struct btrfs_wib *wib, int nr_slots)
 {
+	unsigned long flags;
 	int ret = 0;
 
 	mutex_lock(&wib->commit_mutex);
 	for (int i = 0; i < nr_slots; i++) {
 		u64 seq;
 
-		spin_lock(&wib->lock);
+		spin_lock_irqsave(&wib->lock, flags);
 		seq = ++wib->snap_seq;
-		spin_unlock(&wib->lock);
+		spin_unlock_irqrestore(&wib->lock, flags);
 		ret = wib_flush_and_drop_locked(wib, seq, true);
 		if (ret < 0)
 			break;
@@ -1335,6 +1440,7 @@ static int wib_persist_all_slots(struct btrfs_wib *wib, int nr_slots)
  */
 int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	bool enabled;
 	bool enable;
@@ -1345,7 +1451,7 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	if (!wib)
 		return 0;
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	enabled = wib->enabled;
 	enable = wib->enable_requested;
 	disable = wib->disable_requested;
@@ -1356,7 +1462,7 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	 */
 	if (enable)
 		wib->enable_in_progress = true;
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 
 	if (enable) {
 		/*
@@ -1365,10 +1471,10 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 		 * durable before that, so a failure has to fail the commit.
 		 */
 		ret = btrfs_wib_enable(fs_info);
-		spin_lock(&wib->lock);
+		spin_lock_irqsave(&wib->lock, flags);
 		wib->enable_in_progress = false;
 		disable = wib->disable_requested;
-		spin_unlock(&wib->lock);
+		spin_unlock_irqrestore(&wib->lock, flags);
 		if (ret)
 			return ret;
 		/*
@@ -1395,12 +1501,12 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 		const bool flag_written = btrfs_super_compat_ro_flags(fs_info->super_for_commit) &
 					  BTRFS_FEATURE_COMPAT_RO_RAID56_WRITE_INTENT;
 
-		spin_lock(&wib->lock);
+		spin_lock_irqsave(&wib->lock, flags);
 		if (!flag_written && wib->disable_armed) {
 			wib->enabled = false;
 			wib->disable_requested = false;
 			wib->disable_armed = false;
-			spin_unlock(&wib->lock);
+			spin_unlock_irqrestore(&wib->lock, flags);
 			/*
 			 * Nothing refreshes the log from here on, so whatever
 			 * block the devices carry is the one they keep -- and
@@ -1423,13 +1529,13 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 			return 0;
 		}
 		wib->disable_armed = !flag_written;
-		spin_unlock(&wib->lock);
+		spin_unlock_irqrestore(&wib->lock, flags);
 	}
 
 	mutex_lock(&wib->commit_mutex);
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	seq = ++wib->snap_seq;
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	if (!wib->prepared_valid) {
 		/* No snapshot before the flush: don't trust it, drop nothing. */
 		ret = btrfs_wib_build_block(wib, wib->prepared, 0, NULL);
@@ -1467,6 +1573,7 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
  */
 int btrfs_wib_enable(struct btrfs_fs_info *fs_info)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	bool was_enabled;
 	u64 seq;
@@ -1478,7 +1585,7 @@ int btrfs_wib_enable(struct btrfs_fs_info *fs_info)
 		return -EOPNOTSUPP;
 
 	mutex_lock(&wib->commit_mutex);
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	was_enabled = wib->enabled;
 	wib->enabled = true;
 	wib->enable_requested = false;
@@ -1491,16 +1598,16 @@ int btrfs_wib_enable(struct btrfs_fs_info *fs_info)
 		wib->disable_requested = false;
 		wib->disable_armed = false;
 	}
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	seq = ++wib->snap_seq;
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	ret = wib_flush_and_drop_locked(wib, seq, true);
 	if (ret < 0 && !was_enabled) {
-		spin_lock(&wib->lock);
+		spin_lock_irqsave(&wib->lock, flags);
 		wib->enabled = false;
-		spin_unlock(&wib->lock);
+		spin_unlock_irqrestore(&wib->lock, flags);
 	}
 	mutex_unlock(&wib->commit_mutex);
 
@@ -1517,17 +1624,18 @@ int btrfs_wib_enable(struct btrfs_fs_info *fs_info)
  */
 void btrfs_wib_disable(struct btrfs_fs_info *fs_info)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 
 	if (!wib)
 		return;
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	wib->enable_requested = false;
 	if (wib->enabled || wib->enable_in_progress) {
 		wib->disable_requested = true;
 		wib->disable_armed = false;
 	}
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	if (!btrfs_is_testing(fs_info))
 		btrfs_info(fs_info,
 			   "raid56 write-intent log will be disabled after the next commit");
@@ -1551,6 +1659,7 @@ void btrfs_wib_disable(struct btrfs_fs_info *fs_info)
  */
 int btrfs_wib_request_enable(struct btrfs_fs_info *fs_info, bool automatic)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 
 	if (!wib)
@@ -1565,7 +1674,7 @@ int btrfs_wib_request_enable(struct btrfs_fs_info *fs_info, bool automatic)
 	if (automatic && btrfs_test_opt(fs_info, NORAID56_WRITE_INTENT))
 		return -EOPNOTSUPP;
 
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	if (!wib->enabled)
 		wib->enable_requested = true;
 	/*
@@ -1575,7 +1684,7 @@ int btrfs_wib_request_enable(struct btrfs_fs_info *fs_info, bool automatic)
 	 */
 	wib->disable_requested = false;
 	wib->disable_armed = false;
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	btrfs_set_fs_compat_ro(fs_info, RAID56_WRITE_INTENT);
 	return 0;
 }
@@ -2085,6 +2194,7 @@ out:
  */
 int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 {
+	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	struct wib_recovery_stats st = { 0 };
 	struct btrfs_wib_entry *snap;
@@ -2100,12 +2210,12 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 	snap = kvcalloc(BTRFS_WIB_MAX_ENTRIES, sizeof(*snap), GFP_KERNEL);
 	if (!snap)
 		return -ENOMEM;
-	spin_lock(&wib->lock);
+	spin_lock_irqsave(&wib->lock, flags);
 	for (int i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
 		if (wib->entries[i].sticky)
 			snap[nr++] = wib->entries[i];
 	}
-	spin_unlock(&wib->lock);
+	spin_unlock_irqrestore(&wib->lock, flags);
 	if (nr == 0)
 		goto out;
 

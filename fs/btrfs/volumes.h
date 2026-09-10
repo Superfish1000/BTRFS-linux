@@ -806,6 +806,28 @@ void btrfs_rm_dev_replace_free_srcdev(struct btrfs_device *srcdev);
 void btrfs_destroy_dev_replace_tgtdev(struct btrfs_device *tgtdev,
 				      bool allow_freeze);
 bool btrfs_logical_is_raid56(struct btrfs_fs_info *fs_info, u64 logical);
+/*
+ * Testing escape hatch for the NODATACOW-on-RAID5/6 refusal.
+ *
+ * Refusing "chattr +C" on a RAID5/6 filesystem, and copying rather than
+ * overwriting in place for inodes that were already marked, removes the state
+ * in which a failed write leaves an unverifiable stale sector.  That is the
+ * point -- but it also removes the only way to BUILD that state, and the
+ * reproductions in tools/testing/btrfs/uml/nocow_stale.sh exist to show that
+ * the upstream behaviour is what it is claimed to be.  A test cannot
+ * demonstrate a bug in code it has been prevented from reaching.
+ *
+ * Debug builds only, off by default, and nothing in the filesystem consults
+ * it except the two refusals.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+bool btrfs_raid56_allow_nodatacow(void);
+bool btrfs_raid56_stale_read_legacy(void);
+#else
+static inline bool btrfs_raid56_allow_nodatacow(void) { return false; }
+static inline bool btrfs_raid56_stale_read_legacy(void) { return false; }
+#endif
+
 unsigned long btrfs_full_stripe_len(struct btrfs_fs_info *fs_info,
 				    u64 logical);
 u64 btrfs_calc_stripe_length(const struct btrfs_chunk_map *map);

@@ -113,6 +113,21 @@ writers_start() {
 }
 writers_stop() { touch $T/umltest/stop.$TAG; wait; rm -f $T/umltest/stop.$TAG; }
 rm -f $T/umltest/manifest.$TAG.new
+# The kernel refuses "chattr +C" on a RAID5/6 filesystem, and copies rather
+# than overwriting in place for inodes that were already marked.  Scenarios
+# that exist to show what happens WITHOUT that protection have to turn it off
+# explicitly; it is a debug-build knob and every other boot leaves it alone.
+# nocow_refuse deliberately does not call this: it tests the refusal.
+allow_nodatacow() {
+	echo 1 > /sys/module/btrfs/parameters/raid56_allow_nodatacow 2>/dev/null \
+		|| log "NODATACOW_KNOB_FAIL"
+}
+
+deny_nodatacow() {
+	echo 0 > /sys/module/btrfs/parameters/raid56_allow_nodatacow 2>/dev/null \
+		|| log "NODATACOW_KNOB_FAIL"
+}
+
 # device-mapper helpers: dm_setup creates d0..dN-1 over the ubd devices
 dm_setup() {
 	local i=0
@@ -150,9 +165,18 @@ dm_heal() {
 # stride so they land in different vertical stripes and on different devices.
 NOCOW_BLOCKS=32
 NOCOW_STRIDE=16          # in 4K blocks, so 64 KiB apart
-# One RAID5 full stripe on a 4-device array is 3 x BTRFS_STRIPE_LEN = 192 KiB.
-NOCOW_FS_BLOCKS=48       # 4K blocks per full stripe
+# One RAID5 full stripe is (NDEV - 1) x BTRFS_STRIPE_LEN, i.e. 192 KiB on a
+# 4-device array.  Derived rather than fixed: a scenario that needs more
+# devices to keep the metadata writable would otherwise walk the wrong stride
+# and silently test nothing.
+NOCOW_FS_BLOCKS=$(( (${NDEV:-4} - 1) * 16 ))
 NOCOW_NEXT_COL=16        # +64 KiB: the next data column of the same stripe
+# nocow_two_stale: full stripes walked, and the width of each overwrite in
+# 4K blocks.  One column short of the full stripe, so the write is still a
+# read-modify-write, while covering as many columns as possible -- the defect
+# needs two of them to land on the pair of devices that are failing.
+TWO_STRIPES=24
+TWO_WIDTH=$(( (${NDEV:-4} - 2) * 16 ))
 nocow_bad() {
 	# How many of the overwritten blocks do NOT read back as the value the
 	# overwrite was acknowledged to have written.  Zero means the data is
@@ -252,6 +276,7 @@ inplace)
 	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS $MNTDEV
 	stats
+	allow_nodatacow
 	touch $MNT/nocow; chattr +C $MNT/nocow
 	dd if=/dev/urandom of=$MNT/nocow bs=64K count=12 conv=fsync status=none
 	sync
@@ -309,6 +334,7 @@ stress)
 	: > $MAN
 	# A nodatacow file overwritten in place by one writer: its sectors are
 	# updated in place (torn content after a crash is expected for it).
+	allow_nodatacow
 	touch $MNT/nocow; chattr +C $MNT/nocow; dd if=/dev/zero of=$MNT/nocow bs=4096 count=64 conv=fsync status=none
 	for w in 1 2 3 4; do
 		(
@@ -469,6 +495,7 @@ nocow_stale)
 	dm_scan
 	do_mount "$OPTS${NOLOG:+,noraid56_write_intent}" /dev/mapper/d0
 	log "log state: $(cat /sys/fs/btrfs/*/raid56_write_intent 2>/dev/null | tr '\n' ' ')"
+	allow_nodatacow
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
 	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
@@ -675,8 +702,14 @@ nocow_cow)
 	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
+	# Back on for the writes.  An inode carrying +C that the kernel would
+	# no longer let you set is exactly the state the copy-on-write fallback
+	# exists for: marked before any RAID5/6 chunk existed, or moved onto
+	# one by a balance.
+	deny_nodatacow
 	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
 	sync
 	log "first extent: $(filefrag -v $MNT/nocow 2>/dev/null | sed -n 4p | tr -s ' ')"
@@ -723,6 +756,7 @@ nocow_rmw)
 	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
 	dd if=/dev/zero bs=1M count=4 status=none | tr '\000' 'A' > $MNT/nocow
@@ -747,6 +781,7 @@ nocow_rmw)
 	# cleared at unmount, so any busy filesystem cycles through it.  Touch
 	# more distinct full stripes than it can hold, so pass 2 has to read the
 	# disk like it would on a real array.
+	allow_nodatacow
 	touch $MNT/churn; chattr +C $MNT/churn 2>/dev/null
 	fallocate -l 256M $MNT/churn 2>/dev/null || log "FALLOCATE_FAIL"
 	n=0
@@ -796,6 +831,7 @@ nocow_replay_prep)
 	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
 	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
@@ -844,6 +880,97 @@ nocow_replay_recover)
 	stats "after replay recovery"
 	kmsg "replay|write-intent" 6
 	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+nocow_two_stale)
+	# Does forcing a rebuild for every sector the log calls stale make
+	# reads WORSE than not having the record at all?
+	#
+	# The state-machine model says it does, in the states where the
+	# rebuild does not fit inside the profile's tolerance
+	# (tools/testing/btrfs/scrub_policy_model.py --all-readers, reader
+	# "stale-any": 6835 of 14446 RAID5 states).  This builds one of them.
+	#
+	# TWO devices fail their writes, and each overwrite spans two data
+	# columns of one full stripe.  When both of those columns land on the
+	# failing pair the write takes two faults, which RAID5 does not
+	# tolerate, so it is REFUSED -- the caller is told nothing landed and
+	# the committed content is still what was there before.  But the log
+	# records both columns stale, and a reader that acts on that record
+	# without checking the budget asks for two reconstructions from one
+	# parity.  Upstream would have returned the committed content off the
+	# disk.
+	#
+	# So: reads that fail, or that come back as neither the old content
+	# nor the new, are the defect.  Either value is acceptable -- which one
+	# depends on whether that stripe's write was refused or acknowledged,
+	# and the point is that neither is garbage.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
+	[ "${LEGACY:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_stale_read_legacy \
+			2>/dev/null || log "LEGACY_ARM_FAIL"
+		log "legacy stale-read behaviour armed"
+	}
+	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
+	dd if=/dev/zero bs=1M count=16 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	log "layout: $(filefrag -v $MNT/nocow 2>/dev/null | sed -n 4p | tr -s ' ')"
+	# Two devices, so a write spanning two data columns of one full stripe
+	# can take two faults at once.
+	dm_error_writes 1; dm_error_writes 2
+	log "write errors on devices 1 and 2"
+	# One 4K write per data column, each its own read-modify-write.  Each
+	# takes at most ONE fault -- the column either sits on a failing device
+	# or it does not -- so every write stays inside RAID5 tolerance and is
+	# acknowledged, and the filesystem stays writable.  Two failing devices
+	# then leave TWO columns of the same full stripe recorded stale, which
+	# is one more than a single parity can rebuild.  A write wide enough to
+	# take both faults at once is refused instead, and the transaction
+	# abort that follows ends the scenario before it has built anything.
+	#
+	# Deliberately no conv=fsync either: that syncs the tree log on every
+	# write, and with two devices erroring that aborts the transaction too.
+	for i in $(seq 0 $((TWO_STRIPES-1))); do
+		for c in $(seq 0 $((NDEV-2))); do
+			dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+			dd of=$MNT/nocow bs=4096 \
+			   seek=$((i * NOCOW_FS_BLOCKS + c * NOCOW_NEXT_COL)) \
+			   count=1 conv=notrunc status=none 2>/dev/null
+		done
+	done
+	sync
+	log "per-column overwrites: $TWO_STRIPES stripes x $((NDEV-1)) columns"
+	stats "after write errors"
+	dm_heal 1; dm_heal 2; log "healed devices 1 and 2"
+	# Read back one block from each of the two columns of every stripe
+	# touched, with every device present and healthy.
+	garbage=0; ioerr=0; olds=0; news=0
+	for i in $(seq 0 $((TWO_STRIPES-1))); do
+		for c in $(seq 0 $((NDEV-2))); do
+			off=$((i * NOCOW_FS_BLOCKS + c * NOCOW_NEXT_COL))
+			if ! out=$(dd if=$MNT/nocow bs=4096 skip=$off count=1 \
+				      status=none 2>/dev/null); then
+				ioerr=$((ioerr+1)); continue
+			fi
+			if [ -z "$(printf %s "$out" | tr -d 'A')" ]; then
+				olds=$((olds+1))
+			elif [ -z "$(printf %s "$out" | tr -d 'B')" ]; then
+				news=$((news+1))
+			else
+				garbage=$((garbage+1))
+			fi
+		done
+	done
+	log "NOCOW_TWO_STALE garbage=$garbage ioerr=$ioerr old=$olds new=$news of $((TWO_STRIPES*(NDEV-1)))"
+	echo "$garbage $ioerr" > $T/umltest/nocow.twostale.${LEGACY:-0}.$TAG
+	kmsg "raid56|write-intent" 6
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
 	finish
 	;;
 nocow_scrub)
@@ -930,6 +1057,7 @@ degraded_fresh)
 	# extent in place, which cannot be redirected to fresh space.
 	dd if=/dev/urandom of=$MNT/big bs=1M count=4 conv=fsync status=none 2>/dev/null
 	sync
+	allow_nodatacow
 	chattr +C $MNT/nocow 2>/dev/null
 	dd if=/dev/zero of=$MNT/nocow bs=1M count=2 conv=fsync status=none 2>/dev/null
 	sync
@@ -1005,6 +1133,7 @@ stale_parity)
 	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
 	mkdir -p $MNT/nc; chattr +C $MNT/nc 2>/dev/null
 	dd if=/dev/urandom of=$MNT/nc/f bs=64K count=24 conv=fsync status=none
 	sync

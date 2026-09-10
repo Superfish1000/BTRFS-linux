@@ -1764,6 +1764,98 @@ static void rbio_update_error_bitmap(struct btrfs_raid_bio *rbio, struct bio *bi
 		set_bit(i, rbio->error_bitmap);
 }
 
+/*
+ * Treat the sectors the write-intent log records as stale the way a failed
+ * checksum is treated, so they are rebuilt from the parity rather than
+ * believed -- but only when the rebuild can actually be done.
+ *
+ * Three conditions, each of which is a counterexample the state-machine model
+ * produced from an earlier version that did not have it
+ * (tools/testing/btrfs/scrub_policy_model.py --all-readers):
+ *
+ *  - every stale column of the FULL STRIPE is marked, not only the sectors
+ *    in the bio at hand.  A parity describes the whole stripe; rebuilding one
+ *    column while another column it was computed from is also stale returns a
+ *    value nothing ever committed.
+ *
+ *  - a parity the log records as stale is marked failed too, so the rebuild
+ *    does not use it.  It describes an older data vector, and rebuilding from
+ *    it undoes an acknowledged write just as surely as folding a stale sector
+ *    into a new parity does.
+ *
+ *  - if all of that would not fit inside the profile's fault tolerance,
+ *    nothing is marked at all.  Without a checksum a rebuild that runs out of
+ *    equations does not fail loudly, it returns garbage; leaving the stale
+ *    sector alone is what the code did before this record existed, and being
+ *    no worse than that in the cases it cannot help is what makes it safe to
+ *    have on.
+ */
+static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
+{
+	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
+	const int nr_parity = rbio->real_stripes - rbio->nr_data;
+	struct btrfs_wib_stripe_state st;
+	u32 failed = 0, add = 0;
+	int nr_failed = 0;
+
+	if (rbio->real_stripes > 32)
+		return;
+	if (!btrfs_wib_stripe_state(fs_info, rbio->bioc->full_stripe_logical,
+				    rbio->nr_data, nr_parity, &st))
+		return;
+
+	/*
+	 * The defect this function was rewritten to fix, on a switch, so the
+	 * test that demonstrates the fix can also demonstrate the failure
+	 * without a second kernel.  See raid56_stale_read_legacy.
+	 */
+	if (btrfs_raid56_stale_read_legacy()) {
+		for (int i = 0; i < rbio->nr_data; i++) {
+			const int first = i * rbio->stripe_nsectors;
+
+			if (!(st.stale_cols & BIT_ULL(i)))
+				continue;
+			for (int nr = 0; nr < rbio->stripe_nsectors; nr++)
+				set_bit(first + nr, rbio->error_bitmap);
+		}
+		return;
+	}
+
+	/* Stripes already known bad; their faults count against the budget. */
+	for (int i = 0; i < rbio->real_stripes; i++) {
+		const int first = i * rbio->stripe_nsectors;
+		const int end = first + rbio->stripe_nsectors;
+
+		if (find_next_bit(rbio->error_bitmap, end, first) < end) {
+			failed |= BIT(i);
+			nr_failed++;
+		}
+	}
+
+	for (int i = 0; i < rbio->nr_data; i++)
+		if ((st.stale_cols & BIT_ULL(i)) && !(failed & BIT(i)))
+			add |= BIT(i);
+	for (int p = 0; p < nr_parity; p++)
+		if ((st.bad_parity & BIT(p)) && !(failed & BIT(rbio->nr_data + p)))
+			add |= BIT(rbio->nr_data + p);
+
+	if (nr_failed + hweight32(add) > nr_parity)
+		return;
+
+	/*
+	 * Several bios share this bitmap, so set_bit() one at a time rather
+	 * than bitmap_set(); see the comment in rbio_update_error_bitmap().
+	 */
+	for (int i = 0; i < rbio->real_stripes; i++) {
+		const int first = i * rbio->stripe_nsectors;
+
+		if (!(add & BIT(i)))
+			continue;
+		for (int nr = 0; nr < rbio->stripe_nsectors; nr++)
+			set_bit(first + nr, rbio->error_bitmap);
+	}
+}
+
 /* Verify the data sectors at read time. */
 static void verify_bio_data_sectors(struct btrfs_raid_bio *rbio,
 				    struct bio *bio)
@@ -1785,24 +1877,14 @@ static void verify_bio_data_sectors(struct btrfs_raid_bio *rbio,
 	 * records.  This runs BEFORE the csum_bitmap check below, and must:
 	 * fill_data_csums() frees the bitmap outright when nothing in the
 	 * stripe has a checksum, which is precisely the nodatacow case this
-	 * exists for.  Checked here, a stale sector is marked exactly as a
-	 * checksum mismatch would mark it, and is rebuilt from the parity
-	 * instead of believed -- so the next parity this write computes keeps
-	 * the value the caller was told is on the disk, rather than the one
-	 * the device did not take.
+	 * exists for.  Marked here, a stale sector is treated exactly as a
+	 * checksum mismatch would be, and is rebuilt from the parity instead
+	 * of believed -- so the next parity this write computes keeps the
+	 * value the caller was told is on the disk, rather than the one the
+	 * device did not take.
 	 */
-	if (unlikely(btrfs_wib_any_stale(fs_info))) {
-		const int nr = bio_get_size(bio) >> fs_info->sectorsize_bits;
-
-		for (int i = 0; i < nr; i++) {
-			const int sector_nr = total_sector_nr + i;
-			const u64 logical = rbio->bioc->full_stripe_logical +
-				((u64)sector_nr << fs_info->sectorsize_bits);
-
-			if (btrfs_wib_stale(fs_info, logical))
-				set_bit(sector_nr, rbio->error_bitmap);
-		}
-	}
+	if (unlikely(btrfs_wib_any_stale(fs_info)))
+		mark_stale_sectors(rbio);
 
 	/* No data csum for the whole stripe, nothing else to verify. */
 	if (!rbio->csum_bitmap || !rbio->csum_buf)
@@ -2911,6 +2993,58 @@ static void rmw_update_stale_data(struct btrfs_raid_bio *rbio, u64 full_stripe_s
 	}
 }
 
+/*
+ * Say, for each parity of this full stripe, whether it still describes the
+ * data on disk.  A read-modify-write always writes every parity, so a write
+ * that landed clears a record an earlier failure left behind and one that did
+ * not sets it.
+ *
+ * The read and scrub paths need this to be a separate question from which
+ * DATA is stale: rebuilding a data column out of a parity whose own write
+ * failed returns the value that parity was last computed from, which is not
+ * what was acknowledged.  See mark_stale_sectors().
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+/* See btrfs_raid56_stale_read_legacy() in volumes.h. */
+static bool stale_read_legacy;
+module_param_named(raid56_stale_read_legacy, stale_read_legacy, bool, 0644);
+MODULE_PARM_DESC(raid56_stale_read_legacy,
+		 "Mark stale sectors without checking that the rebuild fits inside the profile's tolerance, as the first version did (testing only: restores a known defect)");
+
+bool btrfs_raid56_stale_read_legacy(void)
+{
+	return READ_ONCE(stale_read_legacy);
+}
+
+/* See btrfs_raid56_allow_nodatacow() in volumes.h. */
+static bool allow_nodatacow;
+module_param_named(raid56_allow_nodatacow, allow_nodatacow, bool, 0644);
+MODULE_PARM_DESC(raid56_allow_nodatacow,
+		 "Permit NODATACOW on RAID5/6, which is not safe (testing only)");
+
+bool btrfs_raid56_allow_nodatacow(void)
+{
+	return READ_ONCE(allow_nodatacow);
+}
+#endif
+
+static void rmw_update_stale_parity(struct btrfs_raid_bio *rbio,
+				    u64 full_stripe_start)
+{
+	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
+	const int nr_parity = rbio->real_stripes - rbio->nr_data;
+
+	for (int p = 0; p < nr_parity; p++) {
+		const int first = (rbio->nr_data + p) * rbio->stripe_nsectors;
+		const int end = first + rbio->stripe_nsectors;
+		const bool stale =
+			find_next_bit(rbio->error_bitmap, end, first) < end;
+
+		btrfs_wib_update_stale_parity(fs_info, full_stripe_start, p,
+					      stale);
+	}
+}
+
 static void rmw_rbio(struct btrfs_raid_bio *rbio)
 {
 	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
@@ -3084,6 +3218,7 @@ out:
 		 * current again.
 		 */
 		rmw_update_stale_data(rbio, full_stripe_start);
+		rmw_update_stale_parity(rbio, full_stripe_start);
 	}
 	else if (ret >= 0 && !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors))
 		/*
