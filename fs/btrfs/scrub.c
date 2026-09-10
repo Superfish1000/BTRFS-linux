@@ -1807,6 +1807,12 @@ static int scrub_find_fill_first_stripe(struct btrfs_block_group *bg,
 static void scrub_reset_stripe(struct scrub_stripe *stripe)
 {
 	scrub_stripe_reset_bitmaps(stripe);
+	/*
+	 * Not one of stripe->bitmaps, so scrub_stripe_reset_bitmaps() does not
+	 * cover it: scrub_write_endio() sets it when a repair write fails, and
+	 * a reused stripe would carry that into the next thing it describes.
+	 */
+	stripe->write_error_bitmap = 0;
 
 	stripe->nr_meta_extents = 0;
 	stripe->nr_data_extents = 0;
