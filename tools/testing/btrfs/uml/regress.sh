@@ -186,6 +186,18 @@ check_scenario() { # <tag> <resultfile> <label>
 		grep -ahrE "BUG:|KASAN|Oops|hung task" $d 2>/dev/null | head -2
 		return
 	fi
+	# A boot that was killed rather than finishing invalidates everything
+	# after it: the background writers record a file in the manifest as soon
+	# as dd returns, so a kill mid-flight leaves the manifest naming files
+	# whose data never landed, and the verification below then reports that
+	# as corruption.  timeout(1) exits 124.  Say "the setup died" instead of
+	# letting it masquerade as lost data.
+	if grep -aq "rc=124" $f; then
+		fail "$label: a boot timed out -- setup incomplete, verification not meaningful"
+		grep -a "rc=124" $f | head -2
+		return
+	fi
+
 	# The verdict the scenarios actually emit.  verify_manifest() prefixes
 	# both lines with the caller's label, so they read
 	#     [recover]  FULL_MANIFEST total=48 bad=0
