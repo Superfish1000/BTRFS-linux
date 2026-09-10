@@ -2017,6 +2017,7 @@ static int wib_recover_one(struct btrfs_fs_info *fs_info, struct scrub_ctx *sctx
 	"raid56 write-intent log: full stripe at %llu has unrepairable sectors, keeping it recorded",
 			  *start);
 		st->failed++;
+		st->kept++;
 		atomic64_inc(&wib->stat_recovery_errors);
 		return 1;
 	}
@@ -2025,6 +2026,7 @@ static int wib_recover_one(struct btrfs_fs_info *fs_info, struct scrub_ctx *sctx
 	"raid56 write-intent log: failed to recover full stripe at %llu: %d, keeping it recorded",
 			  *start, ret);
 		st->failed++;
+		st->kept++;
 		atomic64_inc(&wib->stat_recovery_errors);
 		/* Only a resource shortage is worth failing the mount for. */
 		if (ret == -ENOMEM)
@@ -2166,8 +2168,8 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 	}
 
 	btrfs_info(fs_info,
-	"raid56 write-intent log: recovery done, %u full stripes scrubbed, %u skipped, %u unrepairable, %u kept recorded",
-		   st.done, st.skipped, st.failed, st.kept);
+	"raid56 write-intent log: recovery done, %u full stripes scrubbed, %u skipped, %u kept recorded for a later pass, %u of those unrepairable now",
+		   st.done, st.skipped, st.kept, st.failed);
 
 	kvfree(wib->pending);
 	wib->pending = NULL;
@@ -2279,8 +2281,8 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 	}
 
 	btrfs_info(fs_info,
-	"raid56 write-intent log: recovery after log replay done, %u full stripes scrubbed, %u skipped, %u unrepairable, %u kept recorded",
-		   st.done, st.skipped, st.failed, st.kept);
+	"raid56 write-intent log: recovery after log replay done, %u full stripes scrubbed, %u skipped, %u kept recorded for a later pass, %u of those unrepairable now",
+		   st.done, st.skipped, st.kept, st.failed);
 	ret = wib_persist_all_slots(wib, 1);
 out_end:
 	btrfs_scrub_raid56_recovery_end(fs_info, sctx);
