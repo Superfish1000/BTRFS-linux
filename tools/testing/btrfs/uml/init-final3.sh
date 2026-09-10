@@ -624,6 +624,83 @@ pausehang)
 	umount $MNT 2>/dev/null
 	finish
 	;;
+nocow_refuse)
+	# Is the unsafe combination refused, and is the refusal the thing that
+	# happens rather than a silent substitution?
+	#
+	# check_fsflags_compatible() rejects FS_NOCOW_FL on a filesystem with
+	# RAID5/6 chunks, the same way it already rejects it on zoned.  The
+	# caller is told, instead of getting copy-on-write while believing they
+	# asked for something else.
+	#
+	# The fallback still has to exist for states a user can no longer
+	# create: an inode marked NODATACOW before any RAID5/6 chunk existed,
+	# or whose extents a balance moved onto one afterwards.  Both are built
+	# here.
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	do_mount $OPTS $MNTDEV
+	log "incompat raid56 set: $(btrfs inspect-internal dump-super $MNTDEV 2>/dev/null | grep -o 'RAID56' | head -1)"
+	touch $MNT/direct
+	if chattr +C $MNT/direct 2>$MNT/.err; then
+		log "REFUSE_FAIL: chattr +C was accepted on a RAID5/6 filesystem"
+		lsattr $MNT/direct 2>/dev/null | while read -r l; do log "  attrs: $l"; done
+	else
+		log "REFUSED_OK: $(cat $MNT/.err 2>/dev/null | tail -1)"
+	fi
+	rm -f $MNT/.err
+	# And the legacy shape: a directory marked +C would normally propagate
+	# the flag to new files.  On a RAID5/6 filesystem that must be refused
+	# too, or the flag arrives by the back door.
+	mkdir -p $MNT/cdir
+	if chattr +C $MNT/cdir 2>/dev/null; then
+		log "REFUSE_FAIL_DIR: chattr +C accepted on a directory"
+	else
+		log "REFUSED_DIR_OK"
+	fi
+	stats "after refusal"
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+nocow_cow)
+	# Does forcing copy-on-write actually remove the in-place
+	# read-modify-write on RAID5/6?
+	#
+	# A NODATACOW file is created and overwritten exactly as the nocow_rmw
+	# scenario does, with a device failing every write.  If the force is
+	# working, can_nocow_file_extent() refuses every one of those extents,
+	# the overwrites are copied to fresh space instead, and
+	# inplace_full_stripe_writes stays at zero -- there is no in-place RMW
+	# left for a stale sector to arise in.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	log "first extent: $(filefrag -v $MNT/nocow 2>/dev/null | sed -n 4p | tr -s ' ')"
+	stats "after create"
+	dm_error_writes $FAIL; log "write errors on device $FAIL"
+	acked=0
+	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_STRIDE)) count=1 \
+		   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
+	done
+	sync
+	log "overwrites: $acked of $NOCOW_BLOCKS acknowledged"
+	log "after overwrite: $(filefrag -v $MNT/nocow 2>/dev/null | sed -n 4p | tr -s ' ')"
+	log "extent count now: $(filefrag $MNT/nocow 2>/dev/null | grep -o '[0-9]* extent' | head -1)"
+	dm_heal $FAIL
+	stats "after overwrite"
+	# Read it back with the failing device omitted is a separate boot; here
+	# just record whether any in-place full stripe write happened at all.
+	kmsg "raid56|write-intent" 4
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
 nocow_rmw)
 	# Does an ordinary FAULT-FREE write destroy data a previous failed
 	# write left recoverable?

@@ -250,6 +250,25 @@ static int check_fsflags_compatible(const struct btrfs_fs_info *fs_info,
 	if (btrfs_is_zoned(fs_info) && (flags & FS_NOCOW_FL))
 		return -EPERM;
 
+	/*
+	 * Same reasoning as zoned, for a different reason: NODATACOW means an
+	 * in-place overwrite, and on RAID5/6 that is a read-modify-write of a
+	 * stripe holding live data.  NODATACOW also means no checksum, so when
+	 * a write to one of those sectors fails, nothing afterwards can tell
+	 * the stale sector from a good one -- the read path folds it into the
+	 * new parity and scrub recomputes the parity from it, each destroying
+	 * the copy that still held what the write was acknowledged to have
+	 * stored.  Measured at 8 of 32 acknowledged blocks lost with scrub
+	 * reporting no errors at all.
+	 *
+	 * Refuse rather than quietly copy-on-write instead: the caller asked
+	 * for a specific behaviour, and silently substituting another one
+	 * leaves them believing they have it.  An error says what is actually
+	 * on offer.
+	 */
+	if (btrfs_fs_incompat(fs_info, RAID56) && (flags & FS_NOCOW_FL))
+		return -EPERM;
+
 	return 0;
 }
 

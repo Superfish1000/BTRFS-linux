@@ -1877,6 +1877,48 @@ static int can_nocow_file_extent(struct btrfs_path *path,
 	io_start = args->file_extent.disk_bytenr + args->file_extent.offset;
 
 	/*
+	 * Force COW on RAID5/6.  An in-place overwrite there is a
+	 * read-modify-write of a stripe that already holds live data, and a
+	 * NODATACOW extent has no checksum, so nothing can tell a sector a
+	 * failed write left stale from a good one.  Everything downstream then
+	 * has to guess: the read path believes the stale sector and folds it
+	 * into the new parity, and scrub "verifies" it (see
+	 * scrub_verify_one_sector(), "no other choice but to trust it") and
+	 * recomputes the parity from it -- destroying the copy that still held
+	 * what the write was acknowledged to have stored.  Measured at 8 of 32
+	 * acknowledged blocks lost, with scrub reporting no errors at all.
+	 *
+	 * Copy-on-write lands in fresh space that no committed transaction
+	 * references, so a failure there can lose nothing that was promised.
+	 * That removes the ambiguity rather than arbitrating it afterwards,
+	 * which is the only approach that works without a checksum to appeal
+	 * to.
+	 *
+	 * This is a FALLBACK, not the primary answer.  Setting the flag on a
+	 * filesystem that already has RAID5/6 chunks is refused outright by
+	 * check_fsflags_compatible(), because silently substituting a
+	 * different behaviour for the one the caller asked for leaves them
+	 * believing they have it.  What reaches here is the state a user can
+	 * no longer create but may already have: an inode that was marked
+	 * NODATACOW before any RAID5/6 chunk existed, or whose extents were
+	 * moved onto one by a balance or a profile conversion afterwards.
+	 * Those files cannot be refused retroactively, so they are copied
+	 * instead of overwritten, and said so.
+	 *
+	 * The cost falls on exactly the workloads NODATACOW exists for -- VM
+	 * images and databases -- which get fragmentation and write
+	 * amplification back on these profiles.  raid56_forced_cow counts it
+	 * so it can be seen rather than guessed at.
+	 */
+	if (btrfs_logical_is_raid56(root->fs_info, io_start)) {
+		atomic64_inc(&root->fs_info->raid56_write_stats.forced_cow);
+		btrfs_warn_rl(root->fs_info,
+"inode %llu is NODATACOW but its extent at %llu is in a RAID5/6 block group; copying instead of overwriting in place, because an in-place write there cannot be verified",
+			      btrfs_ino(inode), io_start);
+		goto out;
+	}
+
+	/*
 	 * Force COW if csums exist in the range. This ensures that csums for a
 	 * given extent are either valid or do not exist.
 	 */

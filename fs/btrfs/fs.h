@@ -540,6 +540,13 @@ struct btrfs_raid56_write_stats {
 	 * tree put the genuinely allocated share at 86-94%.
 	 */
 	atomic64_t partial_resident;
+	/*
+	 * NODATACOW extents that were copied instead of overwritten in place,
+	 * because they live in a RAID5/6 block group where an in-place
+	 * read-modify-write has no checksum to tell a stale sector from a good
+	 * one.  See can_nocow_file_extent().
+	 */
+	atomic64_t forced_cow;
 };
 
 struct btrfs_fs_info {

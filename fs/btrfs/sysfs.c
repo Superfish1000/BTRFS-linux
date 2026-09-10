@@ -1392,13 +1392,14 @@ static ssize_t btrfs_raid56_write_profile_show(struct kobject *kobj,
 	const struct btrfs_raid56_write_stats *st = &fs_info->raid56_write_stats;
 
 	return sysfs_emit(buf,
-		"full_stripe_writes %llu\ninplace_full_stripe_writes %llu\nsub_stripe_writes %llu\nsub_stripe_vertical_stripes %llu\nsub_stripe_written_sectors %llu\nsub_stripe_resident_sectors %llu\n",
+		"full_stripe_writes %llu\ninplace_full_stripe_writes %llu\nsub_stripe_writes %llu\nsub_stripe_vertical_stripes %llu\nsub_stripe_written_sectors %llu\nsub_stripe_resident_sectors %llu\nraid56_forced_cow %llu\n",
 		(unsigned long long)atomic64_read(&st->full),
 		(unsigned long long)atomic64_read(&st->inplace),
 		(unsigned long long)atomic64_read(&st->partial),
 		(unsigned long long)atomic64_read(&st->partial_vstripes),
 		(unsigned long long)atomic64_read(&st->partial_sectors),
-		(unsigned long long)atomic64_read(&st->partial_resident));
+		(unsigned long long)atomic64_read(&st->partial_resident),
+		(unsigned long long)atomic64_read(&st->forced_cow));
 }
 BTRFS_ATTR(, raid56_write_profile, btrfs_raid56_write_profile_show);
 
