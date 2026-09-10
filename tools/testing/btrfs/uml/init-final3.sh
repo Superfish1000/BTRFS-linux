@@ -750,7 +750,11 @@ nocow_replay_probe)
 	# mount -- so this really does read the array without any recovery
 	# having run.  The failed device is omitted, so every one of the
 	# overwritten blocks has to come from the parity.
-	do_mount ro,nologreplay,degraded $MNTDEV
+	# Plain ro,degraded.  The log has already been replayed by the recovery
+	# boot, so open_ctree() has no reason to call btrfs_wib_rw_mount() here
+	# and no recovery runs.  (ro,nologreplay,degraded is refused outright at
+	# option-parsing time -- "bad option", with no message from btrfs.)
+	do_mount ro,degraded $MNTDEV
 	bad=$(nocow_bad)
 	log "NOCOW_REPLAY_${PROBE:-x} bad=$bad of $NOCOW_BLOCKS"
 	echo $bad > $T/umltest/nocow.replay.${PROBE:-x}.$TAG

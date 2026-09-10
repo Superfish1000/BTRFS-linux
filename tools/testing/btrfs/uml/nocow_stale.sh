@@ -60,18 +60,22 @@ MNTPROBE=/dev/ubda; [ "$FAIL" = "0" ] && MNTPROBE=/dev/ubdb
 
 if [ "$WHO" = replay ]; then
 	# The after-replay recovery path: error records plus a dirty tree log.
+	# No "before" probe: reading the array without letting any recovery run
+	# needs ro,nologreplay, which is refused at option-parsing time when a
+	# log is dirty.  The premise -- that the parity holds what was
+	# acknowledged -- is already established by the log and rmw modes, and
+	# what makes this test mean anything is the control: the same run
+	# against a kernel with the fix reverted must destroy blocks.
 	boot nocow_replay_prep none /dev/ubda
-	boot nocow_replay_probe "$FAIL" $MNTPROBE PROBE=before
 	boot nocow_replay_recover none /dev/ubda
 	boot nocow_replay_probe "$FAIL" $MNTPROBE PROBE=after
-	before=$(cat $T/umltest/nocow.replay.before.$TAG 2>/dev/null || echo "?")
 	after=$(cat $T/umltest/nocow.replay.after.$TAG 2>/dev/null || echo "?")
 	echo "==== $TAG ===="; cat $T/umltest/results.$TAG; echo
-	echo "blocks unrecoverable from the parity, device $FAIL omitted:"
-	echo "  before the after-replay recovery: $before"
-	echo "  after  the after-replay recovery: $after"
-	[ "$before" = "?" ] || [ "$after" = "?" ] && { echo "RESULT: INCONCLUSIVE"; exit 2; }
-	[ "$before" -gt 0 ] 2>/dev/null && { echo "RESULT: PREMISE WRONG -- the parity did not hold them to begin with"; exit 3; }
+	echo "blocks unrecoverable from the parity after the after-replay"
+	echo "recovery, device $FAIL omitted: $after"
+	grep -q "recovery after log replay" $D/log.nocow_replay_recover.none 2>/dev/null \
+		|| { echo "RESULT: INCONCLUSIVE -- the after-replay recovery never ran"; exit 2; }
+	[ "$after" = "?" ] && { echo "RESULT: INCONCLUSIVE -- the probe reported nothing"; exit 2; }
 	[ "$after" -gt 0 ] 2>/dev/null \
 		&& { echo "RESULT: REPRODUCED -- the after-replay recovery destroyed $after block(s)"; exit 1; } \
 		|| { echo "RESULT: NOT REPRODUCED -- the data survived the after-replay recovery"; exit 0; }
