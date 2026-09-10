@@ -184,7 +184,7 @@ static struct btrfs_wib_entry *wib_find_entry(struct btrfs_wib *wib, u64 bytenr)
 {
 	lockdep_assert_held(&wib->lock);
 
-	for (int i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
 		struct btrfs_wib_entry *e = &wib->entries[i];
 
 		if (wib_entry_used(e) && e->bytenr == bytenr)
@@ -202,7 +202,7 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 {
 	lockdep_assert_held(&wib->lock);
 
-	for (int i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
 		struct btrfs_wib_entry *e = &wib->entries[i];
 
 		if (e->bitmap || !e->sticky)
@@ -234,7 +234,7 @@ static struct btrfs_wib_entry *wib_find_or_alloc_entry(struct btrfs_wib *wib,
 
 	lockdep_assert_held(&wib->lock);
 
-	for (int i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
 		struct btrfs_wib_entry *e = &wib->entries[i];
 
 		if (!wib_entry_used(e)) {
@@ -278,7 +278,7 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 		if (!wib_find_entry(wib, cur))
 			(*needed)++;
 	}
-	for (int i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
 		const struct btrfs_wib_entry *e = &wib->entries[i];
 
 		if (!wib_entry_used(e))
@@ -345,89 +345,6 @@ int btrfs_wib_try_mark(struct btrfs_wib *wib, u64 logical, u64 len)
 }
 
 /*
- * Snapshot the in-flight set into @block (commit_mutex held).  If @base is
- * a valid block, everything it lists is kept listed as well (the result is
- * a superset of @base, so no flush is needed before writing it); -ENOSPC if
- * that does not fit.
- */
-int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const void *base)
-{
-	unsigned long flags;
-	struct btrfs_fs_info *fs_info = wib->fs_info;
-	struct btrfs_wib_disk_header *hdr = block;
-	struct btrfs_wib_disk_entry *de = block + sizeof(*hdr);
-	u32 nr = 0;
-
-	/*
-	 * @base is unioned in below, after this memset has cleared @block.
-	 * Aliasing them would zero the base and silently drop everything it
-	 * lists.
-	 */
-	ASSERT(block != base);
-	memset(block, 0, BTRFS_WIB_SLOT_SIZE);
-
-	spin_lock_irqsave(&wib->lock, flags);
-	for (int i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
-		const struct btrfs_wib_entry *e = &wib->entries[i];
-
-		if (!wib_entry_used(e))
-			continue;
-		de[nr].bytenr = cpu_to_le64(e->bytenr);
-		de[nr].bitmap = cpu_to_le64(e->bitmap);
-		de[nr].error = cpu_to_le64(e->sticky);
-		de[nr].stale = cpu_to_le64(wib_no_persist() ? 0 : e->stale);
-		de[nr].stale_par = cpu_to_le64(wib_no_persist() ? 0 : e->stale_par);
-		nr++;
-	}
-	spin_unlock_irqrestore(&wib->lock, flags);
-
-	if (base) {
-		const struct btrfs_wib_disk_header *bh = base;
-		const struct btrfs_wib_disk_entry *be = base + sizeof(*bh);
-		/*
-		 * @base is always a block this kernel built -- wib->last or
-		 * wib->prepared -- so its count is in range.  Nothing here
-		 * enforces that though, and an out-of-range count would walk
-		 * be[] off the end of the slot, so clamp rather than trust
-		 * the caller to stay disciplined.
-		 */
-		const u32 bnr = min_t(u32,
-				      le64_to_cpu(bh->magic) == BTRFS_WIB_MAGIC ?
-				      le32_to_cpu(bh->nr_entries) : 0,
-				      BTRFS_WIB_MAX_ENTRIES);
-
-		for (u32 i = 0; i < bnr; i++) {
-			u32 j;
-
-			for (j = 0; j < nr; j++) {
-				if (de[j].bytenr == be[i].bytenr)
-					break;
-			}
-			if (j == nr) {
-				if (nr == BTRFS_WIB_MAX_ENTRIES)
-					return -ENOSPC;
-				de[nr++] = be[i];
-				continue;
-			}
-			de[j].bitmap |= be[i].bitmap;
-			de[j].error |= be[i].error;
-			de[j].stale |= be[i].stale;
-			de[j].stale_par |= be[i].stale_par;
-		}
-	}
-
-	memcpy(hdr->fsid, fs_info->fs_devices->metadata_uuid, BTRFS_FSID_SIZE);
-	hdr->magic = cpu_to_le64(BTRFS_WIB_MAGIC);
-	hdr->seq = cpu_to_le64(seq);
-	hdr->nr_entries = cpu_to_le32(nr);
-	hdr->block_shift = cpu_to_le32(BTRFS_WIB_BLOCK_SHIFT);
-	hdr->flags = cpu_to_le64(BTRFS_WIB_FLAG_STALE);
-	btrfs_csum(fs_info->csum_type, block + BTRFS_CSUM_SIZE,
-		   BTRFS_WIB_SLOT_SIZE - BTRFS_CSUM_SIZE, hdr->csum);
-	return 0;
-}
-
-/*
  * Two on-disk entry layouts exist: format 1 without the stale record, and the
  * current one with it.  The header's BTRFS_WIB_FLAG_STALE says which, and
  * these two are the only places the difference is allowed to matter -- every
@@ -447,6 +364,164 @@ static u32 wib_block_max_entries(const void *block)
 }
 
 /* Read entry @i of @block into @out, whichever layout the block is in. */
+/* Write entry @i of @block in whichever layout its header declares. */
+static void wib_write_entry(void *block, u32 i, const struct btrfs_wib_entry *e)
+{
+	struct btrfs_wib_disk_header *hdr = block;
+
+	if (wib_block_is_v1(block)) {
+		struct btrfs_wib_disk_entry_v1 *de = block + sizeof(*hdr);
+
+		de[i].bytenr = cpu_to_le64(e->bytenr);
+		de[i].bitmap = cpu_to_le64(e->bitmap);
+		de[i].error = cpu_to_le64(e->sticky);
+	} else {
+		struct btrfs_wib_disk_entry *de = block + sizeof(*hdr);
+
+		de[i].bytenr = cpu_to_le64(e->bytenr);
+		de[i].bitmap = cpu_to_le64(e->bitmap);
+		de[i].error = cpu_to_le64(e->sticky);
+		de[i].stale = cpu_to_le64(wib_no_persist() ? 0 : e->stale);
+		de[i].stale_par = cpu_to_le64(wib_no_persist() ? 0 : e->stale_par);
+	}
+}
+
+/* Does @block carry any stale record at all? */
+static bool wib_block_has_stale(const void *block)
+{
+	const struct btrfs_wib_disk_header *hdr = block;
+
+	if (wib_block_is_v1(block))
+		return false;
+	for (u32 i = 0; i < le32_to_cpu(hdr->nr_entries); i++) {
+		struct btrfs_wib_entry e;
+
+		btrfs_wib_read_entry(block, i, &e);
+		if (e.stale || e.stale_par)
+			return true;
+	}
+	return false;
+}
+/*
+ * Snapshot the in-flight set into @block (commit_mutex held).  If @base is
+ * a valid block, everything it lists is kept listed as well (the result is
+ * a superset of @base, so no flush is needed before writing it); -ENOSPC if
+ * that does not fit.
+ */
+int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const void *base)
+{
+	unsigned long flags;
+	struct btrfs_fs_info *fs_info = wib->fs_info;
+	struct btrfs_wib_disk_header *hdr = block;
+	u32 max, nr = 0;
+	bool v2 = false;
+
+	/*
+	 * @base is unioned in below, after this memset has cleared @block.
+	 * Aliasing them would zero the base and silently drop everything it
+	 * lists.
+	 */
+	ASSERT(block != base);
+	memset(block, 0, BTRFS_WIB_SLOT_SIZE);
+
+	spin_lock_irqsave(&wib->lock, flags);
+	/*
+	 * Pick the narrowest layout that can say everything this block has to
+	 * say, and pick it BEFORE writing anything, because the header flag
+	 * that records the choice is also what wib_write_entry() and
+	 * btrfs_wib_read_entry() key their stride off.
+	 *
+	 * Two reasons this is not simply "always write the wide one".  A block
+	 * carrying the wide layout is refused outright by any kernel that
+	 * predates it -- correctly, since it cannot know the stride -- and
+	 * refusing a log means the stripes it covers are never recovered.
+	 * Stamping the wide format on every block would impose that on every
+	 * filesystem, including ones that have never had a stale record in
+	 * their lives.  And the wide entry costs capacity that turns directly
+	 * into device-wide cache flushes on the write path: 99 entries against
+	 * 165 before the on-disk union overflows and btrfs_wib_mark() has to
+	 * wait for a REQ_PREFLUSH to every device.
+	 *
+	 * Nothing stale is the overwhelmingly common case -- it is why
+	 * btrfs_wib_stale() has a lock-free nr_stale == 0 fast path -- so the
+	 * common case pays neither.
+	 */
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
+		const struct btrfs_wib_entry *e = &wib->entries[i];
+
+		if (wib_entry_used(e) && (e->stale | e->stale_par)) {
+			v2 = true;
+			break;
+		}
+	}
+	if (!v2 && base && le64_to_cpu(((const struct btrfs_wib_disk_header *)base)->magic)
+			   == BTRFS_WIB_MAGIC && wib_block_has_stale(base))
+		v2 = true;
+	hdr->flags = v2 ? cpu_to_le64(BTRFS_WIB_FLAG_STALE) : 0;
+	max = wib_block_max_entries(block);
+
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
+		const struct btrfs_wib_entry *e = &wib->entries[i];
+
+		if (!wib_entry_used(e))
+			continue;
+		if (nr == max) {
+			spin_unlock_irqrestore(&wib->lock, flags);
+			return -ENOSPC;
+		}
+		wib_write_entry(block, nr++, e);
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+
+	if (base) {
+		const struct btrfs_wib_disk_header *bh = base;
+		/*
+		 * @base is always a block this kernel built -- wib->last or
+		 * wib->prepared -- so its count is in range.  Nothing here
+		 * enforces that though, and an out-of-range count would walk
+		 * off the end of the slot, so clamp rather than trust the
+		 * caller to stay disciplined.
+		 */
+		const u32 bnr = min_t(u32,
+				      le64_to_cpu(bh->magic) == BTRFS_WIB_MAGIC ?
+				      le32_to_cpu(bh->nr_entries) : 0,
+				      wib_block_max_entries(base));
+
+		for (u32 i = 0; i < bnr; i++) {
+			struct btrfs_wib_entry be, cur;
+			u32 j;
+
+			btrfs_wib_read_entry(base, i, &be);
+			for (j = 0; j < nr; j++) {
+				btrfs_wib_read_entry(block, j, &cur);
+				if (cur.bytenr == be.bytenr)
+					break;
+			}
+			if (j == nr) {
+				if (nr == max)
+					return -ENOSPC;
+				wib_write_entry(block, nr++, &be);
+				continue;
+			}
+			cur.bitmap |= be.bitmap;
+			cur.sticky |= be.sticky;
+			cur.stale |= be.stale;
+			cur.stale_par |= be.stale_par;
+			wib_write_entry(block, j, &cur);
+		}
+	}
+
+	memcpy(hdr->fsid, fs_info->fs_devices->metadata_uuid, BTRFS_FSID_SIZE);
+	hdr->magic = cpu_to_le64(BTRFS_WIB_MAGIC);
+	hdr->seq = cpu_to_le64(seq);
+	hdr->nr_entries = cpu_to_le32(nr);
+	hdr->block_shift = cpu_to_le32(BTRFS_WIB_BLOCK_SHIFT);
+	btrfs_csum(fs_info->csum_type, block + BTRFS_CSUM_SIZE,
+		   BTRFS_WIB_SLOT_SIZE - BTRFS_CSUM_SIZE, hdr->csum);
+	return 0;
+}
+
+
 void btrfs_wib_read_entry(const void *block, u32 i, struct btrfs_wib_entry *out)
 {
 	const struct btrfs_wib_disk_header *hdr = block;
@@ -551,22 +626,27 @@ bool btrfs_wib_block_valid(const struct btrfs_fs_info *fs_info, const void *bloc
 	return true;
 }
 
-static u64 wib_disk_entry_bits(const struct btrfs_wib_disk_entry *de)
+/*
+ * These walk blocks this kernel built -- wib->last and wib->prepared -- which
+ * used to make them stride-safe by construction.  They are not any more: a
+ * block is written in the narrow layout whenever nothing is stale, so the same
+ * kernel produces both, and every one of them has to decode rather than index.
+ */
+static u64 wib_entry_bits(const struct btrfs_wib_entry *e)
 {
-	return le64_to_cpu(de->bitmap) | le64_to_cpu(de->error);
+	return e->bitmap | e->sticky;
 }
 
 /* Return the bits of @oe (any kind) that @new no longer lists. */
-static u64 wib_dropped_bits(const struct btrfs_wib_disk_entry *oe, const void *new)
+static u64 wib_dropped_bits(const struct btrfs_wib_entry *oe, const void *new)
 {
 	const struct btrfs_wib_disk_header *nh = new;
-	const struct btrfs_wib_disk_entry *ne = new + sizeof(*nh);
 	const u32 nnr = le32_to_cpu(nh->nr_entries);
-	u64 bits = wib_disk_entry_bits(oe);
+	u64 bits = wib_entry_bits(oe);
 	/*
 	 * A stale bit going away has to count as a dropped bit in its own
 	 * right, and cannot be folded into the OR above: @stale is a subset of
-	 * @error, so bitmap|error|stale is just bitmap|error and a stale bit
+	 * @sticky, so bitmap|sticky|stale is just bitmap|sticky and a stale bit
 	 * clearing on its own would look like no change at all.
 	 *
 	 * It has to count because of what clears it -- a data write that
@@ -577,12 +657,15 @@ static u64 wib_dropped_bits(const struct btrfs_wib_disk_entry *oe, const void *n
 	 * as dropped makes the commit flush first, which is the ordering the
 	 * record needs.
 	 */
-	u64 stale = le64_to_cpu(oe->stale);
+	u64 stale = oe->stale;
 
 	for (u32 j = 0; j < nnr && (bits || stale); j++) {
-		if (ne[j].bytenr == oe->bytenr) {
-			bits &= ~wib_disk_entry_bits(&ne[j]);
-			stale &= ~le64_to_cpu(ne[j].stale);
+		struct btrfs_wib_entry ne;
+
+		btrfs_wib_read_entry(new, j, &ne);
+		if (ne.bytenr == oe->bytenr) {
+			bits &= ~wib_entry_bits(&ne);
+			stale &= ~ne.stale;
 		}
 	}
 	return bits | stale;
@@ -592,14 +675,16 @@ static u64 wib_dropped_bits(const struct btrfs_wib_disk_entry *oe, const void *n
 bool btrfs_wib_block_drops(const void *old, const void *new)
 {
 	const struct btrfs_wib_disk_header *oh = old;
-	const struct btrfs_wib_disk_entry *oe = old + sizeof(*oh);
 	const u32 onr = le32_to_cpu(oh->nr_entries);
 
 	if (le64_to_cpu(oh->magic) != BTRFS_WIB_MAGIC)
 		return false;
 
 	for (u32 i = 0; i < onr; i++) {
-		if (wib_dropped_bits(&oe[i], new))
+		struct btrfs_wib_entry oe;
+
+		btrfs_wib_read_entry(old, i, &oe);
+		if (wib_dropped_bits(&oe, new))
 			return true;
 	}
 	return false;
@@ -880,7 +965,6 @@ static void wib_readd_dropped(struct btrfs_wib *wib)
 {
 	unsigned long flags;
 	const struct btrfs_wib_disk_header *oh = wib->last;
-	const struct btrfs_wib_disk_entry *oe = wib->last + sizeof(*oh);
 	const u32 onr = le32_to_cpu(oh->nr_entries);
 	unsigned int nr_readded = 0;
 	unsigned int nr_lost = 0;
@@ -892,10 +976,13 @@ static void wib_readd_dropped(struct btrfs_wib *wib)
 
 	spin_lock_irqsave(&wib->lock, flags);
 	for (u32 i = 0; i < onr; i++) {
-		const u64 bytenr = le64_to_cpu(oe[i].bytenr);
-		u64 bits = wib_disk_entry_bits(&oe[i]);
+		struct btrfs_wib_entry old;
 		struct btrfs_wib_entry *e;
+		u64 bytenr, bits;
 
+		btrfs_wib_read_entry(wib->last, i, &old);
+		bytenr = old.bytenr;
+		bits = wib_entry_bits(&old);
 		e = wib_find_entry(wib, bytenr);
 		if (e)
 			bits &= ~(e->bitmap | e->sticky);
@@ -919,12 +1006,9 @@ static void wib_readd_dropped(struct btrfs_wib *wib)
 		 * to forget which side of the stripe was bad.
 		 */
 		{
-			struct btrfs_wib_entry old;
-			u64 add;
-
-			btrfs_wib_read_entry(wib->last, i, &old);
 			/* Keep the invariant that @stale is a subset of @sticky. */
-			add = (old.stale & e->sticky) & ~e->stale;
+			const u64 add = (old.stale & e->sticky) & ~e->stale;
+
 			e->stale |= add;
 			e->stale_par |= old.stale_par;
 			if (add)
@@ -2399,11 +2483,11 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 	if (!wib)
 		return 0;
 
-	snap = kvcalloc(BTRFS_WIB_MAX_ENTRIES, sizeof(*snap), GFP_KERNEL);
+	snap = kvcalloc(BTRFS_WIB_NR_ENTRIES, sizeof(*snap), GFP_KERNEL);
 	if (!snap)
 		return -ENOMEM;
 	spin_lock_irqsave(&wib->lock, flags);
-	for (int i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
 		if (wib->entries[i].sticky)
 			snap[nr++] = wib->entries[i];
 	}

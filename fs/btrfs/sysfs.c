@@ -1357,7 +1357,7 @@ static ssize_t btrfs_raid56_write_intent_show(struct kobject *kobj,
 
 	spin_lock_irqsave(&wib->lock, flags);
 	enabled = wib->enabled;
-	for (int i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
 		nr_inflight += hweight64(wib->entries[i].bitmap);
 		nr_sticky += hweight64(wib->entries[i].sticky);
 	}

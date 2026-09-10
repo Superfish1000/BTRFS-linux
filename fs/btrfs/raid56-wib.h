@@ -136,6 +136,14 @@ struct btrfs_wib_disk_header {
 #define BTRFS_WIB_MAX_ENTRIES_V1					\
 	((BTRFS_WIB_SLOT_SIZE - sizeof(struct btrfs_wib_disk_header)) /	\
 	 sizeof(struct btrfs_wib_disk_entry_v1))
+/*
+ * Size of the in-memory table, and the bound for every loop over it.  Kept
+ * separate from the two on-disk maxima above because it answers a different
+ * question: how many regions a mount can track, which has nothing to do with
+ * how wide an entry has to be on disk.  It is the larger of the two, so a
+ * block in either layout can always be built from the table.
+ */
+#define BTRFS_WIB_NR_ENTRIES		BTRFS_WIB_MAX_ENTRIES_V1
 
 /*
  * Header flags.  btrfs_wib_block_valid() rejects a block carrying any bit not
@@ -258,7 +266,13 @@ struct btrfs_wib {
 	atomic_t nr_stale;
 
 	/* In-flight sub-stripe writes, bitmap == 0 means the entry is free. */
-	struct btrfs_wib_entry entries[BTRFS_WIB_MAX_ENTRIES];
+	/*
+	 * Sized by the LARGER of the two on-disk layouts.  The live table's
+	 * capacity has nothing to do with how wide an entry has to be on
+	 * disk, and letting the narrower format set it would shrink what a
+	 * mount can track for no reason at all.
+	 */
+	struct btrfs_wib_entry entries[BTRFS_WIB_NR_ENTRIES];
 
 	/* Page sized buffer holding the block being written. */
 	void *block;

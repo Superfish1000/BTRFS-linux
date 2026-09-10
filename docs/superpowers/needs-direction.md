@@ -465,3 +465,75 @@ block group at the same logical address; and on a read-only mount
 `wib_readd_stale()` never runs, so the record is invisible for that mount --
 which is no worse than upstream, but is not protection either.
 
+---
+
+## 13. The stale record mostly fires for data that has a checksum
+
+**What.** `rmw_update_stale_data()` marks a column stale for **any** logged
+sub-stripe write that took an error. There is no nodatacow condition on it.
+And since `chattr +C` is now refused on RAID5/6 (item 10), the producers left
+in a non-debug kernel are mostly sub-stripe CoW data writes and **metadata
+tree blocks on a RAID5/6 metadata profile** -- exactly the content that *does*
+carry a checksum.
+
+The record's entire justification is "for data with no checksum this is the
+only thing that knows". For checksummed content scrub already knows: it
+verifies the sector, finds the mismatch, rebuilds it from the parity and
+writes it back. The record adds nothing there -- and the scrub skip built on
+it actively costs, because it declines to regenerate a parity scrub was
+perfectly capable of fixing.
+
+Unchecksummed data has not disappeared: an inode marked `+C` before the
+refusal existed still implies NODATASUM, and its writes are unchecksummed even
+once forced to copy-on-write. So the record still has real work to do. It just
+is not the common case any more.
+
+**The refinement.** Let the record gate the scrub only for sectors that have
+no checksum. Scrub knows which those are -- it already carries the csum
+bitmap per data stripe. Where everything in the stripe is checksummed, scrub's
+own verification is authoritative and it should proceed normally.
+
+That removes most of item 12's permanence in production, because the stripes
+it would otherwise pin open are the checksummed ones scrub can finish itself.
+
+**The choice.** Build the csum gate; or build the rebuild path of item 8,
+which subsumes it; or leave the skip blunt and accept that a metadata stripe
+that took one transient write error never has its parity regenerated again.
+
+---
+
+## 14. Choosing the on-disk layout per block, and what it fixed
+
+Recorded because the first implementation had all three of these and none was
+found by a test.
+
+Persisting `stale` widened the on-disk entry from 24 to 40 bytes, and the
+first version stamped the new format on **every** block. That did three things
+nobody asked for:
+
+- **Downgrade broke for every filesystem.** A kernel predating the format
+  rejects any block with a nonzero flags field -- correctly, since it cannot
+  know the stride -- and a rejected log means the stripes it covers are never
+  recovered. Stamping the wide format unconditionally imposed that on
+  filesystems that had never had a stale record in their lives.
+- **The write path paid the flush cost unconditionally**, 99 entries against
+  165 before the on-disk union overflows and `btrfs_wib_mark()` waits on a
+  `REQ_PREFLUSH` to every device (item 7).
+- **The first mount after upgrading could drop records.** A format-1 block may
+  legally carry 165 entries; the new kernel accepts and loads all of them, and
+  then cannot fit them into a 99-entry wide block.
+
+All three are gone now: `btrfs_wib_build_block()` picks the narrowest layout
+that can say what the block has to say, and nothing stale -- the overwhelmingly
+common case, and the reason `btrfs_wib_stale()` has a lock-free fast path --
+means the narrow one.
+
+Two things that had to follow. The in-memory table is now sized by its own
+constant (`BTRFS_WIB_NR_ENTRIES`), because how many regions a mount can track
+has nothing to do with how wide an entry is on disk, and letting the narrow
+format set it silently shrank live capacity from 165 to 99. And the helpers
+that walk the kernel's own last block -- `wib_dropped_bits()`,
+`btrfs_wib_block_drops()`, `wib_readd_dropped()` -- used to be stride-safe by
+construction and are not any more, since the same kernel now writes both
+layouts; they all decode rather than index.
+

@@ -25,19 +25,22 @@ static int check_block_entry(const void *block, u32 index, u64 bytenr, u64 bitma
 			     u64 error)
 {
 	const struct btrfs_wib_disk_header *hdr = block;
-	const struct btrfs_wib_disk_entry *de = block + sizeof(*hdr);
+	struct btrfs_wib_entry e;
 
 	if (le32_to_cpu(hdr->nr_entries) <= index) {
 		test_err("block has %u entries, expected entry %u",
 			 le32_to_cpu(hdr->nr_entries), index);
 		return -EINVAL;
 	}
-	if (le64_to_cpu(de[index].bytenr) != bytenr ||
-	    le64_to_cpu(de[index].bitmap) != bitmap ||
-	    le64_to_cpu(de[index].error) != error) {
+	/*
+	 * Decode rather than index: a block is written in the narrow layout
+	 * whenever nothing is stale, so the stride is not a constant and
+	 * indexing one struct over the other reads the wrong fields.
+	 */
+	btrfs_wib_read_entry(block, index, &e);
+	if (e.bytenr != bytenr || e.bitmap != bitmap || e.sticky != error) {
 		test_err("entry %u is (%llu, 0x%llx, 0x%llx), expected (%llu, 0x%llx, 0x%llx)",
-			 index, le64_to_cpu(de[index].bytenr),
-			 le64_to_cpu(de[index].bitmap), le64_to_cpu(de[index].error),
+			 index, e.bytenr, e.bitmap, e.sticky,
 			 bytenr, bitmap, error);
 		return -EINVAL;
 	}
@@ -407,47 +410,88 @@ static int test_torn_block(struct btrfs_fs_info *fs_info)
 	}
 
 	/*
-	 * The format-1 layout, which this kernel must still READ: entries are
-	 * 24 bytes with no stale record, and the flag says so by its absence.
+	 * Layout choice.  A block with nothing stale must come out in the
+	 * NARROW format with flags clear, so that a kernel predating the stale
+	 * record still reads it -- refusing a log means the stripes it covers
+	 * are never recovered, which is the whole thing the feature prevents.
+	 * A block that does carry a stale record must come out wide.
 	 */
+	/* Two records of our own, so this does not depend on what ran before. */
+	wib->entries[0].bytenr = 8 * BTRFS_WIB_ENTRY_SIZE;
+	wib->entries[0].bitmap = 0x00f0;
+	wib->entries[0].sticky = 0x0010;
+	wib->entries[1].bytenr = 2 * BTRFS_WIB_ENTRY_SIZE;
+	wib->entries[1].bitmap = 0;
+	wib->entries[1].sticky = 0x8000;
+
 	btrfs_wib_build_block(wib, block, 45, NULL);
+	if (hdr->flags != 0) {
+		test_err("a block with nothing stale was written in the wide format");
+		goto out;
+	}
 	{
 		const u32 nr = le32_to_cpu(hdr->nr_entries);
-		struct btrfs_wib_disk_entry_v1 *v1 = block + sizeof(*hdr);
-		struct btrfs_wib_disk_entry saved[8];
+		struct btrfs_wib_entry before[8];
+		int victim = -1;
 
-		if (nr > ARRAY_SIZE(saved)) {
-			test_err("self test needs <= %zu entries, block has %u",
-				 ARRAY_SIZE(saved), nr);
+		if (nr == 0 || nr > ARRAY_SIZE(before)) {
+			test_err("self test needs 1..%zu entries, block has %u",
+				 ARRAY_SIZE(before), nr);
 			goto out;
 		}
-		memcpy(saved, block + sizeof(*hdr), nr * sizeof(saved[0]));
-		memset(block + sizeof(*hdr), 0,
-		       BTRFS_WIB_SLOT_SIZE - sizeof(*hdr));
-		for (u32 i = 0; i < nr; i++) {
-			v1[i].bytenr = saved[i].bytenr;
-			v1[i].bitmap = saved[i].bitmap;
-			v1[i].error = saved[i].error;
+		for (u32 i = 0; i < nr; i++)
+			btrfs_wib_read_entry(block, i, &before[i]);
+
+		/* Give one live entry a stale record and rebuild. */
+		for (int i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++) {
+			if (wib->entries[i].sticky) {
+				victim = i;
+				break;
+			}
 		}
-		hdr->flags = 0;
-		restamp(fs_info, block);
-		if (!btrfs_wib_block_valid(fs_info, block)) {
-			test_err("a format-1 block was rejected");
+		if (victim < 0) {
+			test_err("self test needs an entry with an error record");
+			goto out;
+		}
+		wib->entries[victim].stale = wib->entries[victim].sticky;
+		wib->entries[victim].stale_par = 1;
+
+		btrfs_wib_build_block(wib, block, 46, NULL);
+		if (le64_to_cpu(hdr->flags) != BTRFS_WIB_FLAG_STALE) {
+			test_err("a block carrying a stale record was not marked");
+			goto out;
+		}
+		if (le32_to_cpu(hdr->nr_entries) != nr) {
+			test_err("widening the layout changed the entry count: %u, expected %u",
+				 le32_to_cpu(hdr->nr_entries), nr);
 			goto out;
 		}
 		for (u32 i = 0; i < nr; i++) {
 			struct btrfs_wib_entry e;
 
 			btrfs_wib_read_entry(block, i, &e);
-			if (e.bytenr != le64_to_cpu(saved[i].bytenr) ||
-			    e.bitmap != le64_to_cpu(saved[i].bitmap) ||
-			    e.sticky != le64_to_cpu(saved[i].error) ||
-			    e.stale != 0 || e.stale_par != 0) {
-				test_err("format-1 entry %u read back wrong", i);
+			if (e.bytenr != before[i].bytenr ||
+			    e.bitmap != before[i].bitmap ||
+			    e.sticky != before[i].sticky) {
+				test_err("entry %u did not survive widening", i);
+				goto out;
+			}
+			if (e.bytenr == wib->entries[victim].bytenr &&
+			    (e.stale != wib->entries[victim].stale ||
+			     e.stale_par != wib->entries[victim].stale_par)) {
+				test_err("the stale record did not round-trip");
 				goto out;
 			}
 		}
+		if (!btrfs_wib_block_valid(fs_info, block)) {
+			test_err("a wide block this kernel built was rejected");
+			goto out;
+		}
+		wib->entries[victim].stale = 0;
+		wib->entries[victim].stale_par = 0;
 	}
+	memset(&wib->entries[0], 0, sizeof(wib->entries[0]));
+	memset(&wib->entries[1], 0, sizeof(wib->entries[1]));
 
 	btrfs_wib_build_block(wib, block, 44, NULL);
 	hdr->reserved[3] = cpu_to_le64(0xdeadbeef);
@@ -465,9 +509,14 @@ static int test_torn_block(struct btrfs_fs_info *fs_info)
 		goto out;
 	}
 
-	/* An entry count that would index past the end of the slot. */
+	/*
+	 * An entry count that would index past the end of the slot.  The bound
+	 * depends on the layout the block declares, and a block with nothing
+	 * stale declares the narrow one, so use the narrow maximum -- the wide
+	 * maximum is well inside it and would be accepted.
+	 */
 	btrfs_wib_build_block(wib, block, 46, NULL);
-	hdr->nr_entries = cpu_to_le32(BTRFS_WIB_MAX_ENTRIES + 1);
+	hdr->nr_entries = cpu_to_le32(BTRFS_WIB_MAX_ENTRIES_V1 + 1);
 	restamp(fs_info, block);
 	if (btrfs_wib_block_valid(fs_info, block)) {
 		test_err("block with an out of range entry count accepted");
@@ -535,7 +584,7 @@ static int test_log_full(struct btrfs_fs_info *fs_info)
 	int ret;
 
 	/* Fill every entry with a distinct region. */
-	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++) {
 		ret = btrfs_wib_mark(fs_info, (i + 100) * BTRFS_WIB_ENTRY_SIZE,
 				     BTRFS_WIB_BLOCK_SIZE);
 		if (ret) {
@@ -610,7 +659,7 @@ static int test_log_full(struct btrfs_fs_info *fs_info)
 	 */
 	btrfs_wib_done(fs_info, straddling, 2 * BTRFS_WIB_BLOCK_SIZE, false);
 	btrfs_wib_done(fs_info, 100 * BTRFS_WIB_ENTRY_SIZE + SZ_1M, BTRFS_WIB_BLOCK_SIZE, false);
-	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++)
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++)
 		btrfs_wib_done(fs_info, (i + 100) * BTRFS_WIB_ENTRY_SIZE,
 			       BTRFS_WIB_BLOCK_SIZE, false);
 	ret = btrfs_wib_mark(fs_info, 0, BTRFS_WIB_BLOCK_SIZE);
@@ -688,7 +737,7 @@ static int test_sticky(struct btrfs_fs_info *fs_info)
 
 	/* Sticky entries are evicted when the log is full. */
 	btrfs_wib_add_sticky(fs_info, stripe, 3 * BTRFS_WIB_BLOCK_SIZE);
-	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++) {
 		ret = btrfs_wib_mark(fs_info, (i + 300) * BTRFS_WIB_ENTRY_SIZE,
 				     BTRFS_WIB_BLOCK_SIZE);
 		if (ret) {
@@ -700,7 +749,7 @@ static int test_sticky(struct btrfs_fs_info *fs_info)
 		test_err("sticky entry not evicted");
 		return -EINVAL;
 	}
-	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++)
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++)
 		btrfs_wib_done(fs_info, (i + 300) * BTRFS_WIB_ENTRY_SIZE,
 			       BTRFS_WIB_BLOCK_SIZE, false);
 	btrfs_wib_commit_prepare(fs_info);
