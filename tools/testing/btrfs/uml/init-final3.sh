@@ -1015,6 +1015,14 @@ nocow_persist_prep)
 			2>/dev/null || log "NOPERSIST_ARM_FAIL"
 		log "stale record will NOT be persisted (control)"
 	}
+	# Record every parity as not describing the data, so a stripe that also
+	# has a named stale column has nothing left to be rebuilt from.  That
+	# is the ambiguous case, and the repair path must decline it.
+	[ "${FAKEBADPAR:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_stale_fake_bad_parity \
+			2>/dev/null || log "FAKEBADPAR_ARM_FAIL"
+		log "every parity will be recorded as unusable (ambiguous case)"
+	}
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
 	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow

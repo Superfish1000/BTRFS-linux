@@ -3036,6 +3036,21 @@ static void rmw_update_stale_data(struct btrfs_raid_bio *rbio, u64 full_stripe_s
  * what was acknowledged.  See mark_stale_sectors().
  */
 #ifdef CONFIG_BTRFS_DEBUG
+/*
+ * Treat every parity write as having failed, so that a stripe which already
+ * has a named stale data column ends up with no usable parity either.  That is
+ * the state a second, independent fault produces, and it is the one case the
+ * repair path must decline: one column it cannot believe, nothing left to
+ * rebuild it from.  Reaching it with real devices needs two of them failing at
+ * once, which takes the filesystem read-only before the state exists -- so
+ * inject the record the second fault would have written, and let the real
+ * decision run on it.
+ */
+static bool stale_fake_bad_parity;
+module_param_named(raid56_stale_fake_bad_parity, stale_fake_bad_parity, bool, 0644);
+MODULE_PARM_DESC(raid56_stale_fake_bad_parity,
+		 "Record every parity as not describing the data, to exercise the ambiguous case (testing only)");
+
 /* See btrfs_raid56_stale_read_legacy() in volumes.h. */
 static bool stale_read_legacy;
 module_param_named(raid56_stale_read_legacy, stale_read_legacy, bool, 0644);
@@ -3068,9 +3083,12 @@ static void rmw_update_stale_parity(struct btrfs_raid_bio *rbio,
 	for (int p = 0; p < nr_parity; p++) {
 		const int first = (rbio->nr_data + p) * rbio->stripe_nsectors;
 		const int end = first + rbio->stripe_nsectors;
-		const bool stale =
-			find_next_bit(rbio->error_bitmap, end, first) < end;
+		bool stale = find_next_bit(rbio->error_bitmap, end, first) < end;
 
+#ifdef CONFIG_BTRFS_DEBUG
+		if (unlikely(READ_ONCE(stale_fake_bad_parity)))
+			stale = true;
+#endif
 		btrfs_wib_update_stale_parity(fs_info, full_stripe_start, p,
 					      stale);
 	}

@@ -43,8 +43,8 @@ ulimit -c 0
 # The device whose writes fail is also the one omitted for the probe.
 MNTPROBE=/dev/ubda; [ "$FAIL" = "0" ] && MNTPROBE=/dev/ubdb
 
-arm() {	# nopersist -> echoes "<bad>"
-	local nopersist=$1 tag=nocow-persist-$1 d ubds="" omit
+arm() {	# tag-suffix nopersist fakebadpar -> echoes "<bad>"
+	local tag=nocow-persist-$1 nopersist=$2 fakebadpar=${3:-0} d ubds="" omit
 	local D=$T/umltest/$tag
 	rm -rf $D; mkdir -p $D
 	rm -f $T/umltest/results.$tag $T/umltest/nocow.bad.after.$tag
@@ -65,7 +65,7 @@ arm() {	# nopersist -> echoes "<bad>"
 		echo "boot $mode omit=$omit rc=$?" >> $T/umltest/results.$tag
 	}
 
-	boot nocow_persist_prep  none /dev/mapper/d0 "NOPERSIST=$nopersist"
+	boot nocow_persist_prep  none /dev/mapper/d0 "NOPERSIST=$nopersist FAKEBADPAR=$fakebadpar"
 	boot nocow_persist_scrub none /dev/mapper/d0
 	boot nocow_probe "$FAIL" $MNTPROBE PROBE=after
 	cat $T/umltest/nocow.bad.after.$tag 2>/dev/null || echo "?"
@@ -74,11 +74,11 @@ arm() {	# nopersist -> echoes "<bad>"
 sticky_after() { cat $T/umltest/nocow.sticky.nocow-persist-$1 2>/dev/null || echo "?"; }
 
 echo "== with the record persisted =="
-fixed=$(arm 0)
+fixed=$(arm 0 0)
 grep -hE 'overwrites:|scrub:|NOCOW_DIRECT|scrub_skipped_stale' \
 	$T/umltest/nocow-persist-0/log.* 2>/dev/null | sed 's/^/  /' | head -8
 echo "== control: raid56_stale_no_persist=1 =="
-ctl=$(arm 1)
+ctl=$(arm 1 1)
 grep -hE 'overwrites:|NOT be persisted|NOCOW_DIRECT' \
 	$T/umltest/nocow-persist-1/log.* 2>/dev/null | sed 's/^/  /' | head -8
 
@@ -126,5 +126,33 @@ if [ "$fixed_sticky" -ne 0 ] 2>/dev/null; then
 	echo "        retired, so the parity of those stripes was never regenerated"
 	exit 1
 fi
+# The third arm: the ambiguous case.  Every parity is recorded as unusable, so
+# a stripe with a named stale column has nothing left to rebuild it from.  The
+# repair path must decline -- and declining means BOTH halves: the data is
+# still there, and the record is still there.  Repairing would invent a value;
+# retiring would forget that anyone should look.
+echo "== ambiguous: named column, no usable parity =="
+amb=$(arm 2 0 1)
+amb_sticky=$(sticky_after 2)
+amb_msg=$(grep -c 'left untouched' $T/umltest/nocow-persist-2/log.nocow_persist_scrub 2>/dev/null || echo 0)
+echo "  blocks unrecoverable: $amb   records kept: $amb_sticky   declined stripes: $amb_msg"
+if [ "$amb" = "?" ] || [ "$amb_sticky" = "?" ]; then
+	echo "RESULT: INCONCLUSIVE -- the ambiguous arm did not report"; exit 2
+fi
+if [ "$amb_msg" -eq 0 ] 2>/dev/null; then
+	echo "RESULT: FAIL -- the scrub never declined a stripe, so the ambiguous"
+	echo "        branch was not reached and this arm proves nothing"
+	exit 1
+fi
+if [ "$amb" -ne 0 ] 2>/dev/null; then
+	echo "RESULT: FAIL -- declining still lost $amb block(s)"; exit 1
+fi
+if [ "$amb_sticky" -eq 0 ] 2>/dev/null; then
+	echo "RESULT: FAIL -- the scrub declined to repair but retired the record"
+	echo "        anyway, so nothing is left to tell a recovery tool to look"
+	exit 1
+fi
+
 echo "RESULT: PASS -- control destroyed $ctl, persisted destroyed 0, records"
-echo "        visible through the ioctl beforehand, all retired afterwards"
+echo "        visible through the ioctl beforehand, all retired afterwards;"
+echo "        ambiguous stripes declined with data and record both intact"
