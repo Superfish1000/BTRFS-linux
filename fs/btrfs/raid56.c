@@ -1821,7 +1821,22 @@ static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
 		return;
 	}
 
-	/* Stripes already known bad; their faults count against the budget. */
+	/*
+	 * Stripes already known bad; their faults count against the budget.
+	 * A missing device is among them: rbio_add_io_paddrs() sets its bits
+	 * while the read bios are assembled, which is before any of them can
+	 * complete and bring us here.
+	 *
+	 * Several bios complete concurrently and share this bitmap, so the
+	 * count can be one short of what another bio is in the middle of
+	 * recording.  Two callers reading the same log state compute the same
+	 * @add and set_bit() is idempotent, so the union is right either way;
+	 * what a concurrent real IO error can do is push the total past the
+	 * tolerance after this check passed.  The recovery then fails the read
+	 * rather than returning the stale sector -- an error where there would
+	 * have been silently wrong data, which is the safe direction to be
+	 * wrong in, and not worth a lock on a bio completion path to avoid.
+	 */
 	for (int i = 0; i < rbio->real_stripes; i++) {
 		const int first = i * rbio->stripe_nsectors;
 		const int end = first + rbio->stripe_nsectors;
