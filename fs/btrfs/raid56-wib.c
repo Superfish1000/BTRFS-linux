@@ -107,6 +107,7 @@
 #include <linux/mm.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/mm.h>
+#include <linux/delay.h>
 #include "messages.h"
 #include "ctree.h"
 #include "fs.h"
@@ -1819,6 +1820,18 @@ struct wib_recovery_stats {
  * receive the full stripe geometry (@len is 0 if there is no such stripe
  * anymore).
  */
+#ifdef CONFIG_BTRFS_DEBUG
+/*
+ * Milliseconds to linger per recovered full stripe.  Widens the window in
+ * which the recovery is inside the scrub code, so a test can land a
+ * transaction commit in it; see tools/testing/btrfs/uml/pausehang.sh.
+ */
+static int btrfs_raid56_recovery_delay_ms;
+module_param_named(raid56_recovery_delay_ms, btrfs_raid56_recovery_delay_ms, int, 0644);
+MODULE_PARM_DESC(raid56_recovery_delay_ms,
+		 "Linger this many ms per recovered full stripe (testing only)");
+#endif
+
 static int wib_recover_one(struct btrfs_fs_info *fs_info, struct scrub_ctx *sctx,
 			   u64 logical, bool trusted,
 			   bool log_replay_pending, u64 *start, u64 *len,
@@ -1837,6 +1850,10 @@ static int wib_recover_one(struct btrfs_fs_info *fs_info, struct scrub_ctx *sctx
 	if (ret < 0)
 		return ret;
 
+#ifdef CONFIG_BTRFS_DEBUG
+	if (unlikely(READ_ONCE(btrfs_raid56_recovery_delay_ms) > 0))
+		msleep(READ_ONCE(btrfs_raid56_recovery_delay_ms));
+#endif
 	ret = btrfs_scrub_raid56_full_stripe(fs_info, sctx, *start, trusted);
 	if (ret == -ENOENT) {
 		st->skipped++;
