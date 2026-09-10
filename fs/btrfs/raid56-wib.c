@@ -187,7 +187,10 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 				      (unsigned int)hweight64(e->sticky), e->bytenr);
 		atomic64_inc(&wib->stat_sticky_evicted);
 		e->sticky = 0;
-		e->stale = 0;
+		if (e->stale) {
+			atomic_sub(hweight64(e->stale), &wib->nr_stale);
+			e->stale = 0;
+		}
 		return e;
 	}
 	return NULL;
@@ -220,7 +223,10 @@ static struct btrfs_wib_entry *wib_find_or_alloc_entry(struct btrfs_wib *wib,
 	if (free) {
 		free->bytenr = bytenr;
 		free->sticky = 0;
-		free->stale = 0;
+		if (free->stale) {
+			atomic_sub(hweight64(free->stale), &wib->nr_stale);
+			free->stale = 0;
+		}
 	}
 	return free;
 }
@@ -1080,13 +1086,14 @@ void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool fa
 		if (failed) {
 			e->sticky |= mask;
 			atomic64_inc(&wib->stat_sticky);
-		} else {
+		} else if (e->stale & mask) {
 			/*
 			 * Every write of this RMW landed, so whatever these
 			 * blocks held before, the disk now has what was
 			 * acknowledged.  Leaving them marked stale would send
 			 * later reads to reconstruct a sector that is correct.
 			 */
+			atomic_sub(hweight64(e->stale & mask), &wib->nr_stale);
 			e->stale &= ~mask;
 		}
 		if (!e->bitmap)
@@ -1149,7 +1156,7 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	spin_lock(&wib->lock);
 	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
 		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
-		u64 mask;
+		u64 mask, add;
 
 		if (!e)
 			continue;
@@ -1160,7 +1167,10 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		 * stale would send the read path to a parity that describes
 		 * exactly the sector it is being told to distrust.
 		 */
+		add = (mask & e->sticky) & ~e->stale;
 		e->stale |= mask & e->sticky;
+		if (add)
+			atomic_add(hweight64(add), &wib->nr_stale);
 	}
 	spin_unlock(&wib->lock);
 }
@@ -1172,6 +1182,12 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
  * negative is the behaviour without this record at all; a false positive
  * costs a reconstruction that was not needed.
  */
+/* Is anything at all recorded stale?  Lock-free; see wib->nr_stale. */
+bool btrfs_wib_any_stale(const struct btrfs_fs_info *fs_info)
+{
+	return fs_info->wib && atomic_read(&fs_info->wib->nr_stale) != 0;
+}
+
 bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 {
 	struct btrfs_wib *wib = fs_info->wib;
@@ -1180,6 +1196,14 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	bool stale = false;
 
 	if (!wib)
+		return false;
+	/*
+	 * The overwhelmingly common case: nothing anywhere is recorded stale,
+	 * so answer without the lock or the table walk.  Racing with a record
+	 * being added can only return the answer this function gave before
+	 * the record existed at all, which is the behaviour without it.
+	 */
+	if (likely(!atomic_read(&wib->nr_stale)))
 		return false;
 
 	spin_lock(&wib->lock);
@@ -1207,7 +1231,12 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		if (!e)
 			continue;
 		e->sticky &= ~btrfs_wib_range_mask(cur, logical, len);
-		e->stale &= ~btrfs_wib_range_mask(cur, logical, len);
+		if (e->stale & btrfs_wib_range_mask(cur, logical, len)) {
+			atomic_sub(hweight64(e->stale &
+					     btrfs_wib_range_mask(cur, logical, len)),
+				   &wib->nr_stale);
+			e->stale &= ~btrfs_wib_range_mask(cur, logical, len);
+		}
 		if (!wib_entry_used(e))
 			freed = true;
 	}

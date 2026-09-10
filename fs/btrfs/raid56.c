@@ -1776,12 +1776,36 @@ static void verify_bio_data_sectors(struct btrfs_raid_bio *rbio,
 	phys_addr_t paddrs[BTRFS_MAX_BLOCKSIZE / PAGE_SIZE];
 	phys_addr_t paddr;
 
-	/* No data csum for the whole stripe, no need to verify. */
-	if (!rbio->csum_bitmap || !rbio->csum_buf)
-		return;
-
 	/* P/Q stripes, they have no data csum to verify against. */
 	if (total_sector_nr >= rbio->nr_data * rbio->stripe_nsectors)
+		return;
+
+	/*
+	 * Sectors a failed write left stale, which the write-intent log
+	 * records.  This runs BEFORE the csum_bitmap check below, and must:
+	 * fill_data_csums() frees the bitmap outright when nothing in the
+	 * stripe has a checksum, which is precisely the nodatacow case this
+	 * exists for.  Checked here, a stale sector is marked exactly as a
+	 * checksum mismatch would mark it, and is rebuilt from the parity
+	 * instead of believed -- so the next parity this write computes keeps
+	 * the value the caller was told is on the disk, rather than the one
+	 * the device did not take.
+	 */
+	if (unlikely(btrfs_wib_any_stale(fs_info))) {
+		const int nr = bio_get_size(bio) >> fs_info->sectorsize_bits;
+
+		for (int i = 0; i < nr; i++) {
+			const int sector_nr = total_sector_nr + i;
+			const u64 logical = rbio->bioc->full_stripe_logical +
+				((u64)sector_nr << fs_info->sectorsize_bits);
+
+			if (btrfs_wib_stale(fs_info, logical))
+				set_bit(sector_nr, rbio->error_bitmap);
+		}
+	}
+
+	/* No data csum for the whole stripe, nothing else to verify. */
+	if (!rbio->csum_bitmap || !rbio->csum_buf)
 		return;
 
 	btrfs_bio_for_each_block_all(paddr, bio, step) {
@@ -1795,21 +1819,8 @@ static void verify_bio_data_sectors(struct btrfs_raid_bio *rbio,
 		if (!IS_ALIGNED(offset, fs_info->sectorsize))
 			continue;
 
-		/*
-		 * No csum for this sector.  That is not the same as the sector
-		 * being good: nodatacow and prealloc data has none at all, and
-		 * a sector a failed write left stale then passes through here
-		 * believed.  The write-intent log records exactly those, which
-		 * is the only signal available for data without checksums --
-		 * treat it as a failed verification, so the sector is rebuilt
-		 * from the parity like any other unreadable one.
-		 */
+		/* No csum for this sector, skip to the next sector. */
 		if (!test_bit(total_sector_nr, rbio->csum_bitmap)) {
-			const u64 logical = rbio->bioc->full_stripe_logical +
-				((u64)total_sector_nr << fs_info->sectorsize_bits);
-
-			if (unlikely(btrfs_wib_stale(fs_info, logical)))
-				set_bit(total_sector_nr, rbio->error_bitmap);
 			total_sector_nr++;
 			continue;
 		}

@@ -170,6 +170,16 @@ struct btrfs_wib {
 	 */
 	bool enable_in_progress;
 
+	/*
+	 * How many blocks across all entries currently carry a stale record.
+	 * btrfs_wib_stale() is asked about EVERY sector that has no checksum,
+	 * which on a nodatacow filesystem is every sector it reads, so the
+	 * common answer has to be free of both the lock and the table walk.
+	 * Stale records only exist after a device error, so this is normally
+	 * zero and the query never touches wib->lock.
+	 */
+	atomic_t nr_stale;
+
 	/* In-flight sub-stripe writes, bitmap == 0 means the entry is free. */
 	struct btrfs_wib_entry entries[BTRFS_WIB_MAX_ENTRIES];
 
@@ -233,6 +243,7 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed);
 void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical);
+bool btrfs_wib_any_stale(const struct btrfs_fs_info *fs_info);
 void btrfs_wib_commit_prepare(struct btrfs_fs_info *fs_info);
 int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed);
 

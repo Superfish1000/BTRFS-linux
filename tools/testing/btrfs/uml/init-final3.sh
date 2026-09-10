@@ -539,6 +539,24 @@ nocow_rmw)
 	stats "after pass1"
 	# Healthy again: pass 2 takes no faults at all.
 	dm_heal $FAIL; log "healed device $FAIL"
+	# Evict the stripe cache.  Pass 1's writes were ACKNOWLEDGED, so
+	# rmw_rbio() left RBIO_CACHE_READY_BIT set and the cache still holds the
+	# content the caller was told is on disk -- correct content, which pass 2
+	# would then use, and nothing would be destroyed.  That is real but it is
+	# not durable: the cache holds RBIO_CACHE_SIZE (1024) rbios and is only
+	# cleared at unmount, so any busy filesystem cycles through it.  Touch
+	# more distinct full stripes than it can hold, so pass 2 has to read the
+	# disk like it would on a real array.
+	touch $MNT/churn; chattr +C $MNT/churn 2>/dev/null
+	fallocate -l 256M $MNT/churn 2>/dev/null || log "FALLOCATE_FAIL"
+	n=0
+	for i in $(seq 0 1200); do
+		dd if=/dev/zero of=$MNT/churn bs=4096 count=1 \
+		   seek=$((i * NOCOW_FS_BLOCKS)) conv=notrunc status=none 2>/dev/null \
+			&& n=$((n+1))
+	done
+	sync
+	log "stripe-cache churn: $n distinct full stripes touched (cache holds 1024)"
 	clean=0
 	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
 		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' |
