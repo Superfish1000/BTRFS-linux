@@ -2335,7 +2335,7 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 	struct btrfs_fs_info *fs_info = sctx->fs_info;
 	const int nr_parity = map->num_stripes - data_stripes;
 	struct btrfs_wib_stripe_state st;
-	u32 holes = 0;
+	u32 holes = 0, needs_help = 0;
 	int nr_good_par = 0;
 
 
@@ -2349,8 +2349,22 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 		return SCRUB_WIB_NONE;
 
 	/*
-	 * Columns that cannot be believed: recorded stale with something in
-	 * them that has no proof of its own, or on a device that is not there.
+	 * Two different questions, and conflating them is a hole.
+	 *
+	 * @holes is every column that cannot be BELIEVED: named stale, or on a
+	 * device that is not there.  It has nothing to do with checksums --
+	 * a reconstruction is determined by columns and parities, not by which
+	 * sectors happen to carry their own proof.  This has to match what
+	 * mark_stale_sectors() will count when the repair actually runs, or
+	 * this function authorises a rebuild that the recovery path then
+	 * declines to honour -- and declining there is silent: it returns
+	 * without marking, so the column the log names is read off the disk
+	 * and believed, and on this path the result is written back.
+	 *
+	 * @needs_help is the narrower question of whether any of that is our
+	 * business: a column whose content is checksummed, or is a metadata
+	 * tree block, is verified and repaired by the ordinary path and must
+	 * not be blocked.
 	 */
 	for (int i = 0; i < data_stripes; i++) {
 		struct scrub_stripe *stripe = &sctx->raid56_data_stripes[i];
@@ -2361,10 +2375,11 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 		}
 		if (!(st.stale_cols & BIT_ULL(i)))
 			continue;
+		holes |= BIT(i);
 		if (scrub_stripe_has_unverifiable(stripe))
-			holes |= BIT(i);
+			needs_help |= BIT(i);
 	}
-	if (!holes)
+	if (!needs_help)
 		return SCRUB_WIB_NONE;
 
 	/* Parities that can still be used as a source. */
@@ -2387,7 +2402,7 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 		return SCRUB_WIB_AMBIGUOUS;
 
 	for (int i = 0; i < data_stripes; i++)
-		if (holes & BIT(i))
+		if (needs_help & BIT(i))
 			sctx->raid56_data_stripes[i].wib_rebuild = true;
 	return SCRUB_WIB_PROVEN;
 }
@@ -2572,16 +2587,37 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 		return ret;
 
 	/*
-	 * Everything that could be checked was checked, everything that had to
-	 * be rebuilt was rebuilt and written back, and the parity now describes
-	 * the data on disk.  The record has done its job, so retire it.
+	 * Retire the record only if the repair actually reached the platter.
 	 *
-	 * Not while read-only: scrub_stripe_read_repair_worker() skips the
-	 * write-back then, so the sectors this claims to have repaired are
-	 * still stale on the disk and the record is the only thing that knows.
+	 * A failed repair write is invisible to everything above: it lands in
+	 * stripe->write_error_bitmap, which is not one of the scrub bitmaps
+	 * and which the unrepaired-sectors check above never reads -- the
+	 * reconstruction cleared those bits by succeeding in memory.  And the
+	 * parity written just now was computed from that same memory
+	 * (raid56_parity_cache_data_folios()), so it describes the repaired
+	 * value whether or not the disk ever received it.  Clearing the record
+	 * on that basis would forget the one stripe most in need of another
+	 * look, on the strength of a repair that did not happen.
+	 *
+	 * btrfs_scrub_raid56_full_stripe() already folds this bitmap into its
+	 * result for the recovery caller; the check simply was not on the user
+	 * scrub's path.
+	 *
+	 * Not while read-only either: the write-back is skipped entirely then,
+	 * so the sectors this claims to have repaired are still stale and the
+	 * record is the only thing that knows.
 	 */
-	if (!sctx->readonly)
-		btrfs_wib_clear_sticky(fs_info, full_stripe_start, fstripe_len);
+	if (sctx->readonly)
+		return 0;
+	for (int i = 0; i < data_stripes; i++) {
+		if (sctx->raid56_data_stripes[i].write_error_bitmap) {
+			btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu was repaired in memory but a write-back failed; keeping its record",
+				      full_stripe_start);
+			return 0;
+		}
+	}
+	btrfs_wib_clear_sticky(fs_info, full_stripe_start, fstripe_len);
 	return 0;
 }
 

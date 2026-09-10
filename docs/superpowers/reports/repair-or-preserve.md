@@ -98,3 +98,58 @@ from the block group while log regions are 4MiB-aligned -- grouping columns by
 the wrong grid would be exactly the kind of guess this interface exists to
 avoid. An earlier version did that and reported two AMBIGUOUS stripes the kernel
 had in fact repaired.
+
+## Four defects the adversarial review found in the above
+
+Every one of them was in code that had already been written, built clean,
+passed the self tests, and passed the UML scenarios with a working negative
+control. None of them would have been found by running more tests.
+
+**The clearing side was coarse where it asserts health.** One log bit covers a
+whole 64KiB column, but a sub-stripe write touches only the vertical stripes it
+was given. `rmw_update_stale_data()` cleared the bit whenever the rbio supplied
+*any* sector of the column, so a single landed 4KiB write turned off a record
+describing fifteen sectors it never went near -- one of which held the only copy
+of an acknowledged value, in the parity. Marking coarsely is conservative;
+clearing coarsely loses data. It now clears only when the write supplied the
+entire column. `btrfs_wib_done()` already refuses to clear for exactly this
+reason one level up, where the range is the full stripe and the unit is the
+column; the same argument one level down was not applied.
+
+**There were two budgets, and the stricter one failed silently.**
+`scrub_raid56_plan_wib()` counted a stale column as a hole only if it held
+unverifiable extent sectors; `mark_stale_sectors()` counts every stale column
+and every bad parity. So scrub could authorise a rebuild that the recovery path
+then declined -- and declining there means *returning without marking*, so the
+column the log names is read off the disk and believed. On an ordinary read that
+is no worse than not having the record. On the repair path the result is written
+back. The two are now one question: a reconstruction is determined by columns
+and parities, not by which sectors carry their own proof, so `holes` counts
+every named column and `needs_help` separately decides whether it is our
+business at all.
+
+**Retirement was gated on `!sctx->readonly` and nothing else.** A failed repair
+write lands in `stripe->write_error_bitmap`, which is not one of the scrub
+bitmaps and which the unrepaired-sectors check never reads -- the reconstruction
+cleared those bits by succeeding *in memory*. And the parity written afterwards
+is computed from that same memory, so it describes the repaired value whether or
+not the disk received it. The record was being retired on the strength of a
+repair that had not happened, forgetting the stripe most in need of another
+look. `btrfs_scrub_raid56_full_stripe()` already folds that bitmap into its
+result for the recovery caller; the check simply was not on the user scrub's
+path. It is now.
+
+**The ambiguous case was partly manufactured.** `logged` is false for a
+full-stripe non-in-place write, so the tail took a branch that recorded only
+"something went wrong in this stripe" -- while `rbio->error_bitmap`, right
+there, named the column and the sectors. That turned something known into
+something unknown, and a stripe the log cannot name is one the repair path must
+decline. It mattered most for the data that could least afford it: NODATACOW is
+forced to copy-on-write on RAID5/6, so *every* checksumless write there is a
+full-stripe COW write and took that branch. The one class with no checksum to
+appeal to was the one class that could never get a column name.
+
+**Not modelled.** The first of these is about sub-column granularity, and the
+state machine treats a column as atomic. It is argued in the code and against
+the precedent one level up, not measured. That is a weaker standard than the
+rest of this work is held to.

@@ -2993,7 +2993,8 @@ static void rmw_update_stale_data(struct btrfs_raid_bio *rbio, u64 full_stripe_s
 		const int end = first + rbio->stripe_nsectors;
 		const u64 logical = full_stripe_start +
 				    btrfs_stripe_nr_to_offset(stripe);
-		bool supplied = false;
+		bool supplied_any = false;
+		bool supplied_all = true;
 
 		/*
 		 * Only the data stripes this rbio actually wrote have anything
@@ -3004,12 +3005,12 @@ static void rmw_update_stale_data(struct btrfs_raid_bio *rbio, u64 full_stripe_s
 		 * which is worse than never having set it.
 		 */
 		for (int sectornr = 0; sectornr < rbio->stripe_nsectors; sectornr++) {
-			if (sector_paddrs_in_rbio(rbio, stripe, sectornr, 1)) {
-				supplied = true;
-				break;
-			}
+			if (sector_paddrs_in_rbio(rbio, stripe, sectornr, 1))
+				supplied_any = true;
+			else
+				supplied_all = false;
 		}
-		if (!supplied)
+		if (!supplied_any)
 			continue;
 
 		/*
@@ -3017,10 +3018,29 @@ static void rmw_update_stale_data(struct btrfs_raid_bio *rbio, u64 full_stripe_s
 		 * granularity is one BTRFS_STRIPE_LEN and being coarse here
 		 * only costs a reconstruction that was not needed.
 		 */
-		if (find_next_bit(rbio->error_bitmap, end, first) >= end)
-			btrfs_wib_clear_stale(fs_info, logical, BTRFS_STRIPE_LEN);
-		else
+		if (find_next_bit(rbio->error_bitmap, end, first) < end) {
 			btrfs_wib_mark_stale(fs_info, logical, BTRFS_STRIPE_LEN);
+			continue;
+		}
+
+		/*
+		 * Clearing is the opposite: it asserts health, and being coarse
+		 * about THAT loses data.  One bit covers a whole 64KiB column
+		 * (BTRFS_WIB_BLOCK_SHIFT == BTRFS_STRIPE_LEN_SHIFT) while a
+		 * sub-stripe write touches only the vertical stripes it was
+		 * given, so a single landed 4KiB write would otherwise clear a
+		 * record describing fifteen sectors it never went near -- one
+		 * of which is the sector whose acknowledged value exists
+		 * nowhere but the parity.  Clear only when this write supplied
+		 * the entire column, so that every sector the bit covers is
+		 * one we just put there.
+		 *
+		 * btrfs_wib_done() refuses to clear @stale for exactly this
+		 * reason one level up, where the range is the full stripe and
+		 * the unit is the column.  Same argument, one level down.
+		 */
+		if (supplied_all)
+			btrfs_wib_clear_stale(fs_info, logical, BTRFS_STRIPE_LEN);
 	}
 }
 
@@ -3292,14 +3312,32 @@ out:
 		rmw_update_stale_data(rbio, full_stripe_start);
 		rmw_update_stale_parity(rbio, full_stripe_start);
 	}
-	else if (ret >= 0 && !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors))
+	else if (ret >= 0 && !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors)) {
 		/*
 		 * A full stripe write that a device did not take (within the
 		 * tolerance): that device holds a stale sector of what is
 		 * about to be committed, record the stripe for the next
 		 * mount's scrub like a failed RMW.
+		 *
+		 * And say WHICH device, which this branch used to throw away.
+		 * error_bitmap is right here and names the column and the
+		 * sectors; recording only "something went wrong in this
+		 * stripe" manufactures an unknown out of something known, and
+		 * a stripe the log cannot name is one the repair path must
+		 * decline.  That mattered most for the data it could least
+		 * afford: NODATACOW is forced to copy-on-write on RAID5/6, so
+		 * every checksumless write here is a full-stripe COW write and
+		 * took this branch -- the one class with no checksum to appeal
+		 * to was the one class that could never get a column name.
+		 *
+		 * Order matters: btrfs_wib_mark_stale() only marks blocks the
+		 * log already records, which btrfs_wib_add_sticky() has just
+		 * done.
 		 */
 		btrfs_wib_add_sticky(fs_info, full_stripe_start, full_stripe_len);
+		rmw_update_stale_data(rbio, full_stripe_start);
+		rmw_update_stale_parity(rbio, full_stripe_start);
+	}
 	rbio_orig_end_io(rbio, errno_to_blk_status(ret));
 }
 
