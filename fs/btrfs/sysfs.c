@@ -1363,7 +1363,7 @@ static ssize_t btrfs_raid56_write_intent_show(struct kobject *kobj,
 	spin_unlock(&wib->lock);
 
 	return sysfs_emit(buf,
-		"enabled %d\ninflight_blocks %u\nsticky_blocks %u\npending_recovery_regions %u\nmarks %llu\ncommits %llu\ncommit_flushes %llu\ncommit_errors %llu\nrecovered_stripes %llu\nrecovery_errors %llu\nsticky_total %llu\nsticky_evicted %llu\n",
+		"enabled %d\ninflight_blocks %u\nsticky_blocks %u\npending_recovery_regions %u\nmarks %llu\ncommits %llu\ncommit_flushes %llu\ncommit_errors %llu\nrecovered_stripes %llu\nrecovery_errors %llu\nsticky_total %llu\nsticky_evicted %llu\nstale_query_fast %llu\nstale_query_slow %llu\n",
 		enabled, nr_inflight, nr_sticky, wib->nr_pending,
 		(unsigned long long)atomic64_read(&wib->stat_marks),
 		(unsigned long long)atomic64_read(&wib->stat_commits),
@@ -1372,7 +1372,9 @@ static ssize_t btrfs_raid56_write_intent_show(struct kobject *kobj,
 		(unsigned long long)atomic64_read(&wib->stat_recovered_stripes),
 		(unsigned long long)atomic64_read(&wib->stat_recovery_errors),
 		(unsigned long long)atomic64_read(&wib->stat_sticky),
-		(unsigned long long)atomic64_read(&wib->stat_sticky_evicted));
+		(unsigned long long)atomic64_read(&wib->stat_sticky_evicted),
+		(unsigned long long)atomic64_read(&wib->stat_stale_fast),
+		(unsigned long long)atomic64_read(&wib->stat_stale_slow));
 }
 BTRFS_ATTR(, raid56_write_intent, btrfs_raid56_write_intent_show);
 

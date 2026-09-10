@@ -216,6 +216,16 @@ struct btrfs_wib {
 	unsigned int max_pending;
 
 	/* Statistics, exported through sysfs. */
+	/*
+	 * How the staleness query was answered.  btrfs_wib_stale() is asked
+	 * about every sector without a checksum, so on a nodatacow filesystem
+	 * these count every sector an RMW reads: @stat_stale_fast is the
+	 * lock-free answer, @stat_stale_slow the walk under wib->lock.  The
+	 * ratio is the whole justification for wib->nr_stale.
+	 */
+	atomic64_t stat_stale_fast;
+	atomic64_t stat_stale_slow;
+
 	atomic64_t stat_marks;
 	atomic64_t stat_commits;
 	atomic64_t stat_commit_flushes;

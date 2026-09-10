@@ -1203,8 +1203,11 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	 * being added can only return the answer this function gave before
 	 * the record existed at all, which is the behaviour without it.
 	 */
-	if (likely(!atomic_read(&wib->nr_stale)))
+	if (likely(!atomic_read(&wib->nr_stale))) {
+		atomic64_inc(&wib->stat_stale_fast);
 		return false;
+	}
+	atomic64_inc(&wib->stat_stale_slow);
 
 	spin_lock(&wib->lock);
 	e = wib_find_entry(wib, cur);
