@@ -125,3 +125,42 @@ those rows can never violate and the assertion could only fail. The sweep now
 runs `--in-place` with `--strict`, and the check diffs against a recorded
 baseline instead, so a row moving in either direction is surfaced: a new
 exposure, or one that closed and should come out of the docs.
+
+## The scrub-pause wedge: a deadlock that cannot happen
+
+Reading two wait conditions together produced a convincing deadlock:
+
+    btrfs_scrub_pause():  inc pause_req;  wait until paused == running
+    scrub_pause_off():    wait until pause_req == 0;  then dec paused
+
+The recovery is deliberately absent from scrubs_running, so while it sits in
+scrub_blocked_if_needed() paused is 1 and running is 0.  A commit waits for
+1 == 0, which only the recovery can make true; the recovery waits for
+pause_req to reach 0, which only that commit can make true.  Each is the
+other's blocker.  It was reported as a deadlock twice before anything measured
+it.
+
+It cannot happen, because the two participants are never in the room together.
+Instrumenting the recovery to sample fs_info->scrub_pause_req, scrubs_paused
+and scrubs_running every 100ms while an artificial delay held it inside the
+scrub code:
+
+  btrfs_remount_rw()                 60 samples,  0 with a pauser
+  btrfs_wib_recover_after_replay()  166 samples,  0 with a pauser
+
+Zero in every sample of both.  The reason is structural rather than lucky:
+btrfs_remount_rw() runs the recovery before btrfs_start_pre_rw_mount(), when
+the filesystem is not yet taking transactions, and the after-replay recovery
+runs between the log replay and the point where anything else writes.  The
+commits that stat_commits counted happened around those windows, not inside
+them.
+
+What is left is real but much smaller: btrfs_scrub_raid56_recovery_begin()
+documents that the recovery is kept out of the pause protocol, and
+scrub_raid56_parity_stripe() puts it in.  The guard makes the code match its
+comment, and costs nothing.  It is hardening against a latent inconsistency,
+not a fix for a hang, and the commit that added it should not have implied
+otherwise.
+
+The measurement is worth more than the guard.  "A pauser overlapped the
+recovery 0 times out of 226" is an answer; "it did not hang this time" is not.
