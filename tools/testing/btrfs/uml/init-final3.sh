@@ -706,6 +706,59 @@ nocow_rmw_probe)
 	umount $MNT || log "UMOUNT_FAIL"
 	finish
 	;;
+nocow_replay_prep)
+	# Leave error records AND a dirty tree log, then die without
+	# unmounting.  The next read-write mount replays the log and then runs
+	# btrfs_wib_recover_after_replay(), which is the recovery entry point
+	# that handles error records exclusively -- and the one nocow_stale.sh
+	# cannot reach, because it unmounts cleanly and so leaves no log.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	dm_error_writes $FAIL; log "write errors on device $FAIL"
+	acked=0
+	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_STRIDE)) count=1 \
+		   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
+	done
+	log "in-place overwrites: $acked of $NOCOW_BLOCKS acknowledged"
+	dm_heal $FAIL; log "healed device $FAIL"
+	# fsync-only files so a tree log is left dirty; no sync, no umount.
+	for i in $(seq 0 5); do
+		dd if=/dev/urandom of=$MNT/logged$i bs=64K count=1 conv=fsync \
+		   status=none 2>/dev/null
+	done
+	stats "recorded with a dirty log"
+	echo b > /proc/sysrq-trigger
+	sleep 60
+	;;
+nocow_replay_probe)
+	# nologreplay keeps this mount from replaying the log, which is what
+	# would otherwise drag btrfs_wib_rw_mount() in even on a read-only
+	# mount -- so this really does read the array without any recovery
+	# having run.  The failed device is omitted, so every one of the
+	# overwritten blocks has to come from the parity.
+	do_mount ro,nologreplay,degraded $MNTDEV
+	bad=$(nocow_bad)
+	log "NOCOW_REPLAY_${PROBE:-x} bad=$bad of $NOCOW_BLOCKS"
+	echo $bad > $T/umltest/nocow.replay.${PROBE:-x}.$TAG
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+nocow_replay_recover)
+	# Replays the log, then recovers the error records.
+	do_mount $OPTS $MNTDEV
+	stats "after replay recovery"
+	kmsg "replay|write-intent" 6
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
 nocow_scrub)
 	# The same question asked of plain "btrfs scrub", with the write-intent
 	# log switched off entirely (noraid56_write_intent), so nothing in this

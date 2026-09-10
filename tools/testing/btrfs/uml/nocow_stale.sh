@@ -28,7 +28,7 @@ FAIL=${3:-1}
 # "nolog"  a plain "btrfs scrub" does it, with the log off
 # "rmw"    nothing scrubs at all: an ordinary FAULT-FREE write to another
 #          column of the same full stripe is what destroys the data
-WHO=${4:-log}
+WHO=${4:-log}   # log | nolog | rmw | replay
 TAG=nocow-stale-$WHO
 PROFILE=raid5:raid1
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -57,6 +57,25 @@ boot() {	# mode omit mntdev [extra-env]
 # The device whose writes fail is also the one omitted for the probes, so the
 # stale sectors it holds must be reconstructed from the parity.
 MNTPROBE=/dev/ubda; [ "$FAIL" = "0" ] && MNTPROBE=/dev/ubdb
+
+if [ "$WHO" = replay ]; then
+	# The after-replay recovery path: error records plus a dirty tree log.
+	boot nocow_replay_prep none /dev/ubda
+	boot nocow_replay_probe "$FAIL" $MNTPROBE PROBE=before
+	boot nocow_replay_recover none /dev/ubda
+	boot nocow_replay_probe "$FAIL" $MNTPROBE PROBE=after
+	before=$(cat $T/umltest/nocow.replay.before.$TAG 2>/dev/null || echo "?")
+	after=$(cat $T/umltest/nocow.replay.after.$TAG 2>/dev/null || echo "?")
+	echo "==== $TAG ===="; cat $T/umltest/results.$TAG; echo
+	echo "blocks unrecoverable from the parity, device $FAIL omitted:"
+	echo "  before the after-replay recovery: $before"
+	echo "  after  the after-replay recovery: $after"
+	[ "$before" = "?" ] || [ "$after" = "?" ] && { echo "RESULT: INCONCLUSIVE"; exit 2; }
+	[ "$before" -gt 0 ] 2>/dev/null && { echo "RESULT: PREMISE WRONG -- the parity did not hold them to begin with"; exit 3; }
+	[ "$after" -gt 0 ] 2>/dev/null \
+		&& { echo "RESULT: REPRODUCED -- the after-replay recovery destroyed $after block(s)"; exit 1; } \
+		|| { echo "RESULT: NOT REPRODUCED -- the data survived the after-replay recovery"; exit 0; }
+fi
 
 if [ "$WHO" = rmw ]; then
 	# One boot does the whole thing: failed write, heal, then a clean write
