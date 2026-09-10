@@ -170,9 +170,11 @@ struct btrfs_wib_entry {
 	 * acknowledged content.  See btrfs_wib_stale() and
 	 * verify_bio_data_sectors().
 	 *
-	 * A subset of @sticky.  Not persisted: it lives for the mount that
-	 * saw the failure, which is where the read path needs it.  Across a
-	 * mount the stripe is still recorded by @sticky and scrubbed.
+	 * A strict subset of @sticky, which btrfs_wib_block_valid() enforces
+	 * on read.  Persisted, as @stale in the on-disk entry: across a mount
+	 * @sticky alone says a write went wrong without saying which side of
+	 * the stripe is wrong, and a scrub that cannot tell recomputes the
+	 * parity from the stale sector.
 	 */
 	u64 stale;
 	/*
@@ -191,7 +193,7 @@ struct btrfs_wib_entry {
 	 * questions stay separable: which side of the stripe is wrong is the
 	 * whole decision.
 	 *
-	 * Not persisted either, for the same reason @stale is not.
+	 * Persisted alongside @stale, for the same reason.
 	 */
 	u64 stale_par;
 };

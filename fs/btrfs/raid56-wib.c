@@ -556,19 +556,36 @@ static u64 wib_disk_entry_bits(const struct btrfs_wib_disk_entry *de)
 	return le64_to_cpu(de->bitmap) | le64_to_cpu(de->error);
 }
 
-/* Return the bits of @oe (either kind) that @new no longer lists. */
+/* Return the bits of @oe (any kind) that @new no longer lists. */
 static u64 wib_dropped_bits(const struct btrfs_wib_disk_entry *oe, const void *new)
 {
 	const struct btrfs_wib_disk_header *nh = new;
 	const struct btrfs_wib_disk_entry *ne = new + sizeof(*nh);
 	const u32 nnr = le32_to_cpu(nh->nr_entries);
 	u64 bits = wib_disk_entry_bits(oe);
+	/*
+	 * A stale bit going away has to count as a dropped bit in its own
+	 * right, and cannot be folded into the OR above: @stale is a subset of
+	 * @error, so bitmap|error|stale is just bitmap|error and a stale bit
+	 * clearing on its own would look like no change at all.
+	 *
+	 * It has to count because of what clears it -- a data write that
+	 * landed (rmw_update_stale_data()).  Persisting "no longer stale"
+	 * before that write is durable would leave a log saying the sector on
+	 * disk can be trusted while the disk still holds the old content, and
+	 * the next scrub would then recompute the parity from it.  Treating it
+	 * as dropped makes the commit flush first, which is the ordering the
+	 * record needs.
+	 */
+	u64 stale = le64_to_cpu(oe->stale);
 
-	for (u32 j = 0; j < nnr && bits; j++) {
-		if (ne[j].bytenr == oe->bytenr)
+	for (u32 j = 0; j < nnr && (bits || stale); j++) {
+		if (ne[j].bytenr == oe->bytenr) {
 			bits &= ~wib_disk_entry_bits(&ne[j]);
+			stale &= ~le64_to_cpu(ne[j].stale);
+		}
 	}
-	return bits;
+	return bits | stale;
 }
 
 /* Return true if any block listed in @old is not listed in @new. */
