@@ -1854,12 +1854,27 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 			last_len = len;
 
 			/*
-			 * An error record means a device may hold stale
-			 * sectors; while extents can still be hidden in the
-			 * tree log, only verified sectors may be trusted.
+			 * An error record means a write to this stripe
+			 * completed with a device error, so a sector of it may
+			 * be stale while the parity holds what was
+			 * acknowledged.  Only verified sectors may be trusted:
+			 * recomputing the parity from a sector the scrub
+			 * cannot check would overwrite the copy that still has
+			 * the acknowledged content.  A sector without a
+			 * checksum is exactly such a sector -- see
+			 * scrub_verify_one_sector(), which has "no other
+			 * choice but to trust it" -- so on a nodatacow file
+			 * this destroys data that was still recoverable.
+			 *
+			 * This is only about error records.  An in-flight
+			 * record is a crash in the middle of an RMW, where no
+			 * device reported anything and the data on disk is
+			 * what the filesystem should present; recomputing the
+			 * parity from it is right.  The log keeps the two in
+			 * separate fields (bitmap and sticky) precisely so
+			 * they can be told apart.
 			 */
-			trusted = !wib_pending_has_error(wib, start, len) ||
-				  !log_replay_pending;
+			trusted = !wib_pending_has_error(wib, start, len);
 			ret = wib_recover_one(fs_info, sctx, start, trusted, log_replay_pending,
 					      &start, &len, &st);
 			if (ret < 0)
