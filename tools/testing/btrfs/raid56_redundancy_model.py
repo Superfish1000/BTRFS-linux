@@ -74,12 +74,17 @@ GARBAGE = "garbage"      # reconstructed from a parity that no longer matches
 
 
 class Stripe:
+    # Does this kernel record WHICH column a failed write left stale, and
+    # consult it wherever a checksum would be consulted?  Set once from the
+    # policy; see --track-stale-columns.
+    track_stale = False
+
     """One vertical stripe: nr_data data sectors plus 1 (RAID5) or 2 (RAID6)
     parity sectors, each on its own device."""
 
     __slots__ = ("nr_data", "nr_parity", "disk", "parity", "committed",
                  "missing", "cache", "cache_ready", "replacing", "reported",
-                 "recorded", "nodatasum", "spurious", "trace")
+                 "recorded", "nodatasum", "spurious", "stale_cols", "stale_par", "trace")
 
     def __init__(self, nr_data, nr_parity, replacing, nodatasum,
                  all_committed=False):
@@ -117,6 +122,16 @@ class Stripe:
         # The last operation failed although the stripe still had the
         # redundancy its profile promises: a spurious failure.
         self.spurious = False
+        # Data columns a failed write left stale on disk, as the write-intent
+        # log's error record identifies them.  A checksum would say the same
+        # thing about the sector; without one this is the only signal there is.
+        self.stale_cols = frozenset()
+        # Parities a failed write left not matching the data.  The same idea
+        # as stale_cols and just as necessary: a stale parity is not a copy of
+        # anything, and reconstructing from it returns a value nothing ever
+        # committed.  With checksums that is caught on the way out; without
+        # them this record is the only thing that knows.
+        self.stale_par = frozenset()
         self.trace = ()
 
     def copy(self):
@@ -131,7 +146,7 @@ class Stripe:
                 tuple(self.missing),
                 tuple(self.cache) if self.cache is not None else None,
                 tuple(self.parity), self.cache_ready, self.reported,
-                self.recorded, self.spurious)
+                self.recorded, self.spurious, self.stale_cols, self.stale_par)
         # Deliberately not self.trace.  It is the operation history, so
         # including it makes every state unique, dedup never fires, and the
         # search re-explores states it has already visited -- which both
@@ -156,12 +171,14 @@ class Stripe:
         lost = set(extra_lost)
         present = lambda d: not self.missing[d] and d not in lost
 
-        if present(i):
+        if present(i) and not (self.track_stale and i in self.stale_cols):
             v = self.disk[i]
             # With checksums, content that is not what was committed is
             # detected and the read falls back to reconstruction (btrfs
             # retries through the next mirror, which for RAID56 rebuilds from
-            # the parity).  Without them it is returned as it is.
+            # the parity).  Without them it is returned as it is -- unless the
+            # log recorded which column a failed write left stale, which is
+            # what track_stale models.
             if self.nodatasum or self.committed[i] is None or v == self.committed[i]:
                 return v
 
@@ -191,6 +208,8 @@ class Stripe:
                 usable = []
                 for p in range(self.nr_parity):
                     if not present(self.nr_data + p):
+                        continue
+                    if self.track_stale and p in self.stale_par:
                         continue
                     if all(self.parity[p][d] == self.disk[d]
                            for d in range(self.nr_data) if d not in holes):
@@ -235,7 +254,8 @@ class Stripe:
             if self.missing[i]:
                 ok = False
                 continue
-            if self.committed[i] is None or self.disk[i] == self.committed[i]:
+            if (self.committed[i] is None or self.disk[i] == self.committed[i]) \
+               and not (self.track_stale and i in self.stale_cols):
                 continue
             v = self.read(i)
             # Without checksums read() hands back the stale sector itself, so
@@ -247,13 +267,22 @@ class Stripe:
                 ok = False
                 continue
             self.disk[i] = v
+            # Written back and correct: the record for this column has served
+            # its purpose and must go, whether or not the rest of the repair
+            # can finish.  Leaving it set makes later reads refuse a sector
+            # that is now right.
+            self.stale_cols = self.stale_cols - {i}
         # Parity is only rewritten when every sector it would be computed
         # from could be verified.  With a device missing the scrub repairs
         # what data stripes it can and writes no parity, because it would
         # otherwise recompute it from sectors it cannot check.
+        # A stale parity needs no reading to fix: recompute it from data that
+        # is now known good.  Only the data columns needed reconstruction.
         if not missing and ok:
             self.parity = [tuple(self.disk)] * self.nr_parity
             self.recorded = False
+            self.stale_cols = frozenset()
+            self.stale_par = frozenset()
             return True
         return False
 
@@ -354,15 +383,31 @@ class Stripe:
 
         # --- write phase
         new_parity = tuple(believed[d] for d in range(st.nr_data))
+        stale = set(st.stale_cols)
         for d in write_set:
             # A device that failed (or is absent) keeps its previous content.
             if d not in failures and not st.missing[d]:
                 st.disk[d] = believed[d]
+                # Freshly written and landed: whatever was stale here is gone.
+                stale.discard(d)
+            else:
+                # The sector on disk is now not what the parity was computed
+                # from.  This is what the log's error record identifies, and
+                # for data without checksums it is the only way to know.
+                stale.add(d)
+        st.stale_cols = frozenset(stale)
         # Each parity sector is written independently.
         st.parity = list(st.parity)
+        spar = set(st.stale_par)
         for p in range(st.nr_parity):
             if ("p%d" % p) not in failures and not st.missing[st.nr_data + p]:
                 st.parity[p] = new_parity
+                spar.discard(p)
+            else:
+                # Not updated, so it no longer describes the data.  Using it to
+                # reconstruct yields a value that was never committed.
+                spar.add(p)
+        st.stale_par = frozenset(spar)
 
         # --- the kernel's accounting
         faults = set()
@@ -614,6 +659,14 @@ def main():
     ap.add_argument("--no-drop-cache-on-fault", action="store_true",
                     help="let a write accepted within the tolerance still "
                          "seed the stripe cache")
+    ap.add_argument("--track-stale-columns", action="store_true",
+                    help="record which column a failed write left stale and "
+                         "consult it wherever a checksum would be consulted. "
+                         "For data without checksums the log's error record is "
+                         "the only thing that can play a checksum's role; "
+                         "without this an ordinary FAULT-FREE write to another "
+                         "column reads the stale sector, trusts it, and bakes "
+                         "it into the parity.")
     ap.add_argument("--repair-on-fault", action="store_true",
                     help="a write that completes with a fault repairs its "
                          "full stripe immediately (rebuild the stale sectors "
@@ -676,6 +729,7 @@ def main():
         policy["target_aliasing"] = True
     if args.no_missing_faults:
         policy["missing_faults"] = False
+    Stripe.track_stale = args.track_stale_columns
     if args.repair_on_fault:
         policy["repair_on_fault"] = True
     if args.flat_sticky_derate:
