@@ -526,7 +526,10 @@ pausehang_log_prep)
 	stats "recorded with a dirty log"
 	log "PREP_DONE"
 	# No umount: leave the log dirty.
-	echo b > /proc/sysrq-trigger
+	# Power off, NOT reboot: sysrq-b restarts the guest, which re-runs this
+	# same init and repeats the whole preparation until the host timeout
+	# kills it.  No sync first -- the dirty tree log is the point.
+	echo o > /proc/sysrq-trigger
 	sleep 60
 	;;
 pausehang_log)
@@ -735,7 +738,10 @@ nocow_replay_prep)
 		   status=none 2>/dev/null
 	done
 	stats "recorded with a dirty log"
-	echo b > /proc/sysrq-trigger
+	# Power off, NOT reboot: sysrq-b restarts the guest, which re-runs this
+	# same init and repeats the whole preparation until the host timeout
+	# kills it.  No sync first -- the dirty tree log is the point.
+	echo o > /proc/sysrq-trigger
 	sleep 60
 	;;
 nocow_replay_probe)

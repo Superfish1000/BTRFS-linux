@@ -50,7 +50,7 @@ boot() {	# mode omit mntdev [extra-env]
 		init=$T/umltest/init-final3.sh $ubds quiet con=null con0=fd:0,fd:1 \
 		BTRFS_TEST_DIR=$T MODE=$mode OPTS=rw PROFILE=$PROFILE TAG=$TAG \
 		MNTDEV=$mntdev NDEV=$NDEV FAIL=$FAIL $extra \
-		> $D/log.$mode.${omit// /-}${extra:+.$PROBE_SUFFIX} 2>&1
+		> $D/log.$mode.${omit// /-}${extra:+.${PROBE_SUFFIX:-x}} 2>&1
 	echo "boot $mode omit=$omit rc=$?" >> $T/umltest/results.$TAG
 }
 
