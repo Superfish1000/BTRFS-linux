@@ -2330,20 +2330,34 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 						 struct btrfs_chunk_map *map,
 						 u64 full_stripe_start,
 						 int data_stripes,
-						 u32 *holes_out)
+						 u64 *holes_out)
 {
 	struct btrfs_fs_info *fs_info = sctx->fs_info;
 	const int nr_parity = map->num_stripes - data_stripes;
 	struct btrfs_wib_stripe_state st;
-	u32 holes = 0, needs_help = 0;
+	u64 holes = 0, needs_help = 0;
 	int nr_good_par = 0;
 
 
 	*holes_out = 0;
 	if (likely(!btrfs_wib_any_stale(fs_info)))
 		return SCRUB_WIB_NONE;
-	if (data_stripes > 32 || nr_parity > 2)
-		return SCRUB_WIB_NONE;
+	/*
+	 * Wider than the masks below can express, so the log cannot be
+	 * consulted for this stripe.  That is not the same as the log having
+	 * nothing to say: we only get here when some stripe somewhere IS
+	 * recorded stale, and returning SCRUB_WIB_NONE would send this stripe
+	 * down the ordinary path, where regenerating the parity from data that
+	 * may be stale is exactly the destruction this feature exists to
+	 * prevent.  Decline instead -- the same answer given to a stripe whose
+	 * ambiguity is understood, for the same reason.
+	 */
+	if (data_stripes > 64 || nr_parity > 2) {
+		btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu has %d data stripes, more than the write-intent log can describe; declining to regenerate its parity while any stripe on this filesystem is recorded stale",
+			      full_stripe_start, data_stripes);
+		return SCRUB_WIB_AMBIGUOUS;
+	}
 	if (!btrfs_wib_stripe_state(fs_info, full_stripe_start, data_stripes,
 				    nr_parity, &st))
 		return SCRUB_WIB_NONE;
@@ -2370,14 +2384,14 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 		struct scrub_stripe *stripe = &sctx->raid56_data_stripes[i];
 
 		if (!stripe->dev || !stripe->dev->bdev) {
-			holes |= BIT(i);
+			holes |= BIT_ULL(i);
 			continue;
 		}
 		if (!(st.stale_cols & BIT_ULL(i)))
 			continue;
-		holes |= BIT(i);
+		holes |= BIT_ULL(i);
 		if (scrub_stripe_has_unverifiable(stripe))
-			needs_help |= BIT(i);
+			needs_help |= BIT_ULL(i);
 	}
 	if (!needs_help)
 		return SCRUB_WIB_NONE;
@@ -2398,11 +2412,11 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 	 * byte of the stripe alone, keep the record, and let a recovery tool
 	 * that can involve a human decide.
 	 */
-	if (hweight32(holes) > nr_good_par)
+	if (hweight64(holes) > nr_good_par)
 		return SCRUB_WIB_AMBIGUOUS;
 
 	for (int i = 0; i < data_stripes; i++)
-		if (needs_help & BIT(i))
+		if (needs_help & BIT_ULL(i))
 			sctx->raid56_data_stripes[i].wib_rebuild = true;
 	return SCRUB_WIB_PROVEN;
 }
@@ -2422,7 +2436,7 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 	const u64 fstripe_len = btrfs_stripe_nr_to_offset(data_stripes);
 	unsigned long extent_bitmap = 0;
 	enum scrub_wib_plan plan;
-	u32 wib_holes = 0;
+	u64 wib_holes = 0;
 	int ret;
 
 	ASSERT(sctx->raid56_data_stripes);
@@ -2576,7 +2590,7 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 		atomic64_inc(&fs_info->wib->stat_scrub_skipped_stale);
 		btrfs_warn_rl(fs_info,
 "scrub: full stripe %llu left untouched: %u data stripe(s) whose last write did not reach the disk cannot be rebuilt from the parity that is left, and without a checksum there is nothing to decide it with -- keeping the record rather than guessing",
-			      full_stripe_start, hweight32(wib_holes));
+			      full_stripe_start, (unsigned int)hweight64(wib_holes));
 		return 0;
 	}
 

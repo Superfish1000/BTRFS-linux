@@ -1795,11 +1795,21 @@ static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
 	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
 	const int nr_parity = rbio->real_stripes - rbio->nr_data;
 	struct btrfs_wib_stripe_state st;
-	u32 failed = 0, add = 0;
+	u64 failed = 0, add = 0;
 	int nr_failed = 0;
 
-	if (rbio->real_stripes > 32)
+	/*
+	 * Wider than the masks below can express.  Returning leaves the read
+	 * exactly as it was before this record existed -- the sectors on disk
+	 * are returned as found -- which is upstream's behaviour and is safe
+	 * in the sense that it invents nothing.  Count it so that a stripe
+	 * this wide does not silently opt out of the protection.
+	 */
+	if (rbio->real_stripes > 64) {
+		if (fs_info->wib)
+			atomic64_inc(&fs_info->wib->stat_read_ambiguous);
 		return;
+	}
 	if (!btrfs_wib_stripe_state(fs_info, rbio->bioc->full_stripe_logical,
 				    rbio->nr_data, nr_parity, &st))
 		return;
@@ -1842,20 +1852,35 @@ static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
 		const int end = first + rbio->stripe_nsectors;
 
 		if (find_next_bit(rbio->error_bitmap, end, first) < end) {
-			failed |= BIT(i);
+			failed |= BIT_ULL(i);
 			nr_failed++;
 		}
 	}
 
 	for (int i = 0; i < rbio->nr_data; i++)
-		if ((st.stale_cols & BIT_ULL(i)) && !(failed & BIT(i)))
-			add |= BIT(i);
+		if ((st.stale_cols & BIT_ULL(i)) && !(failed & BIT_ULL(i)))
+			add |= BIT_ULL(i);
 	for (int p = 0; p < nr_parity; p++)
-		if ((st.bad_parity & BIT(p)) && !(failed & BIT(rbio->nr_data + p)))
-			add |= BIT(rbio->nr_data + p);
+		if ((st.bad_parity & BIT(p)) &&
+		    !(failed & BIT_ULL(rbio->nr_data + p)))
+			add |= BIT_ULL(rbio->nr_data + p);
 
-	if (nr_failed + hweight32(add) > nr_parity)
+	/*
+	 * The log names more members than the surviving parity can rebuild.
+	 * Return the sectors as they are on disk rather than reconstructing a
+	 * value nothing ever committed -- see the budget argument above.
+	 *
+	 * @add is what makes this an ambiguity rather than an ordinary
+	 * unrecoverable read: without it the read was already over budget on
+	 * real IO errors alone and the log had nothing to add.  This is the
+	 * commonest place in the system where an ambiguous stripe is found,
+	 * and until this counter existed it left no trace at all.
+	 */
+	if (nr_failed + hweight64(add) > nr_parity) {
+		if (add && fs_info->wib)
+			atomic64_inc(&fs_info->wib->stat_read_ambiguous);
 		return;
+	}
 
 	/*
 	 * Several bios share this bitmap, so set_bit() one at a time rather
@@ -1864,7 +1889,7 @@ static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
 	for (int i = 0; i < rbio->real_stripes; i++) {
 		const int first = i * rbio->stripe_nsectors;
 
-		if (!(add & BIT(i)))
+		if (!(add & BIT_ULL(i)))
 			continue;
 		for (int nr = 0; nr < rbio->stripe_nsectors; nr++) {
 			/*

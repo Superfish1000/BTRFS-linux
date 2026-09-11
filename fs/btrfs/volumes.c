@@ -3632,6 +3632,8 @@ int btrfs_remove_chunk(struct btrfs_trans_handle *trans, u64 chunk_offset)
 	ret = btrfs_remove_block_group(trans, map);
 	if (unlikely(ret))
 		ASSERT(BTRFS_FS_ERROR(fs_info) != 0);
+	else
+		btrfs_wib_forget_range(fs_info, chunk_offset, map->chunk_len);
 
 out:
 	if (trans->removing_chunk) {

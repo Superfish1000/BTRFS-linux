@@ -834,6 +834,303 @@ static int test_disable_ordering(struct btrfs_fs_info *fs_info)
 	return 0;
 }
 
+/* The entry-aligned base of @logical; mirrors wib_entry_bytenr(). */
+static u64 wib_test_entry_base(u64 logical)
+{
+	return round_down(logical, BTRFS_WIB_ENTRY_SIZE);
+}
+
+/* The live entry for @bytenr, or NULL.  Tests only; no locking needed here. */
+static struct btrfs_wib_entry *find_live_entry(struct btrfs_wib *wib, u64 bytenr)
+{
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
+		struct btrfs_wib_entry *e = &wib->entries[i];
+
+		if ((e->bitmap | e->sticky) && e->bytenr == bytenr)
+			return e;
+	}
+	return NULL;
+}
+
+/* Drop @nr marks starting at entry @base and empty the log. */
+static int drain_marks(struct btrfs_fs_info *fs_info, u64 base, u64 nr)
+{
+	for (u64 i = 0; i < nr; i++)
+		btrfs_wib_done(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+			       BTRFS_WIB_BLOCK_SIZE, false);
+	btrfs_wib_commit_prepare(fs_info);
+	return btrfs_wib_commit(fs_info, true);
+}
+
+/*
+ * When the log is full, the record that NAMES the member a write went wrong on
+ * must be the last one spent, not the first one found.
+ *
+ * A record with only @sticky says something went wrong somewhere in the
+ * stripe, which a scrub rediscovers by reading it.  A record with @stale says
+ * WHICH member is wrong, and for data with no checksum nothing else in the
+ * system can say that -- a scrub that loses it cannot tell a stale data column
+ * from a stale parity, and the two need opposite repairs.  Losing the vague
+ * one costs a rescan; losing the specific one costs the evidence.
+ *
+ * The fallback is equally required: refusing to evict a named record would
+ * break the promise wib_count_entries_locked() makes to btrfs_wib_try_mark(),
+ * which asserts the room it counted exists.  Preference, not refusal.
+ */
+static int test_evict_precedence(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const u64 vague = 700ULL * BTRFS_WIB_ENTRY_SIZE;
+	const u64 named = 701ULL * BTRFS_WIB_ENTRY_SIZE;
+	const u64 base = 800;
+	u64 evicted0, stale_evicted0;
+	int ret;
+
+	evicted0 = atomic64_read(&wib->stat_sticky_evicted);
+	stale_evicted0 = atomic64_read(&wib->stat_stale_evicted);
+
+	btrfs_wib_add_sticky(fs_info, vague, BTRFS_WIB_BLOCK_SIZE);
+	btrfs_wib_add_sticky(fs_info, named, BTRFS_WIB_BLOCK_SIZE);
+	btrfs_wib_mark_stale(fs_info, named, BTRFS_WIB_BLOCK_SIZE);
+
+	if (!find_live_entry(wib, vague) || !find_live_entry(wib, named)) {
+		test_err("sticky records were not created");
+		return -EINVAL;
+	}
+	if (!btrfs_wib_any_stale(fs_info)) {
+		test_err("the named record did not register as stale");
+		return -EINVAL;
+	}
+
+	/*
+	 * A named record is live, so the log must be writable in the wide
+	 * layout and the live bound is BTRFS_WIB_MAX_ENTRIES, not the size of
+	 * the table.  Two slots are taken, so the (MAX_ENTRIES - 1)th fresh
+	 * region is the one that has to displace something.
+	 */
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 1; i++) {
+		ret = btrfs_wib_mark(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+				     BTRFS_WIB_BLOCK_SIZE);
+		if (ret) {
+			test_err("mark %llu failed: %d", i, ret);
+			return ret;
+		}
+	}
+
+	if (atomic64_read(&wib->stat_sticky_evicted) != evicted0 + 1) {
+		test_err("expected exactly one eviction, saw %llu",
+			 atomic64_read(&wib->stat_sticky_evicted) - evicted0);
+		return -EINVAL;
+	}
+	if (find_live_entry(wib, vague)) {
+		test_err("the record naming no member survived; the wrong one was spent");
+		return -EINVAL;
+	}
+	if (!find_live_entry(wib, named)) {
+		test_err("the record naming a member was evicted first");
+		return -EINVAL;
+	}
+	if (atomic64_read(&wib->stat_stale_evicted) != stale_evicted0) {
+		test_err("stale_evicted moved while only a vague record was dropped");
+		return -EINVAL;
+	}
+	if (!btrfs_wib_any_stale(fs_info)) {
+		test_err("the surviving named record stopped counting as stale");
+		return -EINVAL;
+	}
+
+	/* Nothing vague left: the named record must now be spendable. */
+	ret = btrfs_wib_mark(fs_info, (base + BTRFS_WIB_MAX_ENTRIES) * BTRFS_WIB_ENTRY_SIZE,
+			     BTRFS_WIB_BLOCK_SIZE);
+	if (ret) {
+		test_err("mark with only a named record left failed: %d", ret);
+		return ret;
+	}
+	if (find_live_entry(wib, named)) {
+		test_err("the named record was not evicted when it was all that was left");
+		return -EINVAL;
+	}
+	if (atomic64_read(&wib->stat_stale_evicted) != stale_evicted0 + 1) {
+		test_err("losing a named record was not counted");
+		return -EINVAL;
+	}
+	if (btrfs_wib_any_stale(fs_info)) {
+		test_err("nr_stale was not decremented when the named record went");
+		return -EINVAL;
+	}
+
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 1; i++)
+		btrfs_wib_done(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+			       BTRFS_WIB_BLOCK_SIZE, false);
+	ret = drain_marks(fs_info, base + BTRFS_WIB_MAX_ENTRIES, 1);
+	if (ret)
+		return ret;
+	if (block_nr_entries(wib->last) != 0) {
+		test_err("log not empty after the eviction precedence test");
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * A record whose chunk has been removed must go with it.
+ *
+ * The bits are interpreted against whatever chunk covers their address when
+ * they are read.  Once the address is reallocated they are read with a
+ * different geometry, so a surviving record makes a scrub believe a column of
+ * the NEW chunk is stale and rebuild it from a parity that was describing it
+ * correctly -- the record meant to prevent a misrepair causes one.
+ */
+static int test_forget_range(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const u64 chunk = 900ULL * BTRFS_WIB_ENTRY_SIZE;
+	const u64 len = 2 * BTRFS_WIB_ENTRY_SIZE;
+	const u64 keep = 910ULL * BTRFS_WIB_ENTRY_SIZE;
+	int ret;
+
+	btrfs_wib_add_sticky(fs_info, chunk, len);
+	btrfs_wib_mark_stale(fs_info, chunk, BTRFS_WIB_BLOCK_SIZE);
+	btrfs_wib_update_stale_parity(fs_info, chunk, 0, true);
+	btrfs_wib_add_sticky(fs_info, keep, BTRFS_WIB_BLOCK_SIZE);
+
+	if (!find_live_entry(wib, chunk) || !btrfs_wib_any_stale(fs_info)) {
+		test_err("the chunk's records were not created");
+		return -EINVAL;
+	}
+
+	btrfs_wib_forget_range(fs_info, chunk, len);
+
+	if (find_live_entry(wib, chunk) ||
+	    find_live_entry(wib, chunk + BTRFS_WIB_ENTRY_SIZE)) {
+		test_err("a record survived the removal of its chunk");
+		return -EINVAL;
+	}
+	if (btrfs_wib_any_stale(fs_info)) {
+		test_err("nr_stale was not decremented when the chunk was forgotten");
+		return -EINVAL;
+	}
+	if (!find_live_entry(wib, keep)) {
+		test_err("forgetting a chunk took a record outside it");
+		return -EINVAL;
+	}
+
+	btrfs_wib_clear_sticky(fs_info, keep, BTRFS_WIB_BLOCK_SIZE);
+	btrfs_wib_commit_prepare(fs_info);
+	ret = btrfs_wib_commit(fs_info, true);
+	if (ret)
+		return ret;
+	if (block_nr_entries(wib->last) != 0) {
+		test_err("log not empty after the forget-range test");
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * A log that is legal in the narrow layout must not become unwritable when a
+ * stale bit forces the wide one.
+ *
+ * The in-memory table holds BTRFS_WIB_MAX_ENTRIES_V1 regions, and while
+ * nothing is stale a block describes exactly that many.  The first stale bit
+ * halves what a block can describe, without anything having been added -- and
+ * a set that cannot be described cannot be written.  btrfs_wib_build_block()
+ * then returns -ENOSPC leaving the block zeroed with no magic, and
+ * wib_flush_and_drop_locked() hands that on as the snapshot of what was in
+ * flight: an empty snapshot reads as "nothing was in flight", so stripes that
+ * finished after the flush are dropped from the log with no flush covering
+ * them.  That is the write hole, reopened by an accounting mistake.
+ *
+ * So the live set is capped at what the current layout can express, and going
+ * stale spends records to get back under it.
+ */
+static int test_capacity_follows_layout(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const u64 base = 2000;
+	const u32 wide = BTRFS_WIB_MAX_ENTRIES;
+	const u32 narrow = BTRFS_WIB_MAX_ENTRIES_V1;
+	const u64 named = (base + narrow - 1) * BTRFS_WIB_ENTRY_SIZE;
+	void *block;
+	u32 live = 0;
+	int ret;
+
+	block = kzalloc(BTRFS_WIB_SLOT_SIZE, GFP_KERNEL);
+	if (!block)
+		return -ENOMEM;
+
+	/* Fill past the wide maximum with records nothing has named. */
+	for (u32 i = 0; i < narrow; i++)
+		btrfs_wib_add_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+				     BTRFS_WIB_BLOCK_SIZE);
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++)
+		if (wib->entries[i].bitmap | wib->entries[i].sticky)
+			live++;
+	if (live <= wide) {
+		test_err("expected more than %u live regions, got %u", wide, live);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* Legal in the narrow layout. */
+	ret = btrfs_wib_build_block(wib, block, 1, NULL);
+	if (ret) {
+		test_err("a narrow-layout set of %u regions did not build: %d",
+			 live, ret);
+		goto out;
+	}
+
+	/* One stale bit halves what a block can say. */
+	btrfs_wib_mark_stale(fs_info, named, BTRFS_WIB_BLOCK_SIZE);
+	if (!btrfs_wib_any_stale(fs_info)) {
+		test_err("the record did not go stale");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	ret = btrfs_wib_build_block(wib, block, 2, NULL);
+	if (ret) {
+		test_err("the log became unwritable when a record went stale: %d",
+			 ret);
+		goto out;
+	}
+	if (!(le64_to_cpu(((struct btrfs_wib_disk_header *)block)->flags) &
+	      BTRFS_WIB_FLAG_STALE)) {
+		test_err("a block carrying a stale record was not written wide");
+		ret = -EINVAL;
+		goto out;
+	}
+	if (block_nr_entries(block) > wide) {
+		test_err("wide block claims %u entries, more than the %u it can hold",
+			 block_nr_entries(block), wide);
+		ret = -EINVAL;
+		goto out;
+	}
+	/* The record that names a member is the one that had to survive. */
+	if (!find_live_entry(wib, wib_test_entry_base(named))) {
+		test_err("the named record was spent to make the set fit");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	for (u32 i = 0; i < narrow; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+				       BTRFS_WIB_BLOCK_SIZE);
+	btrfs_wib_commit_prepare(fs_info);
+	ret = btrfs_wib_commit(fs_info, true);
+	if (ret)
+		goto out;
+	if (block_nr_entries(wib->last) != 0) {
+		test_err("log not empty after the capacity test");
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = 0;
+out:
+	kfree(block);
+	return ret;
+}
+
 int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 {
 	struct btrfs_fs_info *fs_info;
@@ -877,6 +1174,15 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_sticky(fs_info);
+	if (ret)
+		goto out;
+	ret = test_capacity_follows_layout(fs_info);
+	if (ret)
+		goto out;
+	ret = test_evict_precedence(fs_info);
+	if (ret)
+		goto out;
+	ret = test_forget_range(fs_info);
 	if (ret)
 		goto out;
 	ret = test_disable_ordering(fs_info);

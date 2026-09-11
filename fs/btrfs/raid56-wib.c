@@ -194,34 +194,137 @@ static struct btrfs_wib_entry *wib_find_entry(struct btrfs_wib *wib, u64 bytenr)
 }
 
 /*
+ * How many entries the log may hold right now.
+ *
+ * A block carrying a stale record must be written in the wide layout, whose
+ * entry is twice the size, so the same 4KiB slot expresses half as many
+ * regions.  The in-memory table is sized to the NARROW maximum so that a
+ * filesystem that has never had a stale record can use all of it -- which
+ * means the table can hold more than a wide block is able to describe.
+ *
+ * A set that cannot be described cannot be written.  btrfs_wib_build_block()
+ * returns -ENOSPC and leaves the block zeroed with no magic, and its callers
+ * are not all in a position to notice: wib_flush_and_drop_locked() asserts
+ * that it fits and then hands the block on as the snapshot of what was in
+ * flight, so on a kernel built without CONFIG_BTRFS_ASSERT an empty snapshot
+ * is taken to mean nothing was in flight, and stripes that finished after the
+ * flush are dropped from the log without a flush having covered them.  That is
+ * the write hole this log exists to close, reopened by a capacity accident.
+ *
+ * So the live set is capped here instead, and the assertion is allowed to be
+ * true.
+ */
+static u32 wib_live_max(const struct btrfs_wib *wib)
+{
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
+		const struct btrfs_wib_entry *e = &wib->entries[i];
+
+		if (wib_entry_used(e) && (e->stale | e->stale_par))
+			return BTRFS_WIB_MAX_ENTRIES;
+	}
+	return BTRFS_WIB_MAX_ENTRIES_V1;
+}
+
+static u32 wib_live_count(const struct btrfs_wib *wib)
+{
+	u32 nr = 0;
+
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++)
+		if (wib_entry_used(&wib->entries[i]))
+			nr++;
+	return nr;
+}
+
+/* True if this entry names the member a failed write left wrong. */
+static bool wib_entry_names_member(const struct btrfs_wib_entry *e)
+{
+	return (e->stale | e->stale_par) != 0;
+}
+
+/*
  * Make room by dropping an entry that only records stripes without a write
  * in flight (sticky).  Those stripes then rely on scrub instead of the
  * mount-time recovery.
+ *
+ * Two passes, because the records are not worth the same.  An entry carrying
+ * @stale or @stale_par names WHICH member a failed write left wrong, and for
+ * data with no checksum that is the only thing in the system that can tell a
+ * stale data column from a stale parity -- the two need opposite repairs, and
+ * a scrub that cannot tell them apart may not touch the stripe at all.  An
+ * entry with only @sticky says that something went wrong somewhere in the
+ * stripe, which a scrub can rediscover by reading it.  So spend the vague
+ * records first and the specific ones only when there is nothing else left.
+ *
+ * The second pass is not optional.  wib_count_entries_locked() counts every
+ * entry without in-flight bits as available and btrfs_wib_try_mark() then
+ * asserts that the room it was promised exists; a preference keeps that true,
+ * refusing outright would not.  Losing the address of a fault is survivable,
+ * losing the write path is not.
  */
 static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 {
 	lockdep_assert_held(&wib->lock);
 
-	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
-		struct btrfs_wib_entry *e = &wib->entries[i];
+	for (int pass = 0; pass < 2; pass++) {
+		for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
+			struct btrfs_wib_entry *e = &wib->entries[i];
 
-		if (e->bitmap || !e->sticky)
-			continue;
-		if (!btrfs_is_testing(wib->fs_info))
-			btrfs_warn_rl(wib->fs_info,
+			if (e->bitmap || !e->sticky)
+				continue;
+			if (pass == 0 && wib_entry_names_member(e))
+				continue;
+			if (!btrfs_is_testing(wib->fs_info)) {
+				if (wib_entry_names_member(e))
+					btrfs_warn_rl(wib->fs_info,
+	"raid56 write-intent log full, dropping the record of %u stripes at %llu INCLUDING which member %u of them lost -- that cannot be worked out again by reading the disks, run scrub before those stripes are written",
+						      (unsigned int)hweight64(e->sticky),
+						      e->bytenr,
+						      (unsigned int)hweight64(e->stale | e->stale_par));
+				else
+					btrfs_warn_rl(wib->fs_info,
 	"raid56 write-intent log full, dropping record of %u stripes with failed writes at %llu, run scrub",
-				      (unsigned int)hweight64(e->sticky), e->bytenr);
-		atomic64_inc(&wib->stat_sticky_evicted);
-		e->sticky = 0;
-		if (e->stale) {
-			atomic_sub(hweight64(e->stale), &wib->nr_stale);
-			e->stale = 0;
+						      (unsigned int)hweight64(e->sticky),
+						      e->bytenr);
+			}
+			atomic64_inc(&wib->stat_sticky_evicted);
+			if (wib_entry_names_member(e))
+				atomic64_inc(&wib->stat_stale_evicted);
+			e->sticky = 0;
+			if (e->stale) {
+				atomic_sub(hweight64(e->stale), &wib->nr_stale);
+				e->stale = 0;
+			}
+			e->stale_par = 0;
+			e->gen = 0;
+			return e;
 		}
-		e->stale_par = 0;
-		e->gen = 0;
-		return e;
 	}
 	return NULL;
+}
+
+/*
+ * Bring the live set back within what the current layout can express.
+ *
+ * Needed because the capacity does not only shrink when entries are added: the
+ * moment the first stale bit appears it halves, so a log legally holding 120
+ * regions a moment ago is now holding more than a block can describe, without
+ * anything having been added.  Spend records until it fits -- wib_evict_sticky()
+ * takes the vaguest first, so what goes is knowledge a scrub can rediscover by
+ * reading, not the knowledge that names a member.
+ *
+ * Nothing may be evictable, every entry having a write in flight.  The set then
+ * stays over the limit and the commit fails the write, which is the same answer
+ * a full log already gives and is far better than writing a block that omits
+ * stripes without saying so.
+ */
+static void wib_enforce_capacity_locked(struct btrfs_wib *wib)
+{
+	lockdep_assert_held(&wib->lock);
+
+	while (wib_live_count(wib) > wib_live_max(wib)) {
+		if (!wib_evict_sticky(wib))
+			break;
+	}
 }
 
 /*
@@ -246,6 +349,13 @@ static struct btrfs_wib_entry *wib_find_or_alloc_entry(struct btrfs_wib *wib,
 		if (e->bytenr == bytenr)
 			return e;
 	}
+	/*
+	 * A free slot is not room if the block cannot describe it; evict
+	 * instead, so the set stays expressible rather than growing into a
+	 * state that cannot be written.
+	 */
+	if (free && wib_live_count(wib) >= wib_live_max(wib))
+		free = NULL;
 	if (!free && evict)
 		free = wib_evict_sticky(wib);
 	if (free) {
@@ -274,6 +384,9 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 
 	lockdep_assert_held(&wib->lock);
 
+	const u32 max = wib_live_max(wib);
+	u32 live = 0, evictable = 0;
+
 	*needed = 0;
 	*avail = 0;
 	for (u64 cur = first; cur <= last; cur += BTRFS_WIB_ENTRY_SIZE) {
@@ -284,10 +397,20 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 		const struct btrfs_wib_entry *e = &wib->entries[i];
 
 		if (!wib_entry_used(e))
-			(*avail)++;
-		else if (!e->bitmap && (e->bytenr < first || e->bytenr > last))
-			(*avail)++;
+			continue;
+		live++;
+		if (!e->bitmap && (e->bytenr < first || e->bytenr > last))
+			evictable++;
 	}
+	/*
+	 * Free table slots are not the measure: a slot the current layout
+	 * cannot describe is not room.  Evicting @evictable entries leaves
+	 * @live - @evictable in use, so @max - @live + @evictable is what can
+	 * still be admitted -- and it is negative, meaning nothing, when the
+	 * set is already over the limit because a stale bit halved it.
+	 */
+	if (max + evictable > live)
+		*avail = max + evictable - live;
 }
 
 /* True if btrfs_wib_try_mark() for the same range would succeed. */
@@ -441,7 +564,7 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 	 * Stamping the wide format on every block would impose that on every
 	 * filesystem, including ones that have never had a stale record in
 	 * their lives.  And the wide entry costs capacity that turns directly
-	 * into device-wide cache flushes on the write path: 99 entries against
+	 * into device-wide cache flushes on the write path: 82 entries against
 	 * 165 before the on-disk union overflows and btrfs_wib_mark() has to
 	 * wait for a REQ_PREFLUSH to every device.
 	 *
@@ -1139,8 +1262,21 @@ static int wib_flush_and_drop_locked(struct btrfs_wib *wib, u64 seq, bool force)
 		 * finished during the flush.
 		 */
 		ret = btrfs_wib_build_block(wib, wib->flushsnap, seq, NULL);
-		/* The in-memory set always fits. */
+		/*
+		 * The in-memory set always fits: wib_live_max() caps it at what
+		 * the current layout can describe, and wib_enforce_capacity_locked()
+		 * re-establishes that whenever a stale bit halves the cap.
+		 *
+		 * Check it anyway rather than only asserting.  ASSERT() compiles
+		 * away without CONFIG_BTRFS_ASSERT, and the block handed on from
+		 * here is the snapshot of what was in flight: a failed build
+		 * leaves it zeroed with no magic, which reads as "nothing was in
+		 * flight" and drops stripes that no flush covered.  Refusing the
+		 * commit costs a failed write; continuing costs the write hole.
+		 */
 		ASSERT(ret == 0);
+		if (ret)
+			return ret;
 		flushed = wib_flush_all_devices(wib);
 		ret = wib_drop_locked(wib, seq, wib->flushsnap, flushed, force);
 	}
@@ -1404,6 +1540,8 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		if (add)
 			atomic_add(hweight64(add), &wib->nr_stale);
 	}
+	/* The first stale bit halves the capacity; make the set fit it. */
+	wib_enforce_capacity_locked(wib);
 	spin_unlock_irqrestore(&wib->lock, flags);
 }
 
@@ -1479,6 +1617,8 @@ void btrfs_wib_update_stale_parity(struct btrfs_fs_info *fs_info,
 		else
 			e->stale_par &= ~mask;
 	}
+	if (stale)
+		wib_enforce_capacity_locked(wib);
 	spin_unlock_irqrestore(&wib->lock, flags);
 }
 
@@ -1645,6 +1785,68 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 			freed = true;
 	}
 	spin_unlock_irqrestore(&wib->lock, flags);
+	if (freed)
+		wake_up_all(&wib->wait);
+}
+
+/*
+ * Forget every record for [@logical, @logical + @len): the address has stopped
+ * meaning anything, because the chunk that gave it a geometry is gone.
+ *
+ * Not the same thing as btrfs_wib_clear_sticky(), even though it clears the
+ * same fields.  That one says "this stripe is consistent again", which is a
+ * statement about data.  This one says "there is no stripe here any more",
+ * which is a statement about the address -- and leaving the record behind is
+ * not the conservative choice it looks like.  A record is interpreted against
+ * whatever chunk covers its address at the time it is read, so once the
+ * address is reallocated the surviving bits are read with a different
+ * @nr_data, a different column-to-device mapping, or no chunk at all.  A
+ * scrub then believes a column of the NEW chunk is stale and rebuilds it from
+ * a parity that was in fact describing it correctly: the record meant to stop
+ * a misrepair causes one.
+ *
+ * An in-flight bit here would mean a write was still outstanding against a
+ * chunk being removed, which is a bug somewhere else; say so rather than
+ * quietly clearing it, and clear it anyway, because keeping it would pin an
+ * entry that nothing will ever complete.
+ */
+void btrfs_wib_forget_range(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	unsigned long flags;
+	struct btrfs_wib *wib = fs_info->wib;
+	const u64 end = logical + len;
+	unsigned int inflight = 0;
+	bool freed = false;
+
+	if (!wib)
+		return;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
+		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+		u64 mask;
+
+		if (!e)
+			continue;
+		mask = btrfs_wib_range_mask(cur, logical, len);
+		inflight += hweight64(e->bitmap & mask);
+		e->bitmap &= ~mask;
+		e->sticky &= ~mask;
+		if (e->stale & mask) {
+			atomic_sub(hweight64(e->stale & mask), &wib->nr_stale);
+			e->stale &= ~mask;
+		}
+		e->stale_par &= ~mask;
+		if (!wib_entry_used(e)) {
+			e->gen = 0;
+			freed = true;
+		}
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (inflight)
+		btrfs_warn(fs_info,
+"raid56 write-intent log: %u block(s) of the chunk at %llu were still recorded in flight as it was removed",
+			   inflight, logical);
 	if (freed)
 		wake_up_all(&wib->wait);
 }

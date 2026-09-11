@@ -159,8 +159,13 @@ struct btrfs_wib_disk_header {
  * Size of the in-memory table, and the bound for every loop over it.  Kept
  * separate from the two on-disk maxima above because it answers a different
  * question: how many regions a mount can track, which has nothing to do with
- * how wide an entry has to be on disk.  It is the larger of the two, so a
- * block in either layout can always be built from the table.
+ * how wide an entry has to be on disk.  It is the larger of the two, so that a
+ * filesystem which has never had a stale record can use all of it.
+ *
+ * Being the larger is exactly why the table alone is not the bound.  A wide
+ * block describes only BTRFS_WIB_MAX_ENTRIES regions, so a full table cannot
+ * be written once anything is stale; wib_live_max() is the live bound, and
+ * wib_enforce_capacity_locked() restores it when a stale bit halves it.
  */
 #define BTRFS_WIB_NR_ENTRIES		BTRFS_WIB_MAX_ENTRIES_V1
 
@@ -345,6 +350,15 @@ struct btrfs_wib {
 	atomic64_t stat_recovery_errors;
 	atomic64_t stat_sticky;
 	atomic64_t stat_sticky_evicted;
+	/*
+	 * The subset of @stat_sticky_evicted that took a named member with it
+	 * (@stale or @stale_par).  Worth its own counter because the two
+	 * losses are not the same: a scrub can rediscover that something went
+	 * wrong in a stripe by reading it, but nothing can work out again
+	 * which member a write failed on.  Non-zero means evidence is gone,
+	 * not merely that the log was busy.
+	 */
+	atomic64_t stat_stale_evicted;
 	atomic64_t stat_commit_errors;
 	/*
 	 * Full stripes a scrub declined to regenerate the parity of, because
@@ -352,6 +366,18 @@ struct btrfs_wib {
 	 * the only place the acknowledged content still exists.
 	 */
 	atomic64_t stat_scrub_skipped_stale;
+	/*
+	 * Reads that found the log naming more members than the surviving
+	 * parity can rebuild, and so returned the sectors as they are on disk
+	 * rather than reconstructing a value nothing ever committed.
+	 *
+	 * The highest-frequency discoverer of an ambiguous stripe in the
+	 * system, and until this counter existed it left no trace at all: the
+	 * budget check in mark_stale_sectors() simply returned.  A scrub
+	 * reports what it declined to repair; this reports what a read
+	 * declined to trust.
+	 */
+	atomic64_t stat_read_ambiguous;
 };
 
 int btrfs_wib_alloc(struct btrfs_fs_info *fs_info);
@@ -391,6 +417,7 @@ bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 			    struct btrfs_wib_stripe_state *st);
 void btrfs_wib_update_stale_parity(struct btrfs_fs_info *fs_info,
 				   u64 full_stripe_start, int parity, bool stale);
+void btrfs_wib_forget_range(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_commit_prepare(struct btrfs_fs_info *fs_info);
 int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed);
 
